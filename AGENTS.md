@@ -6,12 +6,13 @@
 - **No Surprises**: Do not change files unrelated to the task.
 
 ## 2. Reliability
+- **Happy Path First**: Assume perfect conditions. Do not fix edge case like hardware or external service failure unless asked (like network, hardware, server is down). Just document the risk and let the code fail.
 - **Fail Fast**: Crash immediately with a clear error message; do not hide errors.
 - **Check Your Work**: Run the smallest relevant test. If you can't, tell the user what command to run.
 
 ## 3. Scope & Quality
 - **Small Changes**: Do the smallest change that solves the problem. No extra formatting.
-- **Scope**: Do not edit code inside `third_party/` submodules unless asked.
+- **Consistent Changes**: Keep the changes logically consistent across all files.
 - **Reuse Code**: Don't reinvent the wheel; use existing patterns and libraries.
 
 ## 4. Communication

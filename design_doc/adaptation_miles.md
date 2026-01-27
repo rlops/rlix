@@ -90,8 +90,9 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
   - SGLang supports `weight_version` in weight update calls (e.g. `update_weights_from_tensor(..., weight_version=...)` in `third_party/miles/miles/backends/sglang_utils/sglang_engine.py`).
   - The adapter must propagate `active_checkpoint_version` into rollout outputs (e.g., sample metadata) as `generation_checkpoint_version`.
 - **Progress reporting for the central scheduler**:
-  - The shared scheduler needs heartbeats based on **trajectory counts**: `queued_trajectories`, `inflight_trajectories`, `percent_remaining`, and `oldest_unfinished_creation_ts`.
+  - The shared scheduler needs heartbeats based on **trajectory counts**: `queued_trajectories`, `inflight_trajectories`, `percent_completed`, and `oldest_unfinished_creation_ts`.
   - Miles often reasons in “groups” (one group contains multiple trajectories: `n_samples_per_prompt`). The adapter must convert group counts into trajectory counts before reporting.
+  - Readiness rule: when `percent_completed >= 1.0`, the next train step’s batch is ready.
 
 **Model update boundary (make this explicit)**
 - **Miles assumes weight sync happens at safe boundaries** (between rollout batches / when the rollout engines are quiesced), not as a “hot swap” in the middle of multi-turn interactions.
@@ -113,7 +114,7 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
       - record it again when the last turn finishes.
   - Add heartbeat hooks at the start of each rollout batch (`RolloutManager.generate`) to report:
     - `queued_trajectories`, `inflight_trajectories` (trajectory units),
-    - `percent_remaining = (queued_trajectories + inflight_trajectories) / (rollout_batch_size * n_samples_per_prompt)`,
+    - `percent_completed = collected_trajectories / (rollout_batch_size * n_samples_per_prompt)`,
     - `oldest_unfinished_creation_ts`.
 
 **Recommended baseline mapping**
@@ -176,7 +177,7 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
 |--------|----------------------|
 | **queued_trajectories** | `queued_groups * n_samples_per_prompt` |
 | **inflight_trajectories** | `inflight_groups * n_samples_per_prompt` |
-| **percent_remaining** | `(queued_trajectories + inflight_trajectories) / (rollout_batch_size * n_samples_per_prompt)` (may be > 1.0 if backlog > one step) |
+| **percent_completed** | `collected_trajectories / (rollout_batch_size * n_samples_per_prompt)` (`percent_completed >= 1.0` means next train step batch is ready) |
 | **oldest_unfinished** | **Required**: timestamp of the oldest unfinished group (queued or in-flight); used for scheduler tie-breaks. |
 
 ### 3.4 Preemption & Release Protocol (Post-Adaptation)
@@ -218,7 +219,7 @@ For the `swe-agent` example, integration involves modifying the `train.py` loop:
 ### 5.2 Scheduler Progress Hooks
 *   **Integration Point**: `rollout_manager.py`.
 *   **Trigger**: When `results` are pushed to the training queue / buffer and at batch start (hook at the top of the `for rollout_id in range(...)` loop in `third_party/miles/train.py`, before `rollout_manager.generate(...)`).
-*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_remaining, oldest_unfinished_creation_ts)`.
+*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts)`.
 *   **Required TODO (Miles async semantics)**: implement **arrival vs consumption** accounting so the denominator/remaining logic is correct even when generation and training overlap.
     - Track at least these monotonic counters for the current backlog window:
         - `groups_released_for_generation` (submitted/queued into the global data source)
@@ -228,7 +229,7 @@ For the `swe-agent` example, integration involves modifying the `train.py` loop:
     - Compute trajectory counts from the **buffer state**, not from `rollout_id` alone:
         - `queued_trajectories = queued_groups * n_samples_per_prompt`
         - `inflight_trajectories = inflight_groups * n_samples_per_prompt`
-        - `percent_remaining = (queued_trajectories + inflight_trajectories) / (rollout_batch_size * n_samples_per_prompt)`
+        - `percent_completed = collected_trajectories / (rollout_batch_size * n_samples_per_prompt)`
     - Emit an immediate heartbeat whenever the denominator window changes (new groups released, groups dropped), then continue 2% band reporting within that window.
 
 ### 5.3 Native Request Migration During Stop (Framework-Specific)

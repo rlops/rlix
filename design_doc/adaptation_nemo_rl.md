@@ -54,7 +54,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 
 **Already present in the codebase**
 - **In-flight / in-place weight update (INFLIGHT semantics)**: `third_party/nemo-rl/nemo_rl/algorithms/grpo.py` `refit_policy_generation(...)` supports colocated (IPC/ZMQ) and non-colocated (NCCL collective) weight update.
-- **Admission gating around update**: `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py` `AsyncTrajectoryCollector.prepare_for_refit()` pauses new starts and optionally waits for in-flight generations depending on `async_engine` + `in_flight_weight_updates`.
+- **Admission gating around update**: `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py` `AsyncTrajectoryCollector.prepare_for_refit()` pauses launching new **prompt-group rollout threads** (one thread per prompt index; each thread runs a multi-turn rollout over `num_generations_per_prompt` trajectories) and optionally waits for those in-flight threads depending on `async_engine` + `in_flight_weight_updates`.
 - **Version tagging for async GRPO**: trajectories are pushed with `(generation_weight_version, target_weight_version)` and consumed with target matching (bounded staleness) (`third_party/nemo-rl/nemo_rl/algorithms/async_utils.py`).
 
 **Gaps / required extensions to support elastic shrink/expand**
@@ -65,7 +65,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 - **Preemption migration on shrink**:
   - There is no obvious “abort these request_ids on this subset” API exposed at the NeMo-RL generation layer today (unlike ROLL’s `GenerateRequestType.ABORT`).
   - To support SchedRL mid-flight shrink (required for time-sharing), we should reuse existing primitives and add a small extension:
-    - NeMo-RL already tracks in-flight generation threads in `AsyncTrajectoryCollector` (`_inflight_threads`) and already supports pausing new starts (`prepare_for_refit()`).
+    - NeMo-RL already tracks in-flight prompt-group rollout threads in `AsyncTrajectoryCollector` (`_inflight_threads`) and already supports pausing new starts (`prepare_for_refit()`).
     - NeMo-RL vLLM async worker currently creates per-request UUIDs (`request_id = str(uuid.uuid4())` in `vllm_worker_async.py`), which prevents coordinator-owned request identity.
       - **Required extension (hard requirement)**: allow the pipeline coordinator to provide the vLLM `request_id` for each turn, e.g. `request_id = f"{trajectory_id}:{turn_id}:{attempt}"`, and pass it through to `llm.generate(..., request_id=request_id)`.
         - This requires a stable `trajectory_id` (same across retries) and a stable `turn_id` within that trajectory.
@@ -78,7 +78,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 - **Terminology mapping**:
   - Shared protocol uses `active_checkpoint_version` / `generation_checkpoint_version`. NeMo-RL uses `current_weight_version`, `generation_weight_version`, `target_weight_version`. We should map these 1:1 (active = target for new work).
 - **Progress reporting for scheduling**:
-  - The central scheduler needs heartbeats based on **trajectory counts**: `queued_trajectories`, `inflight_trajectories`, `percent_remaining`, and `oldest_unfinished_creation_ts`.
+  - The central scheduler needs heartbeats based on **trajectory counts**: `queued_trajectories`, `inflight_trajectories`, `percent_completed`, and `oldest_unfinished_creation_ts`.
   - NeMo-RL often reasons in “prompt-groups” (one prompt-group contains multiple trajectories: `num_generations_per_prompt`). The adapter must convert prompt-group counts into trajectory counts.
 
 **Concrete file refs & immediate actions**
@@ -87,7 +87,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
   - Add `wake(worker_indices)` / `sleep(worker_indices)` to `VllmGeneration` and thread through `RayWorkerGroup` helpers (use `run_single_worker_single_data` as a reference).
   - Instrument `AsyncTrajectoryCollector` to emit `scheduler.report_progress(...)` at batch start and on 2% progress bands:
     - `queued_trajectories`, `inflight_trajectories` (trajectory units),
-    - `percent_remaining = (queued_trajectories + inflight_trajectories) / (num_prompt_groups_needed * num_generations_per_prompt)`,
+    - `percent_completed = collected_trajectories / train_global_batch_size` (where `train_global_batch_size = num_prompt_groups_needed * num_generations_per_prompt`; `percent_completed >= 1.0` means next train step batch is ready),
     - `oldest_unfinished_creation_ts`.
   - Add simple version tagging for debugging:
     - record `generation_checkpoint_version` when the first turn of a trajectory is submitted, and
@@ -128,7 +128,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
     *   **Colocated inference (`colocated_inference=True`)**: CUDA-IPC + ZMQ streaming (`policy.stream_weights_via_ipc_zmq(...)` + `policy_generation.update_weights_via_ipc_zmq()`).
     *   **Non-colocated inference (`colocated_inference=False`)**: NCCL collective broadcast (`policy.broadcast_weights_for_collective(...)` + `policy_generation.update_weights_from_collective()`).
 *   **Hook**: `refit_policy_generation()` is invoked at generation boundaries inside the training loop (e.g., `third_party/nemo-rl/nemo_rl/algorithms/grpo.py`), before `run_*_rollout`.
-*   **Note (async GRPO)**: `AsyncTrajectoryCollector.prepare_for_refit()` pauses *new* generations and may optionally wait for in-flight generations depending on `async_engine` and `in_flight_weight_updates` (see Section 2.4).
+*   **Note (async GRPO)**: `AsyncTrajectoryCollector.prepare_for_refit()` pauses launching *new* prompt-group rollouts and may optionally wait for in-flight prompt-group threads depending on `async_engine` and `in_flight_weight_updates` (see Section 2.4).
 
 ### 2.4 Running Requests & Trajectories (Pre-Adaptation)
 *   **Running request handling (async GRPO / vLLM async engine)**
@@ -136,8 +136,8 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
     *   **Hook**: `AsyncTrajectoryCollector.prepare_for_refit()`
     *   **Behavior**:
         *   Pauses **new** generation starts by clearing `_refit_pause_cleared`.
-        *   If `vllm_cfg.async_engine=true` and `grpo.async_grpo.in_flight_weight_updates=true`, in-flight generations are allowed to complete while weights are updated (no global abort).
-        *   Otherwise, refit waits for all in-flight generation threads to complete (`wait_for_pending_generations()`).
+        *   If `vllm_cfg.async_engine=true` and `grpo.async_grpo.in_flight_weight_updates=true`, in-flight prompt-group rollouts are allowed to complete while weights are updated (no global abort).
+        *   Otherwise, refit waits for all in-flight prompt-group threads to complete (`wait_for_pending_generations()`).
 *   **Running trajectory handling (buffering + versioning)**
     *   **Files**: `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py`, `third_party/nemo-rl/nemo_rl/algorithms/grpo.py`
     *   **Behavior**:
@@ -182,7 +182,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 |--------|------------------------|
 | **queued_trajectories** | `queued_prompt_groups * num_generations_per_prompt` |
 | **inflight_trajectories** | `inflight_prompt_groups * num_generations_per_prompt` |
-| **percent_remaining** | `(queued_trajectories + inflight_trajectories) / (num_prompt_groups_needed * num_generations_per_prompt)` (may be > 1.0 if backlog > one step) |
+| **percent_completed** | `collected_trajectories / train_global_batch_size` (where `train_global_batch_size = num_prompt_groups_needed * num_generations_per_prompt`; `percent_completed >= 1.0` means next train step batch is ready) |
 | **oldest_unfinished** | Trajectory timestamp in collector |
 
 ### 3.4 Preemption & Release Protocol (Post-Adaptation)
@@ -213,8 +213,8 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 ### 4.2 Scheduler Progress Hooks
 *   **Integration Point**: `AsyncTrajectoryCollector._run_prompt_group_worker` in `third_party/nemo-rl/nemo_rl/algorithms/async_utils.py` (buffer enqueue via `replay_buffer.push_with_wait_signal(...)`), plus the `grpo_train` loop in `third_party/nemo-rl/nemo_rl/algorithms/grpo.py`.
 *   **Trigger**: On buffer enqueue (inside `_run_prompt_group_worker`) and at the start of the batch loop (`for batch in dataloader:` around line 1118).
-*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_remaining, oldest_unfinished_creation_ts)`.
-*   **Frequency**: Report at **batch start** and whenever `percent_remaining` crosses a **2% progress band** (event-driven). Denominator is the per-step rollout target in trajectories: `num_prompt_groups_needed * num_generations_per_prompt`. Use `oldest_unfinished` timestamp for scheduler tie-breaking.
+*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts)`.
+*   **Frequency**: Report at **batch start** and whenever `percent_completed` crosses a **2% progress band** (event-driven). Denominator is the per-step rollout target in trajectories: `train_global_batch_size` (i.e., `num_prompt_groups_needed * num_generations_per_prompt`). Use `oldest_unfinished` timestamp for scheduler tie-breaking.
 
 ### 4.3 Step-Level Retry (If Applicable)
 *   **Status**: Optional.
@@ -224,7 +224,7 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 *   **NeMo-RL Native Pattern (model-update-driven refit)**: `prepare_for_refit()` + optional `wait_for_pending_generations()`.
 *   **Behavior**:
     1.  `_refit_pause_cleared.clear()` pauses **new** generation starts (lines 541-543 in `async_utils.py`).
-    2.  For **in-flight weight updates** (vLLM V1 async engine with `in_flight_weight_updates=True`): pending generations are **allowed to complete** with their current weights/KV caches while weights are updated (lines 558-567). This is the preferred async pattern.
+    2.  For **in-flight weight updates** (vLLM V1 async engine with `in_flight_weight_updates=True`): pending prompt-group rollouts are **allowed to complete** with their current weights/KV caches while weights are updated (lines 558-567). This is the preferred async pattern.
     3.  For **non-async engines**: `wait_for_pending_generations()` blocks until all in-flight threads complete (lines 569-573).
 *   **SchedRL Integration**: When calling `sleep(worker_indices)` for preemption, the proxy should invoke the framework-native pause mechanism. Do **not** force ROLL-style `abort_request()` semantics.
 
@@ -271,7 +271,7 @@ After `wake(worker_indices=A)` + weight sync, rebalance is enabled by default (s
 - If still unbalanced, abort selected in-flight turns on overloaded workers and retry them on underloaded workers.
   - Require abort ACK before retry.
   - Stop condition (5% rule): the pipeline coordinator computes `load[dp] = queued_by_worker[dp] + inflight_by_worker[dp]` (trajectory counts) and stops when:
-    `(max(load) - min(load)) / max(queued_trajectories + inflight_trajectories, 1) <= 0.05`.
+    `(max(load) - min(load)) / train_global_batch_size <= 0.05`.
 
 ### 4.6 Handling Weight Version vs Worker Migration (Required)
 Time-sharing shrink/expand and model-update-driven refit interact but are logically separate:

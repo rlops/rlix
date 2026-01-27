@@ -9,8 +9,9 @@ current rLLM+VeRL stack when we need:
 
 This plan focuses on integrating **SkyRL-train** into SchedRL as a supported framework.
 
-SkyAgent integration (agentic multi-turn, e.g., SWE + OpenHands) is **currently on-policy only** in this repo.
-Async SkyAgent (SWE + OpenHands) is noted as **future work**.
+**Explicit Scope Exclusion**:
+- **SkyContent (SkyAgent)** integration is **dropped** from this plan. It is strictly on-policy/sync today and provides no BATCH/INFLIGHT async modes. We will not support `QUIESCE-by-drain` for it in this phase.
+- All "async agent" examples (Mini-SWE) will be implemented purely within **SkyRL-train** (using its `MiniSweAgentGenerator`).
 
 ## 1.1 What we will support as async multi-turn examples (scoped)
 
@@ -80,9 +81,10 @@ Important constraints:
 
 - One-step-off async maps to `update_policy=BATCH`:
   - activation occurs at the pipelined boundary where the trainer triggers weight sync.
-- Fully-async maps to `update_policy=INFLIGHT` (within SkyRL-train’s own semantics):
-  - trainer pauses generation, syncs weights, then resumes.
-  - staleness control is governed by `trainer.fully_async.max_staleness_steps`.
+- Fully-async maps to `update_policy=QUIESCE-by-abort`:
+  - **Protocol View**: The scheduler sees `inflight` drop to zero (active on engine). The client's holding of tasks ("resume loop") is semantically equivalent to re-queueing.
+  - **Mechanism**: The adapter implements the sync via `pause_generation()` (abort-to-zero) -> `weight_sync` -> `resume_generation()` (re-issue).
+  - Note: Strict consistency is preserved (no requests finish on old weights).
 
 ### 3.2 Migration policy (shrink/expand)
 
@@ -112,7 +114,7 @@ Expand rebalance (stronger expand, enabled by default):
 - Reassign queued/not-started work so it can run on newly expanded engines.
 - If still unbalanced, abort selected in-flight turns and retry them on underloaded engines (abort ACK required).
   - Stop condition (5% rule): the pipeline coordinator computes `load[dp] = queued_by_worker[dp] + inflight_by_worker[dp]` (trajectory counts) and stops when:
-    `(max(load) - min(load)) / max(queued_trajectories + inflight_trajectories, 1) <= 0.05`.
+    `(max(load) - min(load)) / (train_batch_size * n_samples_per_prompt) <= 0.05`.
 
 **Baseline validation (required)**
 - Validate the `REQUEST_RETRY` safety invariant: do not execute stateful env/tool side effects unless a non-abort generation result is received (single-writer commit).
@@ -124,8 +126,9 @@ Expand rebalance (stronger expand, enabled by default):
 SkyRL-train reports in trajectory units already (one `TrajectoryID` is one trajectory).
 
 - Report `queued_trajectories` and `inflight_trajectories` separately.
-- Keep the 2% cadence, with denominator = `policy_mini_batch_size` (trajectory units) for one training step.
-  - `percent_remaining = (queued_trajectories + inflight_trajectories) / policy_mini_batch_size`
+- Report `oldest_unfinished_creation_ts` (timestamp of the oldest unfinished TrajectoryID, queued or in-flight) for scheduler tie-breaks.
+- Keep the 2% cadence, with denominator = `train_batch_size * n_samples_per_prompt` (trajectory units) for one training step.
+  - `percent_completed = collected_trajectories / (train_batch_size * n_samples_per_prompt)` (`percent_completed >= 1.0` means next train step batch is ready)
   - This may be > 100% if the backlog is larger than one step.
 
 Version tagging (simple, for debugging):
@@ -142,24 +145,3 @@ This provides the async training modes without requiring custom SchedRL adapter 
 For the first **async + multi-turn** reference, use the GSM8K multi-turn task setup:
 - `third_party/SkyRL/skyrl-train/examples/turn_level_rewards/` (multi-turn env + turn-level rewards)
 Then wire it to the async trainers above (one-step-off first).
-
-## 5) Future work: SkyAgent SWE + async training
-
-SkyAgent has a SkyRL-train integration entrypoint today:
-- `third_party/SkyRL/skyrl-agent/skyrl_agent/integrations/skyrl_train/skyrl_train_main.py`
-
-But it uses a sync-style trainer wrapper:
-- `third_party/SkyRL/skyrl-agent/skyrl_agent/integrations/skyrl_train/trainer.py` (`SkyRLAgentPPOTrainer`)
-
-So, for SkyAgent SWE + OpenHands tasks, the current SkyRL-train integration should be treated as:
-- `update_policy=QUIESCE` / on-policy style (generate → train → sync),
-- no one-step-off pipelining, and
-- no fully-async staleness-controlled training.
-
-To support async modes for SkyAgent SWE:
-- Add new async entrypoints under `third_party/SkyRL/skyrl-agent/skyrl_agent/integrations/skyrl_train/` that mirror:
-  - `third_party/SkyRL/skyrl-train/examples/async/main_async.py` (one-step-off), and
-  - `third_party/SkyRL/skyrl-train/examples/fully_async/main_fully_async.py` (fully-async).
-- Add corresponding trainer classes that reuse SkyRL-train’s async training loops but keep SkyAgent’s generator.
-
-This is intentionally postponed until the base SkyRL-train async modes are validated in SchedRL first.

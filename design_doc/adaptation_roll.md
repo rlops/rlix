@@ -70,9 +70,10 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
 - **Selective sync / subset NCCL groups**:
   - `model_update()` currently assumes full-cluster collectives. For subset resume, we need per-subset comm groups (or an equivalent mechanism) so only `S` is updated when resuming after a weight change.
 - **Progress reporting for global scheduling**:
-  - The shared scheduler needs heartbeats based on **trajectory counts** (not group counts): `queued_trajectories`, `inflight_trajectories`, `percent_remaining`, and `oldest_unfinished_creation_ts`.
+  - The shared scheduler needs heartbeats based on **trajectory counts** (not group counts): `queued_trajectories`, `inflight_trajectories`, `percent_completed`, and `oldest_unfinished_creation_ts`.
   - ROLL internally batches trajectories into “groups” (`group_size` trajectories per group). The adapter must convert group counts to trajectory counts when reporting.
-  - Cadence: report at batch start and whenever `percent_remaining` crosses a 2% band, where the denominator is the rollout target per training step (trajectory units).
+  - Cadence: report at batch start and whenever `percent_completed` crosses a 2% band, where the denominator is the rollout target per training step (trajectory units).
+  - Readiness rule: when `percent_completed >= 1.0`, the next train step’s batch is ready.
 
 **Concrete file refs & immediate actions**
 - Files: `third_party/ROLL/roll/distributed/scheduler/generate_scheduler.py`, `third_party/ROLL/roll/distributed/executor/model_update_group.py`, `third_party/ROLL/roll/pipeline/agentic/agentic_pipeline.py`.
@@ -81,14 +82,14 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
   - Extend `ModelUpdateGroup.model_update(worker_indices=...)` to build per-subset comm-plans and add a `LatestWeightsCache` snapshot after training for sync-on-resume.
   - Emit heartbeat RPCs from `GroupQueue.put` and `RolloutScheduler.get_batch()` with:
     - `queued_trajectories`, `inflight_trajectories` (trajectory units),
-    - `percent_remaining = (queued_trajectories + inflight_trajectories) / rollout_batch_size`,
+    - `percent_completed = collected_trajectories / rollout_batch_size`,
     - `oldest_unfinished_creation_ts`.
   - Add simple version tagging for debugging:
     - record `generation_checkpoint_version` when the first turn of a trajectory is submitted, and
     - record it again when the last turn finishes.
 
 **Recommended baseline mapping**
-- `update_policy = QUIESCE` (keep the existing “suspend + stop + model_update + start” boundary).
+- `update_policy = QUIESCE-by-abort` (keep the existing “suspend + stop + model_update + start” boundary).
 - `migration_policy = REQUEST_RETRY` (ROLL-native “abort + retry”) for shrink preemption (turn-level retry; does not step env on abort).
 - `expand_rebalance_policy = REBALANCE_QUEUED` (enabled by default): on expand, clear sticky routing so new turns can land on newly activated DP ranks.
 
@@ -98,7 +99,7 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
 **Concise actionable items (merged from `design_doc/archive/adaptation_review.md`)**
 - Implement `start_server_subset(worker_indices)` / `stop_server_subset(worker_indices)` (or equivalent adapter-level subset control).
 - Add `ModelUpdateGroup.model_update(worker_indices=...)` / comm-plan filtering so selective sync-on-resume is possible.
-- Wire `report_progress(queued_trajectories, inflight_trajectories, percent_remaining, oldest_unfinished_creation_ts)` from the rollout buffer enqueue point (e.g., `GroupQueue.put`/`GroupQueueManager`).
+- Wire `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts)` from the rollout buffer enqueue point (e.g., `GroupQueue.put`/`GroupQueueManager`).
 
 ## 2. Existing Code Integration Points (Pre-Adaptation)
 
@@ -159,7 +160,7 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
 |--------|---------------------|
 | **queued_trajectories** | `queued_groups * group_size` from `GroupQueue` / `GroupQueueManager` |
 | **inflight_trajectories** | `inflight_groups * group_size` (or per-trajectory inflight if available) |
-| **percent_remaining** | `(queued_trajectories + inflight_trajectories) / rollout_batch_size` (may be > 1.0 if backlog > one step) |
+| **percent_completed** | `collected_trajectories / rollout_batch_size` (`percent_completed >= 1.0` means next train step batch is ready) |
 | **oldest_unfinished** | New timestamp captured at **group creation** for the oldest unfinished group (aligns with `oldest_unfinished_creation_ts` in `design_doc/multi-pipeline_roll_old_design.md`; do not reuse `create_step`, which is a step id) |
 
 ### 3.4 Preemption & Release Protocol (Post-Adaptation)
@@ -194,9 +195,9 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
 
 ### 4.2 Scheduler Progress Hooks
 *   **Integration Point**: `GroupQueue.put` (within `GroupQueueManager`).
-*   **Trigger**: Report at **batch start** and whenever `percent_remaining` crosses a 2% progress band (event-driven).
-*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_remaining, oldest_unfinished_creation_ts)` where `percent_remaining` is computed against the per-step rollout target (`rollout_batch_size`, in trajectories). Use `RolloutScheduler.get_batch()` or `advance_step` for the batch-start heartbeat.
-*   **Note**: If a group is later dropped/removed, the reported `percent_remaining` may decrease accordingly.
+*   **Trigger**: Report at **batch start** and whenever `percent_completed` crosses a 2% progress band (event-driven).
+*   **Action**: Inject `scheduler.report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts)` where `percent_completed = collected_trajectories / rollout_batch_size` and `collected_trajectories` counts how many trajectories are complete and ready for training for the next step (e.g., buffered/qualified and not yet consumed).
+*   **Note**: If completed trajectories are dropped/unqualified after being counted as collected, `percent_completed` may decrease accordingly.
 
 ### 4.3 Native Request Migration During Stop (Framework-Specific)
 *   **ROLL Native Pattern**: Explicit `abort_request()` (cancellation).

@@ -57,7 +57,7 @@ Reference (ROLL-specific sequence/design inspiration):
 - **Checkpoint version**: monotonic id, typically `global_step`.
 - **Latest checkpoint**: newest produced by training.
 - **Active checkpoint**: the **authoritative target** checkpoint version that rollout workers must **sync/activate to** before (re)opening admission. New rollout admission uses this version. It can intentionally lag latest.
-- **Trainer checkpoint cache**: source-of-truth cache used by rollout workers to pull checkpoints during expand/resume (because shrink/offload can drop worker-local weights).
+- **Trainer-side checkpoint cache service (CPU bucket list)**: source-of-truth CPU-resident weights cache owned by a trainer-side service/actor. The pipeline coordinator controls it via RPC. This cache is used to sync weights to rollout workers during expand/resume, because shrink/offload can drop worker-local weights.
 
 **Isolation assumption (important)**
 - Each pipeline owns a dedicated **engine group** (cluster / worker group / set of rollout engines).
@@ -71,9 +71,21 @@ Reference (ROLL-specific sequence/design inspiration):
 SchedRL unifies cross-framework behavior using two orthogonal knobs:
 
 **A) Model update / activation policy (`update_policy`)**
-- `QUIESCE`: stop generation work before activation (close admission + cancel + wait until in-flight work finishes + possibly shrink-to-zero); safest.
+- `QUIESCE-by-drain`: close admission, then wait for in-flight work to finish naturally (`inflight -> 0`), then sync/activate; strict consistency. **Drain granularity is framework-defined** (e.g., drain per request/turn vs per prompt-group rollout job).
+- `QUIESCE-by-abort`: close admission, abort in-flight work, wait for abort ACK, ensure `inflight == 0`, then sync/activate; strict consistency.
 - `BATCH`: activation only at batch boundaries (no mid-batch cutover); typical for pipelined trainers.
 - `INFLIGHT`: in-place update on active workers without requiring stop/resume; in-flight requests may finish on old weights (requires version tagging and backend support).
+
+**QUIESCE variants (rules)**
+- Pick exactly one of `QUIESCE-by-drain` or `QUIESCE-by-abort` for a given boundary (do not mix drain and abort).
+- `QUIESCE-by-abort` requires `REQUEST_RETRY` safety (two-phase commit) because aborted work must be retried elsewhere/later.
+- Make the drain unit explicit in adapters:
+  - **Turn/request drain**: close admission for new turns/requests and wait until no in-flight requests remain. This guarantees no mid-request mixing, but a multi-turn trajectory can still span versions across turns.
+  - **Trajectory-group drain**: close admission for new trajectory groups (e.g., NeMo-RL prompt-group rollout threads) and wait until no in-flight groups remain. This guarantees no interruption inside that group’s multi-turn rollout loop.
+
+**Important: INFLIGHT may still use backend abort under the hood**
+- Some frameworks implement `INFLIGHT` weight updates via **pause + abort-resume** at the inference-engine layer (abort is used to stop the current streaming request and then resume it later).
+- This is **not** `ABORT-to-zero` and does **not** imply `REQUEST_RETRY` (the same request/trajectory continues after resume).
 
 **B) Preemption migration policy during shrink (`migration_policy`)**
 - `REQUEST_RETRY` (baseline for elastic time-sharing): abort/cancel in-flight work on `P` and retry it on `new_S`.
@@ -104,10 +116,10 @@ SchedRL unifies cross-framework behavior using two orthogonal knobs:
   2. Reassign queued/not-started work so it can run on the expanded workers.
   3. If load is still uneven, abort selected in-flight turns on overloaded workers and retry them on underloaded workers until the load is within tolerance.
      - This uses the same `REQUEST_RETRY` safety rules as shrink: deterministic per-turn request id + abort ACK required + two-phase commit for any stateful tool/env effects.
-     - Stop condition: stop abort+retry when the load gap across active workers is within **5%**.
-       - Definition: let `load[dp] = queued_trajectories_by_worker[dp] + inflight_trajectories_by_worker[dp]` (computed locally by the pipeline coordinator). Stop when:
-         `(max(load) - min(load)) / max(queued_trajectories + inflight_trajectories, 1) <= 0.05`.
-       - Note: `queued_trajectories_by_worker` and `inflight_trajectories_by_worker` are local-only numbers used for rebalance decisions. `report_progress(...)` stays pipeline-level (sum across all workers).
+	     - Stop condition: stop abort+retry when the load gap across active workers is within **5%**.
+	       - Definition: let `load[dp] = queued_trajectories_by_worker[dp] + inflight_trajectories_by_worker[dp]` (computed locally by the pipeline coordinator). Stop when:
+	         `(max(load) - min(load)) / step_target_trajectories <= 0.05`.
+	       - Note: `queued_trajectories_by_worker` and `inflight_trajectories_by_worker` are local-only numbers used for rebalance decisions. `report_progress(...)` stays pipeline-level (sum across all workers).
 
 Important distinction:
 - **Shrink** must migrate/cancel in-flight work on `P` (mandatory), because `P` may be offloaded/stopped and lose state.
@@ -118,7 +130,7 @@ Note:
   Therefore: shrink must rely on a migration mechanism (`REQUEST_RETRY`). If shrink happens at a safe boundary (no in-flight work), the migration path is a no-op but still the required contract.
 
 **Staleness rule of thumb**
-- `QUIESCE` targets strict consistency (new admission never starts with stale weights).
+- `QUIESCE-by-drain` and `QUIESCE-by-abort` target strict consistency (new admission never starts with stale weights).
 - `BATCH` yields fixed, batch-scoped staleness (e.g., one-step-off).
 - `INFLIGHT` yields bounded overlap; correctness requires output version tagging and a clear “which version is active” cutover rule.
 
@@ -170,25 +182,26 @@ These are the chosen design decisions for the protocol:
 
 ### 3.1 Responsibilities (Coordinator vs Scheduler)
 
-- **Coordinator chooses** `active_checkpoint_version` and **notifies the scheduler** of the new desired active version.
-- **Scheduler controls timing** of when to actually sync/activate that version on rollout workers, because it must coordinate with:
-  - shrink/expand (time-sharing),
-  - admission control,
-  - global GPU reallocation.
-- The coordinator controls timing **indirectly** by selecting the active version and (optionally) requesting an urgent sync; the scheduler still decides the safe execution moment.
-- **Coordinator can force** immediate syncing by requesting the scheduler to do so (may block/fail if unsafe).
+- **Coordinator chooses** `active_checkpoint_version` locally (which version new admission should target).
+- **Scheduler controls timing** of when to actually perform a weight sync, because it must coordinate with shrink/expand (time-sharing) and global GPU reallocation.
+- The coordinator triggers a sync only when it must force weights to be present on a worker set (e.g., after expand, before opening admission under `QUIESCE-by-drain`/`QUIESCE-by-abort`, or at a batch boundary).
 
 ### 3.2 Logical RPCs
 
 Allocation and resize:
 - `request_gpus(cluster_id, role, priority, ...)` / `release_gpus(cluster_id, role, ...)`
 - `request_release_gpus(cluster_id, role, ...)` (scheduler-driven generation release)
-- `expand_workers(worker_indices=...)` / `shrink_workers(worker_indices=...)` (DP-subset control)
-- `notify_allocation_applied(pipeline_id, role, active_worker_indices, ...)` (scheduler → coordinator completion signal)
+- `expand_workers(worker_indices=...)` / `shrink_workers(worker_indices=...)` (scheduler → coordinator DP-subset control; blocking RPC that returns only after completion)
 - `notify_cluster_released(cluster_id, role, ...)` (adapter/proxy release ACK)
 
+Checkpoint sync:
+- `request_checkpoint_sync(pipeline_id, version, ...)` (coordinator → scheduler sync intent; scheduler may merge with shrink/expand)
+
+Execution note:
+- The actual in-place weight update and “sync-on-expand” are performed inside the pipeline coordinator (e.g., a `ParameterSyncService` / model update group). The scheduler only decides *when* and *which workers* should be updated and may run a global shrink barrier first.
+
 Progress input:
-- `report_progress(queued_trajectories, inflight_trajectories, percent_remaining, oldest_unfinished_creation_ts, metrics=...)`
+- `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts, metrics=...)`
 
 #### `report_progress(...)` semantics (SchedRL-standard)
 
@@ -203,21 +216,20 @@ SchedRL standardizes progress reporting across frameworks so the scheduler can m
 - `inflight_trajectories`: trajectories that are currently running (at least one turn/request is running or pending on a worker/engine).
 
 **Cadence (2% bands)**
-- We keep the 2% reporting cadence, but the denominator is the **rollout target per training step** (in trajectory units).
-- This is always available as a config value in the target frameworks (ROLL rollout_batch_size, NeMo num_prompt_groups_needed, Miles rollout_batch_size, SkyRL policy_mini_batch_size).
-- Because the denominator is “per step”, `percent_remaining` can be **greater than 100%** when the pipeline backlog is larger than one step.
-- Band thresholds are applied on the **raw percent** (no cap at 100%). For example: 146%, 144%, 142%, ..., 100%, 98%, ...
+- We keep the 2% reporting cadence, but the denominator is the **per-step training batch size** (total samples trained per step, in trajectory units): `step_target_trajectories`.
+- Mapping: ROLL `rollout_batch_size`; NeMo-RL `train_global_batch_size`; Miles `rollout_batch_size * n_samples_per_prompt`; SkyRL-train `train_batch_size * n_samples_per_prompt` (no single knob).
+- `percent_completed >= 1.0` means the next train step’s batch is ready (enough trajectories are collected/qualified and available for training).
+- `percent_completed` may be **greater than 1.0** if the pipeline over-collects. For event-driven 2% bands, the coordinator may cap at `min(percent_completed, 1.0)` to avoid spam.
 
 **What fields mean**
-- `percent_remaining`: `(queued_trajectories + inflight_trajectories) / step_target_trajectories`.
+- `percent_completed`: `collected_trajectories / step_target_trajectories`, where `collected_trajectories` is the number of trajectories that are complete and ready for training for the next step (e.g., buffered/qualified and not yet consumed by the trainer).
 - `oldest_unfinished_creation_ts`: the oldest **trajectory enqueue time** among `unfinished` only (queued + in-flight).
   - For queued items, this is their enqueue time.
   - For in-flight items, use the same trajectory enqueue time (do not replace with worker start time).
 - For retries of the current turn/request (`REQUEST_RETRY`), enqueue time is attached to the trajectory identity and is not reset per retry.
 
-**Optional (recommended) metrics**
-- `metrics.dropped_trajectories_total`: how many trajectories were permanently dropped (unqualified and not retried). Not needed for correctness, but useful for monitoring.
-- `metrics.retried_trajectories_total`: how many trajectories/turns were retried. Not needed for correctness.
+ 
+
 
 #### Scheduler policy (high-level, standardized)
 
@@ -226,11 +238,11 @@ priority score.
 
 **Primary scheduling signals (global)**
 - **Priority tier** (configured): higher tiers first (e.g., non-preemptible training clusters ahead of preemptible generation).
-- **Staleness / activation constraints**: do not schedule actions that would violate the pipeline’s `update_policy` or checkpoint activation intent.
+- **Update policy constraints**: do not schedule actions that would violate the pipeline’s configured `update_policy` safety rules.
 - **Age/fairness**: `oldest_unfinished_creation_ts` is the FIFO tie-break (older unfinished work gets service first).
 - **Throughput/rate** (optional): if available, prefer allocations that improve global utilization (without violating fairness).
 
-**How `percent_remaining` is used**
+**How `percent_completed` is used**
 - **Anti-thrashing**: avoid repeatedly shrinking/expanding a pipeline’s generation cluster when it is actively making progress (band changes) or when it is near completion.
 - **Lease-expiry guidance**: if a pipeline is not making progress (no band changes) and other higher-priority work needs GPUs, it is a better donor for shrink.
 
@@ -243,61 +255,69 @@ This keeps behavior stable for both finite backlogs and continuously-refilled pi
   must be refactored (e.g., by splitting/renaming “shared” nodes or relaxing the shared-node mapping).
 
 Checkpoint intent and sync timing:
-- `request_checkpoint_activation(pipeline_id, active_version, active_checkpoint_ref, update_policy, ...)`
-  - Declares *which* checkpoint should become active. This updates the scheduler’s target `active_checkpoint_version`, but does not necessarily perform sync immediately.
-- `request_checkpoint_sync(pipeline_id, version, urgency={best_effort|force}, ...)`
-  - Requests the scheduler to perform syncing/activation at the chosen time; `force` means “do it now or block/fail”.
-- Optional: `notify_checkpoint_published(pipeline_id, version, checkpoint_ref, ...)` for observability/prefetch; not required for correctness.
+- Coordinator tracks `active_checkpoint_version` locally (which version new admission should target).
+- Scheduler does **not** need to be informed on every local activation change.
+- `request_checkpoint_sync(pipeline_id, version, ...)`
+  - Forced operation (intent): the coordinator calls this only when it must **actually synchronize weights** (load/broadcast) for a specific version before it can safely proceed (source is the trainer-side CPU bucket cache by default).
+  - Scheduler chooses a safe execution moment and the concrete worker set (may merge with shrink/expand and admission gates); if it cannot do so safely, it must fail fast.
 
 ### 3.3 Checkpoint State + Cache Contract
 
-Scheduler tracks (per pipeline / generation):
+Coordinator tracks (per pipeline / generation):
 - `latest_checkpoint_version` (informational)
-- `active_checkpoint_version` (authoritative sync/activation target; admission must only open when workers match it)
-- `active_checkpoint_ref` (how rollout workers pull the active checkpoint; default source is the trainer checkpoint cache)
+- `active_checkpoint_version` (local target for new admission; may intentionally lag latest)
 - `update_policy`
 
-Each rollout worker tracks:
-- `worker_active_checkpoint_version`
-- `cached_checkpoint_versions` (optional)
+Trainer-side checkpoint cache service tracks:
+- `checkpoint_cpu_cache_versions` (CPU bucket-list versions currently retained)
+
+Coordinator also tracks:
+- `worker_active_checkpoint_version[worker]` (what version each rollout worker is known to have loaded/activated)
+- `in_use_checkpoint_versions` (versions referenced by unfinished work; used for safe cache GC)
+
+Rollout workers may have local caches, but they are not relied on for correctness.
 
 Correctness invariant:
-- Never open admission on a worker unless `worker_active_checkpoint_version == active_checkpoint_version`.
+- The coordinator controls admission; it must never dispatch new work to a worker unless `worker_active_checkpoint_version[worker]` matches the required version for that work.
+  - For `QUIESCE-by-drain`/`QUIESCE-by-abort`: required version is `active_checkpoint_version`.
+  - For `BATCH`: required version is the batch-pinned version chosen by the coordinator at the boundary.
+  - For `INFLIGHT`: in-flight work may finish on older versions, so the coordinator must track which versions are still in use (`in_use_checkpoint_versions`) for safe cache retention/GC.
 
-**Race: superseded activations (coalescing)**
-- The coordinator may request activation of `v2` and then quickly request activation of `v3` before syncing `v2` completes.
-- Scheduler behavior must be “last-writer-wins”: coalesce pending work and always converge to the newest requested `active_checkpoint_version`.
-  - Before starting an expensive sync/activate for version `v`, re-check that `v` is still the currently requested active version; if not, skip `v`.
-  - If a sync for `v` is already running and a newer activation arrives, best-effort cancel; if cancellation is not supported, allow it to finish but treat its result
-    as stale (do not reopen admission / do not mark cutover complete for `v`).
-- Required: include an `activation_epoch` in `request_checkpoint_activation(...)` so the scheduler can ignore stale completions safely.
+**Race: superseded sync requests (coalescing)**
+- The coordinator may request sync of `v2` and then quickly request sync of `v3` before syncing `v2` completes.
+- Scheduler/proxy behavior must be “last-writer-wins”: it must not reopen admission or mark cutover complete for an older sync that is already superseded by a newer sync request.
 
-Trainer cache retention (minimum):
-- Keep `{active_checkpoint_version, latest_checkpoint_version}` in the trainer CPU checkpoint cache:
-  - `active_checkpoint_version` is required for correctness (rollouts must be able to pull/sync it even after shrink/offload drops worker-local weights).
-  - `latest_checkpoint_version` is kept as a prefetch optimization because it is expected to become active later.
-  - Note: `active_checkpoint_version` and `latest_checkpoint_version` may be the same; in that case they refer to the same cached copy.
-- In practice, the trainer checkpoint cache is populated after each `trainer.step()`; CPU-cached versions older than `{active, latest}` can be GC’d once the coordinator advances `active_checkpoint_version`
-  *and* it is guaranteed that no in-flight work can still depend on older versions.
+Trainer-side CPU cache retention (minimum):
+- After each train step, the trainer-side cache service materializes the trained weights into CPU bucket-list form and updates `latest_checkpoint_version`.
+- Keep `{active_checkpoint_version, latest_checkpoint_version}` in the trainer-side CPU bucket cache at minimum:
+  - `active_checkpoint_version` is required for correctness (expand/resume must be able to re-sync it after shrink/offload drops worker-local weights).
+  - `latest_checkpoint_version` is kept because it is expected to become active later (and is already produced every step).
+  - Note: `active_checkpoint_version` and `latest_checkpoint_version` may be the same.
+- Always keep any version in `in_use_checkpoint_versions` (as reported/pinned by the coordinator).
+  - Example: under `QUIESCE-by-drain`, in-flight work may still be running on an older weight version, so that version must remain in the CPU cache until the drain completes.
 
-**Race: trainer cache GC**
-- The coordinator should not “hard delete” old versions unilaterally. Cache eviction must be safe with respect to late scheduler actions (expand/resume).
-- Use one of:
-  - **Pin/lease/refcount**: scheduler pins `active_checkpoint_version` (and any in-flight activation target) until it ACKs completion; trainer cache only GC’s
-    unpinned versions.
-  - **Strict delete (default)**:
-    - Keep `{active_checkpoint_version, latest_checkpoint_version}`.
-    - Also keep any version that is currently being synced (an in-flight sync task).
-    - Delete older versions immediately once they are not `{active, latest}` and not in-flight.
-    - Special case: “previous” is not kept by TTL. It is kept only if it is still being synced.
+**Race: trainer-side CPU cache GC**
+- Cache eviction must be safe with respect to late expand/resume and in-flight sync.
+- Default GC rule (safe):
+  - Keep `{active_checkpoint_version, latest_checkpoint_version}`.
+  - Keep any version currently being synced (an in-flight `request_checkpoint_sync` task).
+  - Keep any version in `in_use_checkpoint_versions` (unfinished work pinned to it, as tracked by the coordinator).
+  - Delete older versions only once they are not `{active, latest}`, not in-flight sync, and not in-use.
 
 ### 3.4 Elastic Rollout Workers (Shrink/Expand + Sync)
 
+This section covers:
+1) shrink/expand alone (time-sharing resize, weights unchanged),
+2) model sync without resize (`INFLIGHT`/`QUIESCE` without shrink/expand),
+3) merged resize + model sync.
+
+#### 3.4.1 Shrink/Expand Alone (Weights Unchanged)
+
 **Shrink (`old_S -> new_S`, `P = old_S − new_S`)**
-1. Close admission for `P`.
-2. Migrate/cancel in-flight work on `P` according to `migration_policy` (mandatory for shrink).
+1. Coordinator closes admission for `P`.
+2. Migrate/cancel in-flight work on `P` according to `migration_policy` (mandatory for shrink), and wait until `inflight(P) == 0` (abort ACK or drain completion).
 3. Offload/remove model weights from GPU for `P` (sleep/offload/stop) to free memory.
-4. ACK completion (`notify_allocation_applied` or blocking return) so GPUs can be reassigned.
+4. Return from `shrink_workers(...)` so the scheduler can reassign GPUs.
 
 If you want to “pause and later resume on the same worker”, model it as **pause without shrink** (no deallocation/offload), not as a shrink.
 
@@ -307,35 +327,75 @@ Miles/SGLang note:
 - If offload/sync waits on “engine queue empty” (flush/drain), admission must be closed at the router/dispatcher level first; otherwise new arrivals can keep the engine
   busy indefinitely and starve offload/weight sync.
 
-**Pause without shrink (no deallocation)**
-- Close admission on a subset or pipeline, but keep the workers allocated and their local state intact.
-- Used for: `INFLIGHT` activation barriers, batch boundaries, or “stop admitting new work” without giving GPUs back.
-
 **Expand (`old_S -> new_S`, `A = new_S − old_S`)**
-1. Pull+activate `active_checkpoint_version` on `A` from `active_checkpoint_ref` (trainer checkpoint cache by default).
-2. Open admission for `A`.
+1. Sync+activate `active_checkpoint_version` on `A` from the trainer-side CPU bucket cache service (default).
+2. Coordinator opens admission for `A` after sync completes.
 3. Optional (enabled by default): rebalance queued/not-started work onto `A` (queue/tail rebalance).
+4. Return from `expand_workers(...)` so the scheduler can proceed.
 
 Expand safety rule:
-- Before dispatching an expand that will pull checkpoints, the scheduler must re-validate the current `active_checkpoint_version` (and its ref) and expand using that
-  version, not a stale queued activation intent.
+- Before dispatching an expand that will trigger a weight sync, the scheduler must re-validate the current `active_checkpoint_version` and expand using that version
+  (not a stale queued intent).
 
-**In-place sync (no allocation change)**
-- If `old_S == new_S` but `active_checkpoint_version` changes (common under `INFLIGHT`), the scheduler may apply checkpoint alignment to the existing subset `S`
-  without any new allocations.
+#### 3.4.2 Model Sync Without Resize
 
-**Merging activation with time-sharing resize**
-- If activation and resize happen concurrently, treat it as one plan:
-  - compute post-decision `new_S`,
-  - migrate/offload `P`,
-  - pull+activate for `A`,
-  - in-place update for `new_S ∩ old_S`,
-  - reopen admission on `new_S`.
+This is the “model sync only” case: the scheduler does not change allocation (`old_S == desired_S == S`), but the pipeline needs to move the existing workers to a new active checkpoint version.
 
-### 3.5 Version Tagging
+**Pause without shrink (no deallocation)**
+- Coordinator closes admission (no new starts) but keeps the workers allocated and their local state intact.
 
-Required when `INFLIGHT` is used (and recommended otherwise):
-- Every produced sample/trajectory is tagged with `generation_checkpoint_version`.
+**In-place sync (no allocation change) — INFLIGHT**
+- Goal: ensure no new request/turn starts on `v_old` after switching `active_checkpoint_version := v_new`, while allowing already-running work to finish (mixing is allowed).
+- Steps:
+  1. Coordinator closes admission for **new starts** on `S`.
+  2. Coordinator flips `active_checkpoint_version := v_new`.
+  3. Coordinator (via `ParameterSyncService` / model update group) performs an in-place weight sync to `v_new` on `S` (scheduled by the scheduler from the coordinator’s `request_checkpoint_sync(...)` intent).
+  4. Coordinator reopens admission on `S`.
+- Optional (stronger semantics): abort the current turn and redo it on `v_new` (still INFLIGHT across turns, but avoids continuing a partially-generated turn on `v_old`).
+
+**In-place sync (no allocation change) — QUIESCE-by-drain / QUIESCE-by-abort**
+- Goal: ensure no in-flight work remains before syncing workers to `v_new` (strict boundary).
+- Steps:
+  1. Coordinator closes admission on `S`.
+  2. Reach `inflight(S) == 0`:
+     - `QUIESCE-by-drain`: wait for in-flight work to finish naturally.
+     - `QUIESCE-by-abort`: abort in-flight work, wait abort ACK, and rely on `REQUEST_RETRY` to redo aborted turns later under `v_new`.
+  3. Coordinator flips `active_checkpoint_version := v_new`.
+  4. Coordinator (via `ParameterSyncService` / model update group) performs an in-place weight sync to `v_new` on `S` (scheduled by the scheduler from the coordinator’s `request_checkpoint_sync(...)` intent).
+  5. Coordinator reopens admission on `S`.
+
+This section is also a special case of the merged scenario below when `desired_S == old_S`.
+
+#### 3.4.3 Merged: Resize + Model Sync
+
+**Two-phase scheduling: shrink (all pipelines) → sync+expand (all pipelines)**
+- When time-sharing resize and activation (policy update) must be coordinated across many pipelines, the scheduler should run a two-phase barrier:
+  1) **Shrink phase (global)**: issue `shrink_workers(...)` for each pipeline to free GPUs first.
+  2) **Sync+expand phase (global)**: after all shrinks complete, execute the per-pipeline “sync+expand” actions (below) using the freed GPUs.
+
+This keeps the benefit you want (expand can be fused with selective model update) without introducing a new RPC: “sync+expand” is a logical unit composed from `request_checkpoint_sync(...)` + `expand_workers(...)`.
+
+**Per-pipeline merged steps (after the shrink phase completes)**
+1. Scheduler decides the target active version `v_new` and the post-decision worker set `desired_S`.
+2. Let `S_remain` be the workers that remain allocated after shrink (typically `S_remain = desired_S` after phase-1 shrinks).
+3. Policy update + in-place sync (option B reuse):
+   - If `update_policy` is `INFLIGHT` (no QUIESCE):
+     1) Coordinator closes admission for **new starts** on `S_remain`.
+     2) Coordinator flips `active_checkpoint_version := v_new`.
+     3) Coordinator (via `ParameterSyncService` / model update group) performs an in-place weight sync to `v_new` on `S_remain` (scheduled by the scheduler from the coordinator’s `request_checkpoint_sync(...)` intent).
+     4) Coordinator reopens admission on `S_remain`.
+   - If `update_policy` is `QUIESCE-by-drain` or `QUIESCE-by-abort`:
+     - Scheduler should have already shrunk the pipeline to zero workers in the shrink phase (set `desired_S := ∅` for that pipeline in phase 1).
+     - In that case, there is no in-place sync (no active rollout workers remain); the next step is expand-from-zero under `v_new`.
+4. Expand if needed: compute `A = desired_S − S_remain`, then call `expand_workers(A)`.
+   - `expand_workers(A)` must sync/load `v_new` from the trainer-side CPU cache service before admission opens on `A` (selective “sync-on-expand” handled by the coordinator’s `ParameterSyncService` / model update group).
+5. Coordinator opens admission on `desired_S`.
+
+### 3.5 Version Tagging (Backlog)
+
+Optional (recommended for debugging/analysis):
+- Tag every produced sample/trajectory with `generation_checkpoint_version`.
+  - This can help when a logical “trajectory” spans multiple weight versions (e.g., `INFLIGHT`, or `QUIESCE-by-abort` where an aborted turn is retried later under a newer active version).
 
 ---
 
@@ -349,13 +409,13 @@ The protocol covers a mode if it can define:
 (1) an `update_policy` (how/when rollouts observe new weights),
 (2) a `migration_policy` for shrink preemption (how in-flight work moves),
 (3) a checkpoint alignment mechanism (pull+activate vs in-place),
-and (4) version tagging rules when overlap is allowed.
+and (4) a clear rule for how training consumes mixed-version data when overlap is allowed.
 
 | Mode / Use case | What happens | `update_policy` | Allocation change required? | Preemption during rollout | Coverage notes |
 |---|---|---|---|---|---|
-| **On-policy (sync)** | Rollout then train; no overlap | `QUIESCE` or `BATCH` | No | Yes (shrink/expand during rollout) | Trivial activation; resize uses `REQUEST_RETRY` (cancel+retry). If there is no in-flight work, the migration path is a no-op. |
-| **Pipelined batch overlap (one/two-step-off)** | Train step N overlaps rollout for step N+1 | `BATCH` | No | Yes | Activation at batch boundary; requires tagging if training consumes mixed versions. |
-| **Buffered async generation (bounded staleness)** | Rollout continues while training consumes from buffer | `QUIESCE` (typical) | No | Yes | Activation requires drain/abort boundary; strict “no admission with stale weights”. |
+| **On-policy (sync)** | Rollout then train; no overlap | `QUIESCE-by-drain` or `BATCH` | No | Yes (shrink/expand during rollout) | Trivial activation; resize uses `REQUEST_RETRY` (cancel+retry). If there is no in-flight work, the migration path is a no-op. |
+| **Pipelined batch overlap (one/two-step-off)** | Train step N overlaps rollout for step N+1 | `BATCH` | No | Yes | Activation at batch boundary; training must define how it consumes any mixed-version data (if it happens). |
+| **Buffered async generation (bounded staleness)** | Rollout continues while training consumes from buffer | `QUIESCE-by-drain` (typical) or `QUIESCE-by-abort` | No | Yes | Activation requires a QUIESCE boundary and strict “no admission with stale weights”. |
 | **Always-on background rollout worker** | Background worker keeps producing rollouts; training drains | N/A | No | Hard | Not supported for SchedRL adaptation (example: Miles `third_party/miles/examples/fully_async`). Hard to time-share GPUs because there is no clean scheduler-controlled “stop point” and shrink timing becomes unpredictable. |
 | **In-flight update (no stop)** | Update active rollout workers in-place | `INFLIGHT` | No | Yes (but merged with activation) | Scheduler may sync existing `S` without resize; merge with shrink decisions to avoid syncing preempted workers. |
 | **Time-sharing resize (weights unchanged)** | Scheduler shrinks/expands `S` mid-rollout | N/A (activation unchanged) | Yes | Yes | Uses `migration_policy` on shrink; expand pulls `active` checkpoint if weights were offloaded. |
@@ -364,10 +424,10 @@ and (4) version tagging rules when overlap is allowed.
 
 | Framework | Covered by protocol | What is required in the codebase to fully realize it |
 |---|---|---|
-| **NeMo-RL** | `QUIESCE` + `INFLIGHT` activation; resize time-sharing | Subset lifecycle + admission gating wiring (see `design_doc/adaptation_nemo_rl.md`); version tagging already exists as `(generation_weight_version, target_weight_version)` and should map to `generation_checkpoint_version` / `active_checkpoint_version`. |
-| **ROLL (Agentic)** | `QUIESCE` activation; abort+retry at turn boundary | Subset start/stop + routing remap (clear sticky mappings) so aborted turns retry on remaining/new DP ranks (see `design_doc/adaptation_roll.md`). |
+| **NeMo-RL** | `QUIESCE-by-drain` + `INFLIGHT` activation; resize time-sharing | Subset lifecycle + admission gating wiring (see `design_doc/adaptation_nemo_rl.md`); version tagging already exists as `(generation_weight_version, target_weight_version)` and should map to `generation_checkpoint_version` / `active_checkpoint_version`. |
+| **ROLL (Agentic)** | `QUIESCE-by-abort` activation; abort+retry at turn boundary | Subset start/stop + routing remap (clear sticky mappings) so aborted turns retry on remaining/new DP ranks (see `design_doc/adaptation_roll.md`). |
 | **Miles** | `BATCH` activation and step-based async (`train_async.py`) | Support `train.py` (sync) and `train_async.py` (one-step-ahead overlap) plus sync-by-interval (`update_weights_interval`). Do not use `third_party/miles/examples/fully_async`. Subset targeting (`indices=...`) for `RolloutManager.onload/offload`; implement `REQUEST_RETRY` by aborting subset engines and re-queueing work to the global data source (see `design_doc/adaptation_miles.md`). |
-| **SkyRL-train** | `BATCH` (one-step-off) and fully-async with staleness control (**GSM8K multi-turn only**) | Use existing SkyRL-train async entrypoints first (`third_party/SkyRL/skyrl-train/examples/async`, `third_party/SkyRL/skyrl-train/examples/fully_async`), then add subset lifecycle if/when SchedRL needs live shrink/expand (see `design_doc/adaptation_skyrl.md`). |
+| **SkyRL-train** | `BATCH` (one-step-off) and `QUIESCE-by-abort` (fully-async) | Use existing SkyRL-train async entrypoints first (`third_party/SkyRL/skyrl-train/examples/async`, `third_party/SkyRL/skyrl-train/examples/fully_async`), then add subset lifecycle if/when SchedRL needs live shrink/expand (see `design_doc/adaptation_skyrl.md`). |
 
 ### 4.3 Doc vs Code Status (Reality Check)
 
@@ -385,7 +445,7 @@ Legend: `present` / `partial` / `missing`.
 ### 4.4 Progress Mapping (Per-framework)
 
 This section makes the `report_progress(...)` contract implementable by mapping the three state sets to concrete places
-in each framework. The scheduler consumes `queued_trajectories`, `inflight_trajectories`, `percent_remaining`, and `oldest_unfinished_creation_ts`.
+in each framework. The scheduler consumes `queued_trajectories`, `inflight_trajectories`, `percent_completed`, and `oldest_unfinished_creation_ts`.
 
 #### Shared definitions (trajectory units)
 
@@ -408,7 +468,7 @@ in each framework. The scheduler consumes `queued_trajectories`, `inflight_traje
 - Report:
   - `queued_trajectories = queued_prompt_groups * num_generations_per_prompt`
   - `inflight_trajectories = inflight_prompt_groups * num_generations_per_prompt`
-  - `step_target_trajectories = num_prompt_groups_needed * num_generations_per_prompt`
+  - `step_target_trajectories = train_global_batch_size` (where `train_global_batch_size = num_prompt_groups_needed * num_generations_per_prompt`)
 
 #### Miles
 
@@ -425,7 +485,7 @@ in each framework. The scheduler consumes `queued_trajectories`, `inflight_traje
 - Report:
   - `queued_trajectories`: queued `TrajectoryID`s
   - `inflight_trajectories`: running `TrajectoryID`s
-  - `step_target_trajectories = policy_mini_batch_size`
+  - `step_target_trajectories = train_batch_size * n_samples_per_prompt`
 
 #### Qualification + consumption events (important)
 
@@ -438,16 +498,16 @@ Adapters must update the denominator window correctly:
 
 - `PARTIAL_ROLLOUT_MIGRATE` is a future feature (resume tokens / backlog items) and is not required for baseline correctness.
 - Subset-level lifecycle (`indices=...`) is required for full time-sharing benefits; if missing, the protocol still works at cluster granularity but loses fine-grained sharing.
-- Any mode that allows overlap (`INFLIGHT`, some `BATCH` pipelines) requires reliable `generation_checkpoint_version` tagging and downstream handling during training.
+- Any mode that allows overlap (`INFLIGHT`, some `BATCH` pipelines) requires a clear “mixed-version consumption” rule in training and accurate `in_use_checkpoint_versions` tracking. Optional: `generation_checkpoint_version` tagging for debugging/analysis.
 - Backlog: rLLM+VeRL agentic training integration is archived; it does not provide the needed async training modes (one-step-off, fully-async with staleness control, and elastic subset shrink/expand). If we revisit it, start from `design_doc/archive/adaptation_rllm.md`.
 - Backlog: SkyAgent SWE + async training integration (reuse SkyRL-train async trainers with the SkyAgent generator). Start from `third_party/SkyRL/skyrl-agent/examples/run_skyrl/run_skyrl_swe.sh` and `design_doc/adaptation_skyrl.md`.
 
 | Framework | Typical `update_policy` | Resize/migration baseline | Notes |
 |----------|--------------------------|---------------------------|------|
-| **NeMo-RL** | `INFLIGHT` when `async_engine && in_flight_weight_updates`, else `QUIESCE` | `REQUEST_RETRY` (retry current request/turn for prompt group) | Required: coordinator-provided vLLM `request_id` (not worker-generated UUID) + targeted abort/ACK + retry queue; reuse `prepare_for_refit` admission gating. |
-| **ROLL (Agentic)** | `QUIESCE` | abort + remap + retry (turn-level) | Abort exists (`GenerateRequestType.ABORT`); env loop retries on `ABORT` and resumes without stepping env state; subset start/stop + remap glue needed for time-sharing shrink/expand. |
-| **Miles** | `BATCH` | `REQUEST_RETRY` (retry current turn; trajectory can continue if context is preserved) | Required: coordinator-provided SGLang `rid` + targeted abort/ACK; global data buffer can re-queue work for retry; subset offload/onload + router admission-close are extensions. |
-| **SkyRL-train** | One-step-off: `BATCH`; Fully-async: framework-managed staleness | `REQUEST_RETRY` (mid-flight shrink required) | vLLM-only for fully-async; required: coordinator-provided vLLM `request_id` + targeted abort/ACK; subset shrink/expand requires active-engine-set control in the client/router. |
+| **NeMo-RL** | `INFLIGHT` when `async_engine && in_flight_weight_updates`, else `QUIESCE-by-drain` | `REQUEST_RETRY` (retry current request/turn for prompt group) | QUIESCE-by-drain path waits for pending **prompt-group rollout threads** at the refit boundary; INFLIGHT path updates weights while in-flight prompt-group rollouts continue (no global abort). Required: coordinator-provided vLLM `request_id` (not worker-generated UUID) + targeted abort/ACK + retry queue; reuse `prepare_for_refit` admission gating. |
+| **ROLL (Agentic)** | `QUIESCE-by-abort` (with timeout) | abort + remap + retry (turn-level) | Boundary is implemented by stopping the generate server; vLLM STOP path aborts outstanding requests before model update (abort-to-zero semantics with a timeout). Abort exists (`GenerateRequestType.ABORT`); env loop retries on `ABORT` and resumes without stepping env state; subset start/stop + remap glue needed for time-sharing shrink/expand. |
+| **Miles** | `BATCH` | `REQUEST_RETRY` (retry current turn; trajectory can continue if context is preserved) | Weight updates are triggered at rollout boundaries; `train_async.py` drains the “next rollout” future before `update_weights()` to avoid updating weights mid-generation (BATCH boundary). Required: coordinator-provided SGLang `rid` + targeted abort/ACK; global data buffer can re-queue work for retry; subset offload/onload + router admission-close are extensions. |
+| **SkyRL-train** | `BATCH` (one-step-off) and `QUIESCE-by-abort` (fully-async with atomic pause/resume) | `REQUEST_RETRY` (mid-flight shrink required) | Fully-async uses inference-engine pause + abort-resume + sync + resume (transparently re-issuing aborted work). Strict consistency is preserved (requests must restart). For shrink, still need coordinator-provided vLLM `request_id` + targeted abort/ACK; subset shrink/expand requires active-engine-set control in the client/router. |
 
 Validation checklist (shared):
 - Activation without resize is supported (INFLIGHT case).
@@ -463,24 +523,21 @@ Baseline requirements (all frameworks):
 - Subset lifecycle: `expand_workers(worker_indices)` / `shrink_workers(worker_indices)` with fixed placement.
 - Admission control: close/open admission for subsets and/or pipeline-wide pause.
 - Checkpoint alignment:
-  - pull/sync from `active_checkpoint_ref` (trainer checkpoint cache)
+  - sync from the trainer-side CPU bucket cache service (default)
   - activate to serving engine
   - in-place update support where available (INFLIGHT)
 - Migration on shrink: implement at least `REQUEST_RETRY` (cancel + retry/re-issue). This typically restarts the **current request/turn** (safe boundary), not the entire multi-turn trajectory.
   - Validate the two-phase commit invariant: do not execute stateful tool/env effects unless a non-abort generation result is received (single-writer commit).
   - Required: coordinator-generated per-turn request id must be used as the rollout-engine request id (vLLM `request_id`, SGLang `rid`) so targeted abort+ACK+retry is possible.
-- Version tagging (simple, for debugging):
-  - Record `generation_checkpoint_version` when the **first turn** of a multi-turn trajectory is submitted (trajectory start version).
-  - Record `generation_checkpoint_version` again when the **last turn** finishes (trajectory end version).
-  - This shows if a trajectory ran across a weight update (start version != end version).
-- Progress reporting: report at **batch start** and whenever progress crosses a **2% band**, including the final **0% (completion)** signal.
-  - Recommended: always emit an update when `remaining_trajectories_total == 0` for the current backlog window so the scheduler can release/reallocate promptly.
+- Progress reporting: report at **batch start** and whenever progress crosses a **2% band**, including the final **100% (ready)** signal (`percent_completed >= 1.0`).
+  - Recommended: always emit an update when `percent_completed >= 1.0` for the current backlog window so the scheduler can release/reallocate promptly.
   - Required: if the denominator window changes (queued/in-flight/buffered sets change), emit immediately and rebase the 2% bands (see `report_progress(...)` semantics above).
 - Release ACK: emit `notify_cluster_released` after normal release/shrink completes.
 
 Optional/backlog features:
 - `PARTIAL_ROLLOUT_MIGRATE` (resume tokens / backlog items to avoid restarting the current request/turn).
-- Prefetch/warm cache driven by `notify_checkpoint_published`.
+- Trainer-side cache service (always-on): materializes the latest trained checkpoint into CPU bucket-list form after each train step, so `request_checkpoint_sync(...)` can broadcast/load from CPU without disk/object-store fetch.
+- Version tagging (debugging/analysis): tag samples/trajectories with `generation_checkpoint_version` (useful for `INFLIGHT` and `QUIESCE-by-abort` retry paths).
 - Backlog (safety hardening): add idempotency keys for stateful env/tool commits (e.g., `trajectory_id + turn_id + action_id`) so retries after timeouts/crashes cannot double-apply side effects.
 
 **Code-change inventory (minimum to satisfy elastic time-sharing)**

@@ -111,6 +111,14 @@ This section reality-checks NeMo-RL against the shared protocol in `design_doc/m
 - Add a shrink-time preemption hook that can abort/cancel in-flight work for a subset; if per-request abort is not feasible initially, treat subset `sleep()` as a hard stop and rely on `REQUEST_RETRY` via the retry queue (retry current request/turn on remaining workers). (Today NeMo-RL’s vLLM worker calls `llm.sleep(level=1)`; making “deeper” sleep a tunable parameter would be an extension.)
 - Wire standardized progress heartbeats from `AsyncTrajectoryCollector` after enqueue/buffer updates.
 
+**Critical Implementation Gaps (Must Fix Before Phase 0)**
+
+| Gap | Location | Issue | Fix Required |
+|-----|----------|-------|--------------|
+| **Two-phase admission incomplete** | `async_utils.py` | Already-queued prompt-group threads can start after admission close via `_refit_pause_cleared` | Add queue-drain barrier; ensure no queued work starts after close |
+| **No `creation_ts` tracking** | `async_utils.py` | `oldest_unfinished_creation_ts` required but not tracked; timestamp set at completion not submission | Add enqueue timestamp to prompt-group at submission time, not completion |
+
+
 ## 2. Existing Code Integration Points (Pre-Adaptation)
 
 ### 2.1 Training Entry Point

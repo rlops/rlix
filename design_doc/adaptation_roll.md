@@ -101,6 +101,16 @@ This section reality-checks ROLL (Agentic pipeline) against the shared protocol 
 - Add `ModelUpdateGroup.model_update(worker_indices=...)` / comm-plan filtering so selective sync-on-resume is possible.
 - Wire `report_progress(queued_trajectories, inflight_trajectories, percent_completed, oldest_unfinished_creation_ts)` from the rollout buffer enqueue point (e.g., `GroupQueue.put`/`GroupQueueManager`).
 
+**Critical Implementation Gaps (Must Fix Before Phase 0)**
+
+| Gap | Location | Issue | Fix Required |
+|-----|----------|-------|--------------|
+| **Sticky routing** | `generate_scheduler.py:884-887` | `src_rank2_dp_rank` is never cleared on shrink; routes to dead workers | Clear mapping when DP workers are removed |
+| **Static comm plan** | `model_update_group.py` | `model_update` iterates entire `broadcast_comm_pan` without filtering; hangs waiting for shrunk workers | Add `active_subset` filter before iterating comm plan |
+| **Abort ACK not awaited** | `generate_scheduler.py` | Aborts are fire-and-forget; no confirmation wait | Add ACK wait with 10s timeout before proceeding with shrink |
+| **No `creation_ts` tracking** | `generate_scheduler.py` | `oldest_unfinished_creation_ts` required but not tracked | Add enqueue timestamp to `ExperienceItem` or group data structure |
+
+
 ## 2. Existing Code Integration Points (Pre-Adaptation)
 
 ### 2.1 Training Entry Point

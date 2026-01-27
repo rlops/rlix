@@ -175,6 +175,11 @@ These are the chosen design decisions for the protocol:
 11) Placement changes (Phase 1 style)
 - Decision: fixed placement is enough for Phase 1. We do not require “resize Ray placement groups at runtime”.
 
+12) Drain granularity selection (Turn vs Trajectory-Group)
+- Decision: **Match the framework's native execution unit.** Do not force a granularity that conflicts with the framework's internal batching.
+  - **Turn/request drain**: Use if the framework schedules individual requests/turns (e.g., Miles, SkyRL-train).
+  - **Trajectory-group drain**: Use if the framework schedules opaque groups/threads (e.g., NeMo-RL prompt groups, ROLL rollout groups).
+
 ## 3) Protocol (Shared)
 
 ### 3.1 Responsibilities (Coordinator vs Scheduler)
@@ -498,6 +503,21 @@ Adapters must update the denominator window correctly:
 - Any mode that allows overlap (`INFLIGHT`, some `BATCH` pipelines) requires a clear “mixed-version consumption” rule in training and accurate `in_use_checkpoint_versions` tracking. Optional: `generation_checkpoint_version` tagging for debugging/analysis.
 - Backlog: rLLM+VeRL agentic training integration is archived; it does not provide the needed async training modes (one-step-off, fully-async with staleness control, and elastic subset shrink/expand). If we revisit it, start from `design_doc/archive/adaptation_rllm.md`.
 - Backlog: SkyAgent SWE + async training integration (reuse SkyRL-train async trainers with the SkyAgent generator). Start from `third_party/SkyRL/skyrl-agent/examples/run_skyrl/run_skyrl_swe.sh` and `design_doc/adaptation_skyrl.md`.
+
+### 4.6 Critical Implementation Gaps (Must Fix Before Phase 0)
+
+Framework-specific gaps are documented in each per-framework adaptation file:
+- ROLL: `design_doc/adaptation_roll.md` (sticky routing, static comm plan, abort ACK, creation_ts)
+- Miles: `design_doc/adaptation_miles.md` (missing `/remove_worker`, creation_ts)
+- NeMo-RL: `design_doc/adaptation_nemo_rl.md` (two-phase admission, creation_ts)
+
+**Cross-cutting gaps (apply to all frameworks)**:
+
+| Gap | Issue | Fix Required |
+|-----|-------|--------------|
+| **No `in_use_checkpoint_versions`** | Cache GC safety mechanism exists only in plan | Implement version reference counting |
+| **No thrashing prevention** | No `minimum_hold` or lease mechanism | Add minimum allocation hold time |
+
 
 | Framework | Typical `update_policy` | Resize/migration baseline | Notes |
 |----------|--------------------------|---------------------------|------|

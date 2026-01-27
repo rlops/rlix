@@ -129,6 +129,14 @@ This section reality-checks Miles against the shared protocol in `design_doc/mul
 - Add `indices=...` filtering for `RolloutManager.onload/offload` (and ensure remote calls accept indices) to enable DP-granularity.
 - Wire standardized progress heartbeats (`report_progress`) at batch start and on 2% bands from the rollout loop.
 
+**Critical Implementation Gaps (Must Fix Before Phase 0)**
+
+| Gap | Location | Issue | Fix Required |
+|-----|----------|-------|--------------|
+| **Missing `/remove_worker`** | `router.py` | MilesRouter has `add_worker` but no removal API; `SGLangEngine.shutdown()` calls it but router doesn't implement it | Add `/remove_worker` or `/disable_worker` endpoint to MilesRouter |
+| **No `creation_ts` tracking** | N/A | `oldest_unfinished_creation_ts` required but not tracked | Add enqueue timestamp to trajectory/group data structures |
+
+
 ## 2. Existing Code Integration Points (Pre-Adaptation)
 
 ### 2.1 Training Entry Point

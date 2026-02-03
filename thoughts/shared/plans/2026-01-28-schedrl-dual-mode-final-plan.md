@@ -282,6 +282,7 @@ Deployment selects the mode:
 
 Phase 1: Protocol + Adapter surface (unblocks all frameworks)
 - Implement `schedrl/protocol/{types,actions,validation}.py`
+- Protocol MUST support both `FULL_FT` and `MULTI_LORA` via an `ActiveModelSpec`-style model descriptor (base + optional adapters). Reference: `thoughts/shared/plans/2026-02-02-schedrl-multi-lora-adapter-extension.md`.
 - Implement `schedrl/client/adapter.py` (ABC) + minimal `ActionResponse` schema
 - Implement `schedrl/client/client.py` (`connect`/`get_or_create` + register + report helpers)
 

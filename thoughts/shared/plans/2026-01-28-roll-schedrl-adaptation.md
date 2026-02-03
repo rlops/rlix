@@ -63,6 +63,16 @@ Expose a coordinator-owned Adapter surface that matches the Final Plan:
 - `shrink_workers(worker_indices, action_id, activation_epoch) -> ActionResponse`
 - `expand_workers(worker_indices, checkpoint_version, action_id, activation_epoch) -> ActionResponse`
 
+### Multi-LoRA extension hook (ROLL tag/domain → `adapter_id`)
+This plan is the baseline for **FULL_FT**. For **MULTI_LORA** (multiple LoRA adapters on a frozen base) see:
+`thoughts/shared/plans/2026-02-02-schedrl-multi-lora-adapter-extension.md`.
+
+Required ROLL-specific mapping for MULTI_LORA:
+- Standardize on canonical `adapter_id` at the protocol boundary.
+- Map `adapter_id := env_config["tag"]` (agentic envs) and `adapter_id := domain` (async sampling).
+- Mixed-adapter batching uses a per-prompt `lora_request` list (one LoRARequest per prompt) so a single inference batch can contain multiple adapters.
+- Shrink/expand semantics remain physical, and `migration_policy=REQUEST_RETRY` (abort + backend-confirmed ACK + retry) stays required.
+
 Notes:
 - `ActionResponse` is `{success: bool, error: Optional[str]}`; use `error="Superseded"` for supersession ACKs.
 - Scheduler-owned timeouts are enforced at the scheduler→adapter RPC boundary; the Adapter MUST NOT require `timeout_s` parameters in the public RPC signature.

@@ -86,6 +86,7 @@ Items are organized by execution phase for practical implementation. The origina
 - [ ] 🆕 **notify_ready_to_release() API**: Planned Release (Blocking); blocks until Phase 0-6 planning loop reclaims resources (Lines 1302-1303)
 - [ ] 🆕 **report_progress() with fifo_timestamp**: Fairness Hook; passes creation timestamp of oldest waiting episode (Lines 1304-1305)
 - [ ] 🆕 **unregister_pipeline() API**: Full pipeline unregistration (Line 1307)
+- [ ] 🆕 **Adapter lifecycle RPCs (extraction-plan parity)**: Add `close_admission/open_admission/shrink_workers/expand_workers -> ActionResponse` to `schedrl.protocol.adapter.Adapter`. This is not required by the original Phase 1 checklist text, but is a known divergence from `2026-02-05-ENG-123-roll-multipipeline-extraction.md` (around Line 1262) and should be tracked explicitly here.
 
 ### 🆕 Design Decisions / Negative Constraints (Check Early)
 

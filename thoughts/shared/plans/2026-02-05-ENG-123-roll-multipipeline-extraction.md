@@ -156,7 +156,30 @@ See `## Workflow + Contracts (SPEC; ENG-123)` for the admission-gated startup fl
 
 ### Standardized actor names (ENG-123)
 
-All actors are in Ray namespace `schedrl`.
+This plan uses **two kinds of Ray namespaces**:
+
+1) **SchedRL-owned actors** (job-scoped control plane) live in Ray namespace `schedrl`.
+2) **ROLL-owned actors** (per-pipeline data plane + helper actors) live in a **per-pipeline Ray namespace**:
+   - `pipeline_{pipeline_id}_NS` (string template; must be constructed from the canonical `pipeline_id`)
+
+**Exception (job-global)**:
+- The `SharedStorage` actor is a **job-global coordination primitive** (ports + metadata + caches) and MUST live in a dedicated, shared namespace:
+  - `global_storage_namespace`
+  - Rationale: port claims must be unique across all pipelines in the job; per-pipeline storage would reintroduce collisions.
+
+**Implementation mechanism (ENG-123; Option A namespace override; required)**
+- We do NOT want to touch every `.options(namespace=...)` call site. Instead, ENG-123 uses an env-var-driven namespace override:
+  1. Patch upstream ROLL constant to be env-driven:
+     - In `third_party/ROLL/roll/utils/constants.py`, set:
+       - `RAY_NAMESPACE = os.environ.get("ROLL_RAY_NAMESPACE", "roll")`
+  2. At pipeline admission, SchedRL/Adapter MUST inject per-pipeline env vars via Ray `runtime_env.env_vars` for all ROLL processes (adapter + workers + helper actors):
+     - `PIPELINE_ID = {pipeline_id}`
+     - `ROLL_RAY_NAMESPACE = f"pipeline_{pipeline_id}_NS"`
+  3. Result: all existing ROLL actor creations/lookups that use `namespace=RAY_NAMESPACE` automatically become per-pipeline.
+- **SharedStorage exception**: all SharedStorage get/create sites MUST ignore `RAY_NAMESPACE` and instead use `namespace="global_storage_namespace"` so there is exactly one storage actor shared across all pipelines.
+- **SharedStorage namespace constant (required)**: Define a single hardcoded namespace constant in upstream ROLL (do not derive from `pipeline_id`):
+  - Add `GLOBAL_STORAGE_NAMESPACE = "global_storage_namespace"` to `third_party/ROLL/roll/utils/constants.py`.
+  - All SharedStorage get/create/lookup must use `namespace=GLOBAL_STORAGE_NAMESPACE` (never `namespace=RAY_NAMESPACE`).
 
 - `schedrl:orchestrator`
 - `schedrl:scheduler`
@@ -418,6 +441,145 @@ Note (implementation reference):
 ### Verified Issues & Implementation Gaps
 
 This section consolidates all issues discovered during the deep verification of the `ROLL_multi_pipeline` fork, `start_multi_pipeline_test.py`, and the legacy codebase analysis. These are mandatory constraints for the extraction and porting process.
+
+#### 0. Additional P0/P1 Findings (2026-02-11 audit rounds; MUST be reflected in ENG-123 scope)
+
+These findings were discovered by scanning upstream `third_party/ROLL` for multi-pipeline hazards that are **not** explicitly covered by the existing ENG-123 plan text. They are **not** “upstream bugs” in isolation; they become critical because post-extraction we run **multiple pipelines in the same Ray job/cluster** and then tear them down/reuse resources during the same job.
+
+**Namespace decision (systematic fix; preferred)**:
+- Most multi-pipeline hazards below are caused by **fixed Ray named actors** and `get_if_exists=True` being used in a shared namespace.
+- ENG-123 adopts **per-pipeline ROLL namespaces** (`pipeline_{pipeline_id}_NS`) for isolation of all ROLL actors, instead of rewriting every actor name to include `{pipeline_id}`.
+- This is mandatory: do not rely on “implicit default namespace” behavior. Every ROLL actor creation/lookup MUST use the per-pipeline namespace (directly or via a single `RAY_NAMESPACE` value derived from `pipeline_id` at process start).
+- The only exception is the job-global `SharedStorage` actor (see `global_storage_namespace` below).
+
+**P0 (NEW): Worker Ray actor-name collisions across pipelines (hard crash on 2nd pipeline)**
+- **Context / Failure Mode**: Upstream ROLL names every Worker actor as `{cluster_name}-{rank}(-G...)` (no `pipeline_id`). If two pipelines both create a cluster with the same `cluster_name` (e.g. `actor_infer`), Ray named-actor creation collides and the second pipeline fails during initialization.
+- **Evidence**: `Cluster._create_workers` builds `worker_name = f"{self.cluster_name}-{rank}..."` and passes it to `.options(name=worker_name, namespace=RAY_NAMESPACE)`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Every ROLL actor MUST live in `pipeline_{pipeline_id}_NS` (per-pipeline namespace). No ROLL actor creation/lookup may use the shared `roll` namespace in ENG-123 Library Mode.”; **Touchpoint**: `third_party/ROLL/roll/distributed/executor/cluster.py` (`.options(namespace=...)` for workers).
+
+**P0 (NEW): RolloutScheduler named actors collide across pipelines**
+- **Context / Failure Mode**: Agentic pipeline creates `RolloutScheduler-train` and `RolloutScheduler-val` with fixed names. In multi-pipeline, the second pipeline crashes on named actor creation.
+- **Evidence**: `agentic_pipeline.py` uses `.options(name="RolloutScheduler-train")` / `.options(name="RolloutScheduler-val")`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “RolloutScheduler actors MUST be created/looked up in `pipeline_{pipeline_id}_NS`.”; **Touchpoint**: `third_party/ROLL/roll/pipeline/agentic/agentic_pipeline.py` (RolloutScheduler `.options(namespace=...)`).
+
+**P0 (NEW): RewardScheduler is global + `get_if_exists=True` (cross-pipeline state bleed)**
+- **Context / Failure Mode**: RewardScheduler is created as a Ray named actor with `get_if_exists=True`, and env managers fetch it by name. In multi-pipeline, a pipeline can accidentally connect to another pipeline’s RewardScheduler (silent correctness failure).
+- **Evidence**:
+  - Create: `RewardScheduler-{reward.name}`, `get_if_exists=True` in `agentic_pipeline.py`.
+  - Fetch: `ray.get_actor(name=f"RewardScheduler-{pipeline_config.reward.name}")` in `vl_traj_env_manager.py`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Any `ray.get_actor(...)` lookup MUST target `pipeline_{pipeline_id}_NS` (not the shared `roll` namespace).”; **Touchpoint**: `third_party/ROLL/roll/pipeline/agentic/agentic_pipeline.py` (creation) + `third_party/ROLL/roll/pipeline/agentic/env_manager/vl_traj_env_manager.py` (lookup).
+
+**P0 (NEW): Global dataset actors collide (GlobalDataset / GlobalDatasetManager / val_dataset_manager)**
+- **Context / Failure Mode**: Several dataset actors are created as named actors with `get_if_exists=True` using only `mode` / `dataset_name`, and `val_dataset_manager` uses a fixed name. Multi-pipeline can share datasets and iterators unexpectedly (silent correctness failure).
+- **Evidence**:
+  - GEM Math: `GlobalDataset` name `f"{mode}_{dataset_name}"` and `GlobalDatasetManager` name `f"{mode}_dataset_manager"`.
+  - DeepEyes: dataset name `f"{mode}_deepeyes"`, dataset manager name `f"{mode}_dataset_manager"`.
+  - Agentic pipeline: `val_dataset_manager` fixed name.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Dataset actors MUST live in `pipeline_{pipeline_id}_NS`; no dataset actor may be job-global unless explicitly designed.”; **Touchpoint**: `third_party/ROLL/roll/pipeline/agentic/env/gem/math_env.py`, `third_party/ROLL/roll/pipeline/agentic/env/deepeyes/env.py`, `third_party/ROLL/roll/pipeline/agentic/agentic_pipeline.py`.
+
+**P0 (NEW): GlobalLimiter named actor collides (cross-pipeline throttling)**
+- **Context / Failure Mode**: Env step concurrency limiter is a global named actor `GlobalLimiter_{tag}` with `get_if_exists=True`. Two pipelines using the same tag will throttle each other.
+- **Evidence**: `LimiterClient._initialize_limiter()` uses `GlobalLimiter.options(name=f"GlobalLimiter_{tag}", get_if_exists=True, namespace=RAY_NAMESPACE)`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Limiter actors MUST live in `pipeline_{pipeline_id}_NS` (per-pipeline), unless explicitly configured as a shared job-global limiter.”; **Touchpoint**: `third_party/ROLL/roll/utils/env_action_limiter.py`.
+
+**P0 (NEW): RLVR GenerateScheduler actor collides**
+- **Context / Failure Mode**: RLVR pipeline creates `GenerateScheduler` with name derived only from `actor_infer.cluster_name` and `get_if_exists=True`. If multiple pipelines share the same cluster name, they share a scheduler actor.
+- **Evidence**: `GenerateScheduler.options(name=f"{GENERATE_SCHEDULER_NAME}_{self.actor_infer.cluster_name}", get_if_exists=True, ...)`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “RLVR helper actors MUST live in `pipeline_{pipeline_id}_NS`.”; **Touchpoint**: `third_party/ROLL/roll/pipeline/rlvr/rlvr_math_vlm_pipeline.py`.
+
+**P0 (NEW): AsyncGenerateScheduler GlobalCounter collides**
+- **Context / Failure Mode**: AsyncGenerateScheduler uses a named `GlobalCounter` actor `DynamicSchedulerRequestCounter` with `get_if_exists=True`. Multiple pipelines can share the same counter, producing cross-pipeline request_id/counter coupling.
+- **Evidence**: `GlobalCounter.options(name="DynamicSchedulerRequestCounter", get_if_exists=True, ...)`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Counters MUST live in `pipeline_{pipeline_id}_NS` (never job-global by accident).”; **Touchpoint**: `third_party/ROLL/roll/distributed/scheduler/async_generate_scheduler.py`.
+
+**P0 (NEW): Megatron model_update locker collides**
+- **Context / Failure Mode**: Megatron model update uses a global named locker actor `model_update_locker` with `get_if_exists=True`. Multi-pipeline can serialize across pipelines unexpectedly or deadlock.
+- **Evidence**: `Locker.options(name="model_update_locker", get_if_exists=True, ...)`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Any synchronization primitive represented as a named actor MUST live in `pipeline_{pipeline_id}_NS`.”; **Touchpoint**: `third_party/ROLL/roll/third_party/megatron/model_update.py`.
+
+**P0 (NEW): SGLang multi-node slave actor names collide**
+- **Context / Failure Mode**: SGLang creates `sglang-slave-{i}` named actors with no `pipeline_id`. Multi-pipeline crashes on actor creation.
+- **Evidence**: `.options(name=f"sglang-slave-{i}", namespace=RAY_NAMESPACE, ...)`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “All SGLang auxiliary actors MUST live in `pipeline_{pipeline_id}_NS`.”; **Touchpoint**: `third_party/ROLL/roll/distributed/strategy/sglang_strategy.py`.
+
+**P0 (NEW): Placement groups are created but never destroyed (GPU reservation leak across pipeline teardown)**
+- **Context / Failure Mode**: ResourceManager creates placement groups on init; there is a `destroy_placement_group()` method but it has no callers. Post-extraction, we frequently tear down pipelines and reuse GPUs within the same job; leaked PGs can prevent subsequent allocations and block the scheduler.
+- **Evidence**: PG creation in `ResourceManager.__init__` and unused `destroy_placement_group()`.
+- **Owner/Invariant/Touchpoint**: **Owner=SchedRL** (orchestrator teardown owns lifecycle); **Invariant**: “Pipeline teardown MUST release Ray placement groups associated with the pipeline’s ResourceManager/allocation before returning GPUs to `idle_gpus`.”; **Touchpoint**: `third_party/ROLL/roll/distributed/scheduler/resource_manager.py` (ensure destroy is called from orchestrator teardown path) and/or the extracted `schedrl` ResourceManager wrapper.
+
+**P0 (NEW): LogMonitorListener/ExceptionMonitor can kill the job Ray cluster (violates “SchedRL owns lifecycle”)**
+- **Context / Failure Mode**: `LogMonitorListener.start()` registers an `atexit` hook that calls `ray.shutdown()` and `ray stop --force`, and uses a fixed named actor `ExceptionMonitor` with `get_if_exists=True`. In a multi-pipeline job, this can:
+  - create named actor collisions, and/or
+  - tear down the entire job-scoped Ray cluster outside SchedRL’s orchestrator control.
+- **Evidence**: `atexit.register(self.stop)` and `stop()` executes `ray.shutdown()` + `ray stop --force`; `ExceptionMonitor.options(name="ExceptionMonitor", get_if_exists=True, ...)`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL** (must not self-manage cluster lifecycle in Library Mode); **Invariant**: “In ENG-123 Library Mode, ROLL components MUST NOT call `ray.shutdown()` or `ray stop --force` via `atexit` or background threads; only SchedRL orchestrator may stop the cluster.”; **Touchpoint**: `third_party/ROLL/roll/distributed/scheduler/log_monitor.py` (disable/guard `atexit` + name-scope ExceptionMonitor or remove it from library path).
+
+**P0 (NEW): SharedStorage rendezvous key is `cluster_name` only (cross-pipeline overwrite)**
+- **Context / Failure Mode**: Worker rank0 writes master rendezvous info under key `self.cluster_name`. If two pipelines share the same `CLUSTER_NAME` (very likely: `actor_infer`, `actor_train`), they overwrite each other’s MASTER_ADDR/PORT metadata.
+- **Evidence**: `self.shared_storage.put.remote(self.cluster_name, {"MASTER_ADDR": ..., "MASTER_PORT": ...})`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Any SharedStorage key used for rendezvous/cluster metadata MUST be pipeline-scoped (e.g. `{pipeline_id}:{cluster_name}`), never `cluster_name` alone.”; **Touchpoint**: `third_party/ROLL/roll/distributed/executor/worker.py` (SharedStorage key).
+
+**P0 (NEW): SharedStorage `delete_prefix(pipeline_id)` cleanup is incompatible with current port-lock key schema**
+- **Context / Failure Mode**: The plan mandates `SharedStorage.delete_prefix(pipeline_id)` on pipeline teardown, but Worker’s port-lock keys are `MASTER_ADDR_PORT:{ip}:{port}` (no `pipeline_id`). Cleanup cannot release these locks deterministically, causing port exhaustion/collision over repeated create/teardown within a job.
+- **Evidence**: `master_addr_port_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"` in `Worker.get_free_port()`.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “All per-pipeline ephemeral keys (ports, rendezvous, metadata) MUST include `{pipeline_id}` so teardown can delete them by prefix.”; **Touchpoint**: `third_party/ROLL/roll/distributed/executor/worker.py` (`MASTER_ADDR_PORT` key scheme + claim API).
+
+**SharedStorage namespace rule (job-global; required for cross-pipeline coordination)**
+- **Decision**: Keep existing “create-if-exists / `get_if_exists=True`” logic, but force a single namespace for the storage actor:
+  - `global_storage_namespace`
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “All SharedStorage get/create/lookup MUST use `namespace='global_storage_namespace'` so the same storage actor is shared across all pipelines (even when all other ROLL actors run in `pipeline_{pipeline_id}_NS`).”; **Touchpoint**: `third_party/ROLL/roll/distributed/executor/worker.py` and `third_party/ROLL/roll/utils/checkpoint_manager.py` (SharedStorage `.options(namespace=...)`).
+
+**P0 (NEW if shrink-to-zero is required): Upstream RequestScheduler forbids shrink-to-zero (plan contradiction risk)**
+- **Context / Failure Mode**: If ENG-123 time-sharing requires full shrink-to-zero active ranks, upstream `RequestScheduler` currently throws `ValueError("Cannot shrink to zero active ranks")`.
+- **Decision required**: The plan must explicitly state whether shrink-to-zero is a hard requirement in ENG-123. If yes, this guard must be removed and empty-rank routing behavior must be defined.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “If `sleep_level==2` time-sharing is in scope, RequestScheduler MUST support shrinking to zero active ranks and must not throw when active set is empty; routing must suspend before any empty state is visible to request generation.”; **Touchpoint**: `third_party/ROLL/roll/distributed/scheduler/generate_scheduler.py` (`Cannot shrink to zero` guard + empty-rank selection paths).
+
+**P1 (NEW): `RolloutScheduler.mode_switch_lock` appears unused (outer serialization is currently dead)**
+- **Context / Failure Mode**: `RolloutScheduler` defines `mode_switch_lock = asyncio.Lock()` with a comment “Prevent concurrent shrink/expand”, but shrink/expand are delegated to `RequestScheduler` and there is no evidence this lock is used to serialize lifecycle operations. If implementers assume this lock provides safety, they may accidentally introduce concurrent lifecycle operations or regress lock ordering.
+- **Evidence**: `mode_switch_lock` is instantiated but not referenced in this file.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “There MUST be a single, well-defined outer lifecycle serialization lock for shrink/expand (either use `mode_switch_lock` consistently or remove it and enforce serialization at the adapter/SchedRL layer); do not rely on dead locks.”; **Touchpoint**: `third_party/ROLL/roll/distributed/scheduler/rollout_scheduler.py` (`mode_switch_lock` usage/removal + shrink/expand call sites).
+
+**P1 (NEW): Expand rebalance loop has a documented ‘may cycle indefinitely’ risk**
+- **Context / Failure Mode**: The proportional rebalance on expand uses `cycle(...)` round-robin selection. The upstream code comment warns it may cycle indefinitely if all lists are exhausted before reaching target. In multi-pipeline time-sharing, this can hang lifecycle transitions, blocking the scheduler.
+- **Evidence**: The comment in `_rebalance_on_expand` explicitly calls out the indefinite cycling risk.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Rebalance selection loops MUST have an explicit termination condition and MUST fail-fast with a clear error if the target cannot be met (no infinite `cycle()` loops).”; **Touchpoint**: `third_party/ROLL/roll/distributed/scheduler/generate_scheduler.py` (`_rebalance_on_expand` loop / termination condition).
+
+**P1 (NEW): Ray retry semantics plan text is underspecified / uses wrong knob name**
+- **Context / Failure Mode**: The plan says “set `max_retries=0` for all SchedRL lifecycle actors”, but Ray’s retry knobs for actors/tasks are typically `max_restarts` / `max_task_retries` / `retry_exceptions`, not `max_retries` (which is not a standard Ray actor option). This creates a false sense of “no retries/no replays”.
+- **Owner/Invariant/Touchpoint**: **Owner=SchedRL**; **Invariant**: “All SchedRL lifecycle actors MUST set Ray retry knobs correctly (`max_restarts=0`, tasks `max_task_retries=0`, and avoid implicit retries) to preserve ‘no retries/no replays’ contract.”; **Touchpoint**: `schedrl` actor creation sites (Orchestrator/Scheduler `.options(...)` / `@ray.remote(...)`).
+
+**P1 (NEW): HF isolation must be done at process start (Worker.__init__ is too late with current imports)**
+- **Context / Failure Mode**: Upstream `worker.py` imports `download_model` at module import time, and `checkpoint_manager.py` imports `huggingface_hub` at import time. Any attempt to set `HF_HOME` inside `Worker.__init__` is too late to prevent cache races if HF is imported before the env var is set.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL** (for import ordering) + **Owner=SchedRL** (for runtime_env enforcement); **Invariant**: “HF isolation env vars MUST be set via Ray `runtime_env.env_vars` before the worker process imports HF; do not rely on setting them inside `Worker.__init__`.”; **Touchpoint**: `third_party/ROLL/roll/distributed/executor/cluster.py` (runtime_env env_vars injection) + any HF import sites (e.g. `third_party/ROLL/roll/utils/checkpoint_manager.py`).
+
+**P1 (NEW): CheckpointManager model-path caching keys are not pipeline-scoped**
+- **Context / Failure Mode**: `download_model` caches `{node_ip}:{model_name_or_path}` in SharedStorage. In multi-pipeline, this can return a cached path created under another pipeline’s HF_HOME layout and/or with different model download settings.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Model download cache keys MUST be pipeline-scoped (include `{pipeline_id}`) or the cache MUST be explicitly documented as cross-pipeline shared and safe.”; **Touchpoint**: `third_party/ROLL/roll/utils/checkpoint_manager.py` (SharedStorage cache key format).
+
+**P1 (NEW): Process-global env var mutation in base_config leaks across pipelines if they share a driver process**
+- **Context / Failure Mode**: BaseConfig sets `os.environ["ROLL_LOG_DIR"]`, `PROFILER_OUTPUT_DIR`, `roll_RPC_TIMEOUT`, and merges `system_envs` globally. If multiple pipelines are configured/constructed within the same Python process (common in orchestrated runs), later pipelines can overwrite earlier pipeline’s env settings.
+- **Owner/Invariant/Touchpoint**: **Owner=SchedRL**; **Invariant**: “Pipeline-specific env vars MUST be injected via Ray `runtime_env.env_vars` and MUST NOT be set via process-global `os.environ` in shared drivers; any unavoidable global env must be pipeline-invariant.”; **Touchpoint**: `third_party/ROLL/roll/configs/base_config.py` (global os.environ writes) + SchedRL adapter runner process boundaries.
+
+**P1 (NEW): vLLM/FlashInfer cache paths depend on `WORKER_NAME`, which is overwritten and not pipeline-scoped**
+- **Context / Failure Mode**: vLLM sets cache/workspace roots under `.../<WORKER_NAME>/...`, but `EnvironmentWorker` overwrites `WORKER_NAME` to `EnvironmentWorker_{rank}` (not pipeline-scoped). This creates collisions in shared home/cache directories across pipelines.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Cache/workspace directories MUST be pipeline-scoped independently of `WORKER_NAME` (use `{pipeline_id}`), and `WORKER_NAME` MUST not be overwritten in a way that breaks cache isolation.”; **Touchpoint**: `third_party/ROLL/roll/third_party/vllm/__init__.py` (cache root) + `third_party/ROLL/roll/pipeline/agentic/environment_worker.py` (WORKER_NAME overwrite).
+
+**P1 (NEW): `state_offload_manger` uses a non-concurrency-safe env var cleanup**
+- **Context / Failure Mode**: `state_offload_manger` sets `os.environ["roll_EXEC_FUNC_NAME"]` and then unconditionally `del os.environ["roll_EXEC_FUNC_NAME"]`. If multiple offload managers run concurrently in the same process, this can throw `KeyError` or corrupt profiling labels.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “Profiling context MUST be concurrency-safe (use `os.environ.pop(key, None)` or avoid global env mutation entirely for per-call labels).”; **Touchpoint**: `third_party/ROLL/roll/utils/context_managers.py` (`state_offload_manger`).
+
+**P1 (NEW): Hidden retry loops violate the plan’s default fail-fast semantics**
+- **Context / Failure Mode**: Several components implement retries (OpenAI proxy retries, RLVR sandbox reward retries, driver command retries). In ENG-123 we assume fail-fast on critical lifecycle actions; silent retries can mask faults and create unexpected latency/jitter in scheduling.
+- **Owner/Invariant/Touchpoint**: **Owner=ROLL**; **Invariant**: “All retry loops that can affect scheduling latency or correctness MUST be either removed in Library Mode or made explicit and configurable (default: fail-fast) per ENG-123 policy.”; **Touchpoint**: `third_party/ROLL/roll/pipeline/agentic/llm_proxy/openai_proxy.py`, `third_party/ROLL/roll/pipeline/rlvr/rewards/code_sandbox_reward_worker.py`, `third_party/ROLL/roll/distributed/scheduler/driver_utils.py`.
+
+**P0/P1 (DOC CORRECTION): Ray namespace statement must match actual split (SchedRL vs ROLL)**
+- **Context / Failure Mode**: The plan currently states “All actors are in Ray namespace `schedrl`.” Upstream ROLL uses `RAY_NAMESPACE="roll"` and creates many named actors under that namespace. Implementers will mis-scope `ray.get_actor(...)` lookups and miss collisions if the plan’s namespace statement is taken literally.
+- **Owner/Invariant/Touchpoint**: **Owner=SchedRL** (plan/spec correctness); **Invariant**: “SchedRL-owned actors live in namespace `schedrl`. ROLL-owned actors MUST run in `pipeline_{pipeline_id}_NS` (per-pipeline). SharedStorage MUST run in `global_storage_namespace` (job-global). Do not run multi-pipeline ROLL actors in the shared `roll` namespace in ENG-123.”; **Touchpoint**: Plan text at `### Standardized actor names (ENG-123)` and upstream `third_party/ROLL/roll/utils/constants.py` (`RAY_NAMESPACE`).
+
+**Re-verified (already covered elsewhere in this plan; keep as P0)**:
+- **Issue 86 (vLLM offload gating)**: `VllmStrategy.offload_states` skips offload if not colocated. See **P0: Issue 86**; touchpoint `third_party/ROLL/roll/distributed/strategy/vllm_strategy.py`.
+- **Issue 119 (SharedStorage lifecycle)**: SharedStorage must be durable (detached) across rank0 death. See **P0: Issue 119**; touchpoint `third_party/ROLL/roll/distributed/executor/worker.py` + `third_party/ROLL/roll/distributed/scheduler/storage.py`.
+- **Issue 134 (MASTER_PORT race)**: get→put port claim is non-atomic. See **P0: Issue 134**; touchpoint `third_party/ROLL/roll/distributed/executor/worker.py`.
 
 #### 1. Test Parity, Orchestration & Reliability
 *Issues related to ensuring SchedRL matches the rigorous test conditions of the fork.*
@@ -1151,6 +1313,103 @@ Single source of truth (avoid duplication):
 - Abort ACK definition (ROLL): see **Verified issues to address** → **Critical 2**.
 - request_id format: see **Concrete contracts (must match exactly)** → **Canonical `request_id`**.
 
+## Implementation Execution Checklist (ENG-123; required)
+
+This section is the **implementation breakdown** for human review. Each checklist item is intended to be a small, localized patch. Each phase ends with a validation milestone.
+
+### Phase 1 checklist — SchedRL core package skeleton
+
+**Primary goals**: create job-scoped Orchestrator/Scheduler singletons; define canonical protocol + fail-fast semantics; define correct Ray retry knobs; establish namespace strategy hooks (Option A) at the contract layer.
+
+- [ ] **P0 Issue 21 & 215 (ownership)**: Orchestrator owns core components; enforce singleton actor creation.
+- [ ] **P1 Issue 25 & 31 (fail-fast)**: implement global fail-fast shutdown path (already by-design; ensure it is enforced, not bypassed).
+- [ ] **P1 Issue 29 & 68 (timeouts)**: define phase-specific timeout constants (register/admit/shrink/expand/abort-ACK/offload).
+- [ ] **P0 Issue 51 (delimiter collision)**: implement and enforce `validate_pipeline_id` (reject `:`) and canonical `request_id` helpers.
+- [ ] **P1 Issue 62, 204 & 206 (config resolution/validation)**: define validation entrypoints (even if full Hydra resolution is implemented later, the error boundaries must be clear in Phase 1).
+- [ ] **P1 (namespace override plumbing)**: define `ROLL_RAY_NAMESPACE` contract + `PIPELINE_ID` propagation via Ray `runtime_env.env_vars` (implementation occurs in Phase 3, but the contract must be explicit here).
+- [ ] **P1 (Ray retry semantics; correctness)**: remove any mention/usage of non-Ray knobs like `max_retries`; use Ray-supported knobs for “no retry/no replay” (`max_restarts=0`, tasks `max_task_retries=0`, avoid implicit retries).
+
+Validation milestone (Phase 1)
+- [ ] Start a fresh Ray job; create `schedrl:orchestrator` + `schedrl:scheduler`; verify they start once and are discoverable by name.
+- [ ] Negative test: invalid `pipeline_id` (contains `:`) fails fast at registration/admission.
+
+### Phase 2 checklist — Port scheduler model into `schedrl` (policy + state)
+
+**Primary goals**: port the fork scheduling model (planning loop, fairness, progress ingestion) into SchedRL; keep ROLL as mechanics.
+
+- [ ] **H1 (dead assertions)**: replace fork “no-op tuple assertions” with real `assert` statements or explicit `ValueError`/`RuntimeError` (fail-fast). Do not port silent tuple expressions like `(cond, "msg")`.
+- [ ] **H2 (cluster_id parsing)**: implement a suffix-aware parser for cluster IDs; never parse `pipeline_id` from `cluster_id` using `rsplit("_", 1)` (use the fork-equivalent `_parse_cluster_id` approach).
+- [ ] **H3 (notify_completion atomicity)**: `notify_completion` must be atomic (idempotency check + insert into `pending_completion_requests` under the same scheduler lock).
+- [ ] **P0 Issue 107 (state inconsistency)**: any execution-phase failure triggers controlled-fatal shutdown (`shutdown(force=True)`).
+- [ ] **P0 Issue 81 & 124 (expansion signaling)**: ensure expansion completion signals cannot be orphaned; on any failure, fail-fast and shut down.
+- [ ] **P1 Issue 64 (gap-ratio starvation)**: implement gap-ratio fairness constraints as described (work inflation prevention).
+- [ ] **P1 Issue 202 & 216 (proportional rebalancing/session migration)**: implement required rebalancing logic and define migration semantics.
+- [ ] **P0 Issue 69/80/93/158 (topology validation)**: implement or explicitly defer with a single decision (do not leave ambiguous “P0 but backlog” behavior).
+- [ ] **P0 Issue 87 (ResourceManager init race)**: implement node discovery gating with a bounded wait budget and fail-fast error message.
+
+Validation milestone (Phase 2)
+- [ ] Single-pipeline run: scheduler progresses through phases; progress ingestion updates are observed by scheduler.
+- [ ] Induced failure during execution phase causes immediate job shutdown (no partial continuation).
+
+### Phase 3 checklist — Implement ROLL Adapter + upstream ROLL shim
+
+**Primary goals**: create `schedrl:adapter:{pipeline_id}` actor; isolate all ROLL actors per pipeline namespace (Option A); keep SharedStorage job-global; implement safe shrink/expand/offload; port required upstream patches.
+
+Namespace + SharedStorage (systematic isolation)
+- [ ] **Namespace (Option A; required)**: set `ROLL_RAY_NAMESPACE=f"pipeline_{pipeline_id}_NS"` via Ray `runtime_env.env_vars` for all ROLL processes in this pipeline.
+- [ ] **Global storage namespace (required)**: add `GLOBAL_STORAGE_NAMESPACE="global_storage_namespace"` and update all SharedStorage get/create sites to use it (never `RAY_NAMESPACE`).
+
+Lifecycle correctness + upstream patches
+- [ ] **P0 Issue 35 (job launching gap)**: implement the job launch path separation (system orchestrator vs test runner) so ENG-123 can start a job-scoped Ray cluster + SchedRL actors and then admit pipelines reliably.
+- [ ] **P0 Issue 28 & 72 (fractional GPUs)**: ensure worker actor options use the intended fractional GPU accounting consistently.
+- [ ] **P0 Issue 43 & 108 (resource recovery on unregister)**: adapter/orchestrator must `ray.kill` pipeline actors, clear registries, and release PGs + SharedStorage keys on teardown.
+- [ ] **P0 (LogMonitorListener lifecycle)**: disable/guard `LogMonitorListener` `atexit` hooks that call `ray.shutdown()` / `ray stop --force` in Library Mode; only SchedRL orchestrator may stop the job cluster.
+- [ ] **P0 (placement group leak)**: explicitly call `destroy_placement_group()` (or the extracted equivalent) on pipeline teardown; verify no PG resources remain reserved after teardown.
+- [ ] **P0 Issue 26, 208 & 241 (mandatory validation)**: reject invalid offload/sleep-level/partial-GPU configs at registration time (fail-fast).
+- [ ] **P0 Issue 49 + 134 + 75/141 (ports/storage)**: implement atomic port claim + deterministic cleanup; ensure `delete_prefix(pipeline_id)` actually releases per-pipeline indices.
+- [ ] **P0 (SharedStorage rendezvous key)**: change master rendezvous keying from `cluster_name` to `{pipeline_id}:{cluster_name}` to prevent cross-pipeline overwrites.
+- [ ] **P0 Issue 85 (SGLang ports)**: remove hardcoded ports; use safe port allocation mechanism.
+- [ ] **P0 Issue 86 (vLLM offload)**: offload must trigger regardless of colocation detection (library mode must free GPU memory).
+- [ ] **P0 Issue 119 (SharedStorage detached)**: ensure storage actor lifetime is detached at first creation and shared across pipelines.
+- [ ] **P1 Issue 30 & 41 (Adapter RPC API alignment)**: ensure Adapter RPC signatures match the SchedRL scheduler expectations and the upstream ROLL strategy/worker API surfaces (no mismatched names/args).
+- [ ] **P0 Issue 213 + P1 Issue 212 (API mismatch / stop-before-offload)**: implement correct abort→drain→offload sequencing under new API.
+- [ ] **P0-1 / P0-2 / P0-3 tasks**: `swapping_lock` + suspend re-check + prevent RolloutScheduler auto-resume.
+- [ ] **P1 Issue 105 (lazy query race)**: implement fix and verify scheduler/adapter ordering constraints.
+- [ ] **P1 Issue 211 (max concurrency override)**: ensure actor-infer concurrency settings are correct and not shared across pipelines accidentally.
+- [ ] **P0 Issue 214 (HF cache isolation)**: enforce HF env isolation via `runtime_env` before any HF imports (do not rely on Worker `__init__`).
+- [ ] **P1 (CheckpointManager cache keys)**: include `{pipeline_id}` in model download cache keys (or explicitly document + enforce cross-pipeline-safe invariants for shared cache).
+- [ ] **P1 (BaseConfig global env)**: avoid mutating process-global `os.environ` for pipeline-specific settings in shared driver processes; route settings through `runtime_env.env_vars`.
+- [ ] **P1 (vLLM/FlashInfer cache paths)**: ensure cache/workspace roots are pipeline-scoped (do not rely on `WORKER_NAME`, which can be overwritten).
+- [ ] **P1 (state_offload_manger concurrency)**: replace `del os.environ[...]` with `os.environ.pop(..., None)` (or remove global env dependency) to avoid concurrency errors.
+- [ ] **P1 (hidden retry loops)**: remove or explicitly configure retry loops (OpenAI proxy / sandbox reward / driver utils) to preserve ENG-123 fail-fast semantics.
+- [ ] **P1 (mode_switch_lock)**: remove unused `mode_switch_lock` or enforce its usage; do not rely on dead serialization mechanisms.
+- [ ] **P1 (rebalance termination)**: fix `_rebalance_on_expand` to have an explicit termination condition (no infinite `cycle()` behavior).
+
+Validation milestone (Phase 3)
+- [ ] Two pipelines in same job: no Ray named-actor collisions (verify both pipelines fully initialize).
+- [ ] Shrink-to-zero + expand: no `No active DP ranks` error; no re-open of suspend by RolloutScheduler; GPU memory is actually freed.
+- [ ] Pipeline teardown + re-admission in same job: ports/metadata reusable (no leaks).
+
+### Phase 4 checklist — Selective model update behind Adapter
+
+**Primary goals**: selective sync-on-resume; minimal upstream hooks; correctness under expand after weight update.
+
+- [ ] **P1 Issue 66 (selective expansion safety)**: ensure expansion is safe and does not admit stale weights; fail-fast on any mismatch.
+- [ ] **P1 Issue 207 (dual-path GPU release logic)**: implement/verify the correct release path(s) under the adapter contract.
+- [ ] Implement `ModelUpdateService` port + required upstream hooks (TP>1 bucket caching policy as documented).
+
+Validation milestone (Phase 4)
+- [ ] Expand after a weight update: newly expanded dp ranks serve the correct weights (no stale admission).
+
+### Non-action decisions (must remain true)
+
+These are listed in the plan as P0/P1 but are **explicitly closed/invalid by design**; the implementation must not accidentally reintroduce them:
+- [ ] **P0 Issue 132**: deadlock analysis is “invalid by design” under enforced offload config + fail-fast.
+- [ ] **P0 Issue 236 & 217**: marked closed/invalid in the plan; if ENG-123 requires shrink-to-zero, treat the shrink-to-zero tasks above as the authoritative implementation path (do not rely on the closed label).
+- [ ] **P1 Issue 143 & 147**: closed/invalid; do not add complex recovery/graceful swap behavior in ENG-123.
+- [ ] **P1 Issue 65, 218 & 104**: invalid by design; do not add an extra notification protocol surface in ENG-123.
+- [ ] **P1 Issue 151**: closed/invalid; do not build scheduler logic that depends on racy progress reporting to preserve correctness.
+
 ## Phase 1: Create `schedrl` core package skeleton (Library Mode only)
 
 ### Overview
@@ -1160,7 +1419,17 @@ Implement the minimal protocol, client, and scheduler scaffolding so ROLL can co
 
 #### 0) Ray retry semantics (required for ENG-123 no-retry contract)
 
-Ray has at-least-once retry semantics by default for failed actor tasks. To preserve the ENG-123 lifecycle contract (“no retries / no replays”), set `max_retries=0` for all SchedRL lifecycle actors:
+**Correction (Ray default semantics)**:
+- Ray actor tasks execute with **at-most-once** semantics by default (`max_task_retries=0` for actor tasks).
+- However, Ray can still raise `RayActorError` for an actor task even if the task executed successfully (e.g. actor dies immediately after executing). ENG-123 treats this as a hard failure and will **not** attempt to “retry” lifecycle intents.
+
+To preserve the ENG-123 lifecycle contract (“no retries / no replays”), enforce the following:
+- For SchedRL lifecycle actors: set `max_restarts=0` at actor definition/creation (do not enable actor restarts for lifecycle actors).
+- For lifecycle RPCs (actor tasks): keep `max_task_retries=0` (default) and do not enable `retry_exceptions` or any other retry mechanism.
+- For any non-actor Ray tasks used in lifecycle control paths: explicitly disable retries using Ray-supported knobs (do not use non-Ray knobs like `max_retries`).
+- Policy: on `RayActorError` / connectivity ambiguity, **fail fast** and shut down the job; do not attempt recovery or “best-effort” retries in ENG-123.
+
+Apply this to all SchedRL lifecycle actors:
 - `schedrl:orchestrator`
 - `schedrl:scheduler`
 
@@ -1512,13 +1781,24 @@ Reference SHAs (verified):
 #### 4) Explicit tasks to address upstream ROLL gaps (must-do in this phase)
 
 - Implement shrink-to-zero (remove `Cannot shrink to zero active ranks` guard) and define behavior for `active_dp_ranks == set()`.
+- **P0-1 (explicit task)**: Add `swapping_lock = asyncio.Lock()` to upstream `RequestScheduler.__init__()` and require **all** shrink/expand lifecycle operations to hold `swapping_lock` for the full duration (abort → drain → offload/onload → resume). This is mandatory to prevent concurrent shrink/expand races on the same worker physical state (offload vs load).
+- **P0-2 (explicit task)**: Add a suspend re-check in upstream `RequestScheduler.generate_one_request()` to close the TOCTOU window:
+  - After passing `_check_suspend()`, once `routing_lock` is acquired, re-check `need_suspend` (or equivalently re-enter `_check_suspend()` in a loop).
+  - If `need_suspend=True`, release `routing_lock` and wait/loop until resumed, so request routing cannot observe `active_dp_ranks == ∅` and raise `RuntimeError("No active DP ranks")`.
+- **P0-3 (explicit task)**: Prevent RolloutScheduler from “auto-resuming” RequestScheduler behind the Adapter/SchedRL lifecycle contract.
+  - **Finding**: Upstream `RolloutScheduler.get_batch()` currently calls `await self.generate_scheduler.resume.remote()` unconditionally before it waits for environment outputs. This breaks ENG-123 ownership: during a shrink/offload transition, SchedRL/Adapter may intentionally keep the suspend gate closed, but `get_batch()` can re-open it and reintroduce routing races.
+  - **Required change**: In the Adapter-controlled multi-pipeline path, `RolloutScheduler.get_batch()` MUST NOT call `resume()` (and MUST NOT call `suspend()` either). Only the Adapter/SchedRL may change suspend state.
+  - **Touchpoint**: `third_party/ROLL/roll/distributed/scheduler/rollout_scheduler.py` (`get_batch` resume call).
+- **Decision (do NOT port fork-only helpers)**:
+  - Do NOT port fork `RequestScheduler.get_suspend_state()` into upstream as an ENG-123 requirement. With P0-3, suspend ownership is single-source-of-truth, and state checks (if needed) can be done in SchedRL/Adapter logs/telemetry.
+  - Do NOT port fork `check_gen_active_allocation_with_no_dp_workers()` into upstream. Cross-scheduler consistency validation is a SchedRL concern (SchedRL owns the centralized allocation view).
 - Add `pipeline_id: Optional[str] = None` to upstream `RolloutScheduler.__init__()` and prefix both `GroupQueueManager` + `RequestScheduler` Ray actor names via `.options(name=...)` to avoid multi-pipeline actor-name collisions (E2). Keep this as a naming-only change (no child-actor signature changes required).
 - Fix `RequestScheduler._validate_calculated_ranks(ranks, mode)` expand-mode validation bug in upstream ROLL: shrink must validate ranks are active; expand must validate ranks are inactive (mode-aware check).
 - Enforce canonical request id format using `schedrl.protocol.request_id`.
 - Ensure sticky routing never targets inactive dp ranks after shrink.
 
 **Implementation Reminders (Verified Issues)**:
-- **Issue 85 (Port)**: Framework strategies (SGLang) must not hardcode ports. Use `get_free_port()` or a unique offset that accounts for multiple pipelines on the same node.
+- **Issue 85 (Port)**: Framework strategies (SGLang) must not hardcode ports. Use `get_free_port()` (the same mechanism used by vLLM paths) backed by the ENG-123 SharedStorage atomic `claim_port` logic. Do not use deterministic port offsets/hashes as the primary mechanism.
 - **Issue 86 (Offload)**: `VllmStrategy` weight offloading must be triggered whenever the scheduler issues a shrink/stop, regardless of whether internal colocation is detected, to ensure GPUs are freed for other pipelines.
   - Apply the same rule to SGLang: `SGLangStrategy.offload_states` must release memory on scheduler shrink/stop even if `is_actor_infer_colocated` is false.
   - Rollout offload validation (required; shrink/offload path): after `offload_states_partial(dp_ranks)` completes, verify device-level occupied percent via `torch.cuda.mem_get_info()` is `<= 10%` (fail-fast if higher).

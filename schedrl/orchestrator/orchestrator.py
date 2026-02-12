@@ -66,7 +66,7 @@ def _ensure_scheduler_singleton():
     strategy = head_node_affinity_strategy(soft=False)
     SchedulerActor = scheduler_actor_class()
     try:
-        return (
+        scheduler = (
             SchedulerActor.options(
                 name=SCHEDULER_ACTOR_NAME,
                 namespace=SCHEDRL_NAMESPACE,
@@ -77,7 +77,13 @@ def _ensure_scheduler_singleton():
             .remote()
         )
     except Exception:
-        return ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
+        scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
+
+    try:
+        ray.get(scheduler.initialize.remote())
+    except Exception as e:
+        raise RuntimeError("Failed to initialize SchedRL scheduler actor") from e
+    return scheduler
 
 
 def _kill_ray_on_node(node_ip: str):
@@ -174,6 +180,106 @@ class Orchestrator:
 
     def kill_pipeline(self, pipeline_id: str) -> None:
         validate_pipeline_id(pipeline_id)
+        import ray
+
+        # Best-effort SharedStorage cleanup (job-global).
+        # This releases pipeline-owned coordination metadata (e.g., MASTER_ADDR_PORT claims) so ports can be reused
+        # within the same job.
+        try:
+            shared_storage = ray.get_actor("SHARED_STORAGE_ACTOR", namespace="global_storage_namespace")
+        except Exception:
+            shared_storage = None
+
+        try:
+            ray_namespace = ray.get(self._scheduler.get_pipeline_namespace.remote(pipeline_id=pipeline_id))
+        except Exception as e:
+            raise RuntimeError(f"Failed to resolve ray_namespace for pipeline_id {pipeline_id!r}") from e
+
+        # First, remove scheduler-side state under the scheduler lock so future scheduling cycles ignore this pipeline.
+        # This also unblocks any callers waiting on scheduler events for this pipeline.
+        ray.get(self._scheduler.unregister_pipeline.remote(pipeline_id=pipeline_id))
+
+        try:
+            from ray.util.state import list_actors
+        except Exception as e:
+            raise RuntimeError("ray.util.state.list_actors is required for kill_pipeline(namespace=...)") from e
+
+        def _attr(obj: Any, key: str, default: Any = None) -> Any:
+            if hasattr(obj, key):
+                return getattr(obj, key)
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return default
+
+        def _list_alive_actors(*, name_filter: Optional[str] = None):
+            filters = [("ray_namespace", "=", ray_namespace)]
+            if name_filter is not None:
+                filters.append(("name", "=", name_filter))
+            states = list_actors(filters=filters)
+            alive = []
+            for s in states:
+                if _attr(s, "state") == "ALIVE":
+                    alive.append(s)
+            return alive
+
+        # Kill all named actors in this pipeline namespace.
+        for s in _list_alive_actors():
+            name = _attr(s, "name")
+            if not isinstance(name, str) or name == "":
+                continue
+            try:
+                handle = ray.get_actor(name, namespace=ray_namespace)
+            except Exception:
+                continue
+            try:
+                ray.kill(handle, no_restart=True)
+            except Exception:
+                continue
+
+        # Unnamed actors: assume temporary and wait briefly for natural teardown.
+        deadline = time.time() + 10.0
+        while True:
+            unnamed_alive = _list_alive_actors(name_filter="")
+            if not unnamed_alive:
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(0.2)
+
+        unnamed_alive = _list_alive_actors(name_filter="")
+        if unnamed_alive:
+            # Nuclear option: use internal Ray APIs to kill by ActorID.
+            try:
+                from ray._raylet import ActorID  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    f"Found {len(unnamed_alive)} unnamed ALIVE actors in namespace {ray_namespace!r} but cannot import ActorID"
+                ) from e
+
+            sys.stderr.write(
+                f"[schedrl][ERROR] Found {len(unnamed_alive)} unnamed ALIVE actors in namespace {ray_namespace!r}; "
+                "using internal core_worker.get_actor_handle(...) to force kill them. "
+                "These actors should be named (or their handles retained) to avoid relying on Ray internals.\n"
+            )
+            for s in unnamed_alive:
+                actor_id_hex = _attr(s, "actor_id")
+                try:
+                    actor_id_obj = ActorID.from_hex(actor_id_hex)
+                    handle = ray.worker.global_worker.core_worker.get_actor_handle(actor_id_obj)
+                    ray.kill(handle, no_restart=True)
+                except Exception as e:
+                    sys.stderr.write(f"[schedrl][ERROR] Failed to force-kill unnamed actor_id={actor_id_hex!r}: {e}\n")
+
+        if shared_storage is not None:
+            try:
+                ray.get(shared_storage.delete_port_claims.remote(pipeline_id))
+            except Exception as e:
+                sys.stderr.write(f"[schedrl][ERROR] SharedStorage.delete_port_claims failed for pipeline_id={pipeline_id!r}: {e}\n")
+            try:
+                ray.get(shared_storage.delete_prefix.remote(f"{pipeline_id}:"))
+            except Exception:
+                pass
+
         self._pipelines.pop(pipeline_id, None)
 
     def unregister_pipeline(self, pipeline_id: str) -> None:

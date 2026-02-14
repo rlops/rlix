@@ -15,8 +15,55 @@ def _require_ray():
 
 @dataclass(slots=True)
 class ResourceManager:
+    required_gpus_per_node: int | None = None
+
     def __post_init__(self):
         _require_ray()
+
+    def init_topology(self, *, required_gpus_per_node: int | None = None) -> int:
+        """Initialize and freeze required GPU topology assumptions for this job.
+
+        Returns the finalized required_gpus_per_node.
+
+        Contract (ENG-123): fail-fast if GPU-per-node is inconsistent across GPU nodes.
+        """
+        if self.required_gpus_per_node is not None:
+            raise RuntimeError("ResourceManager topology already initialized")
+        _require_ray()
+        import ray
+
+        alive_nodes = [n for n in ray.nodes() if n.get("Alive")]
+        gpu_counts = []
+        for n in alive_nodes:
+            res = n.get("Resources") or {}
+            count = int(res.get("GPU", 0) or 0)
+            if count > 0:
+                gpu_counts.append(count)
+        if not gpu_counts:
+            raise RuntimeError("No GPU nodes found when initializing topology")
+
+        observed = gpu_counts[0]
+        if any(x != observed for x in gpu_counts):
+            raise RuntimeError(f"Inconsistent GPU-per-node across alive nodes: {sorted(gpu_counts)!r}")
+
+        if required_gpus_per_node is None:
+            required = observed
+        else:
+            required = int(required_gpus_per_node)
+            if required <= 0:
+                raise ValueError(f"required_gpus_per_node must be > 0, got {required_gpus_per_node!r}")
+            if required != observed:
+                raise RuntimeError(
+                    f"required_gpus_per_node={required} does not match observed GPUs-per-node={observed}"
+                )
+
+        self.required_gpus_per_node = required
+        return int(required)
+
+    def get_required_gpus_per_node(self) -> int:
+        if self.required_gpus_per_node is None:
+            raise RuntimeError("ResourceManager topology not initialized; call init_topology() first")
+        return int(self.required_gpus_per_node)
 
     def get_num_gpus(self) -> int:
         """Return current Ray cluster GPU count (no waiting / gating)."""

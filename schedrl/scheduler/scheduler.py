@@ -40,6 +40,68 @@ def _require_ray():
         raise RuntimeError("schedrl.scheduler requires ray") from e
 
 
+def _validate_and_canonicalize_device_mapping(
+    *,
+    cluster_name: str,
+    tp_size: int,
+    device_mapping: List[int],
+    required_gpus_per_node: int,
+) -> List[int]:
+    """Validate + canonicalize device_mapping.
+
+    Canonical form: sorted GPU ids.
+
+    ENG-123 topology contract:
+    - For tp_size in {2,4,8}: each TP group must be contiguous and within a single node boundary.
+    - For tp_size that is a multiple of 8: each TP group must be contiguous and aligned to node boundaries,
+      spanning whole nodes (required_gpus_per_node GPUs per node assumed by global GPU id layout).
+    """
+    if not device_mapping:
+        return []
+    canonical = sorted(int(x) for x in device_mapping)
+
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be > 0 for cluster {cluster_name!r}, got {tp_size!r}")
+    if tp_size == 1:
+        return canonical
+
+    if required_gpus_per_node <= 0:
+        raise ValueError(f"required_gpus_per_node must be > 0, got {required_gpus_per_node!r}")
+    if tp_size not in (2, 4, 8) and (tp_size % required_gpus_per_node != 0):
+        raise ValueError(
+            f"Invalid tp_size={tp_size} for cluster {cluster_name!r}: expected 1,2,4,8 or a multiple of {required_gpus_per_node}"
+        )
+    if len(canonical) % tp_size != 0:
+        raise ValueError(
+            f"cluster {cluster_name!r} has len(device_mapping)={len(canonical)} not divisible by tp_size={tp_size}"
+        )
+
+    for i in range(0, len(canonical), tp_size):
+        group = canonical[i : i + tp_size]
+        if not group:
+            continue
+        expected = list(range(group[0], group[0] + tp_size))
+        if group != expected:
+            raise ValueError(
+                f"Non-contiguous TP group for cluster {cluster_name!r}: got {group}, expected contiguous {expected}"
+            )
+        if tp_size <= required_gpus_per_node:
+            start_node = group[0] // required_gpus_per_node
+            end_node = group[-1] // required_gpus_per_node
+            if start_node != end_node:
+                raise ValueError(
+                    f"TP group crosses node boundary for cluster {cluster_name!r}: group={group} "
+                    f"(gpus_per_node={required_gpus_per_node})"
+                )
+        else:
+            if group[0] % required_gpus_per_node != 0 or group[-1] % required_gpus_per_node != (required_gpus_per_node - 1):
+                raise ValueError(
+                    f"TP group must align to node boundaries for cluster {cluster_name!r}: group={group} "
+                    f"(gpus_per_node={required_gpus_per_node})"
+                )
+    return canonical
+
+
 @dataclass(frozen=True, slots=True)
 class _GapRatioDPWorker:
     pipeline_id: str
@@ -73,6 +135,7 @@ class SchedulerImpl:
     _cycle_counter: int = field(init=False)
     _request_seq: int = field(init=False)
     _num_gpus: Optional[int] = field(init=False)
+    _required_gpus_per_node: Optional[int] = field(init=False)
     _adapter_handle_cache: Dict[str, Tuple[str, Any]] = field(init=False)
 
     def __post_init__(self):
@@ -86,6 +149,7 @@ class SchedulerImpl:
         self._cycle_counter = 0
         self._request_seq = 0
         self._num_gpus: Optional[int] = None
+        self._required_gpus_per_node: Optional[int] = None
         self._adapter_handle_cache = {}
 
     async def register_pipeline(
@@ -169,6 +233,19 @@ class SchedulerImpl:
         if self._resource_manager is None:
             raise RuntimeError("SchedulerImpl.initialize requires a ResourceManager actor (created by orchestrator)")
 
+        try:
+            required_gpus_per_node = int(await self._resource_manager.get_required_gpus_per_node.remote())
+        except RuntimeError as e:
+            msg = str(e)
+            if "init_topology" in msg or "not initialized" in msg:
+                raise RuntimeError(
+                    "ResourceManager topology not initialized; orchestrator must call ResourceManager.init_topology() first"
+                ) from e
+            raise
+        if required_gpus_per_node <= 0:
+            raise RuntimeError(f"Invalid required_gpus_per_node={required_gpus_per_node}, expected > 0")
+        self._required_gpus_per_node = required_gpus_per_node
+
         num_gpus = int(await self._resource_manager.get_num_gpus.remote())
         if num_gpus <= 0:
             raise RuntimeError(f"ResourceManager reported num_gpus={num_gpus}, expected > 0")
@@ -237,9 +314,12 @@ class SchedulerImpl:
                     raise ValueError(
                         f"device_mapping GPU id out of range for cluster {cluster_name!r}: gpu={gpu} not in [0,{num_gpus - 1}]"
                     )
-            if device_mapping and len(device_mapping) % tp_size != 0:
-                raise ValueError(
-                    f"cluster {cluster_name!r} has len(device_mapping)={len(device_mapping)} not divisible by tp_size={tp_size}"
+            if device_mapping:
+                device_mapping = _validate_and_canonicalize_device_mapping(
+                    cluster_name=cluster_name,
+                    tp_size=tp_size,
+                    device_mapping=device_mapping,
+                    required_gpus_per_node=int(self._required_gpus_per_node),
                 )
             is_gen = cluster_name == "actor_infer"
             cfg: Dict[str, Any] = {"tp_size": tp_size, "is_generation": is_gen, "device_mapping": device_mapping}
@@ -483,7 +563,7 @@ class SchedulerImpl:
         await self._topology_ready.wait()
         plan = ExecutionPlan()
         planned_allocation_targets: Set[str] = set()
-        shrink_calls: List[Tuple[Any, List[int]]] = []
+        resize_calls: List[Tuple[Any, List[int], List[int]]] = []
 
         try:
             async with self._lock:
@@ -668,10 +748,10 @@ class SchedulerImpl:
 
                 # Phase 5: prepare execution (Phase 3: propagate shrink to pipeline runtime).
                 # IMPORTANT: do not await adapter RPCs while holding scheduler lock.
-                shrink_calls = self._prepare_shrink_calls_locked(plan)
+                resize_calls = self._prepare_resize_calls_locked(plan)
 
             # Phase 5: execute outside the scheduler lock (avoid deadlocking progress/reporting paths).
-            await self._execute_shrink_calls(shrink_calls)
+            await self._execute_resize_calls(resize_calls)
 
             # Phase 6: commit (Phase 2 simulation: state-only).
             async with self._lock:
@@ -712,45 +792,60 @@ class SchedulerImpl:
         self._adapter_handle_cache[pipeline_id] = (adapter_namespace, handle)
         return handle
 
-    def _prepare_shrink_calls_locked(self, plan: ExecutionPlan) -> List[Tuple[Any, List[int]]]:
-        """Prepare shrink RPC calls under the scheduler lock.
+    def _prepare_resize_calls_locked(self, plan: ExecutionPlan) -> List[Tuple[Any, List[int], List[int]]]:
+        """Prepare resize RPC calls under the scheduler lock.
 
-        Returns a list of (adapter_handle, dp_ranks) to execute outside the lock.
+        Contract: per pipeline per cycle, exactly one of {dp_ranks_to_remove, dp_ranks_to_add} may be non-empty.
         """
-        pipeline_to_dp_ranks: Dict[str, Set[int]] = {}
+        pipeline_to_remove: Dict[str, Set[int]] = {}
+        pipeline_to_add: Dict[str, Set[int]] = {}
 
-        def _add(cluster_id: str, dp_ranks: List[int]) -> None:
+        def _add_remove(cluster_id: str, dp_ranks: List[int]) -> None:
             if not dp_ranks:
                 return
             pipeline_id, cluster_name = parse_cluster_id(cluster_id)
             if cluster_name != "actor_infer":
-                raise RuntimeError(f"shrink ops only supported for actor_infer cluster, got cluster_id={cluster_id!r}")
-            ranks = pipeline_to_dp_ranks.setdefault(pipeline_id, set())
+                return
+            s = pipeline_to_remove.setdefault(pipeline_id, set())
             for r in dp_ranks:
-                ranks.add(int(r))
+                s.add(int(r))
+
+        def _add_add(cluster_id: str, dp_ranks: List[int]) -> None:
+            if not dp_ranks:
+                return
+            pipeline_id, cluster_name = parse_cluster_id(cluster_id)
+            if cluster_name != "actor_infer":
+                return
+            s = pipeline_to_add.setdefault(pipeline_id, set())
+            for r in dp_ranks:
+                s.add(int(r))
 
         for op in plan.completion_driven_suspension_ops:
-            _add(op.cluster_id, list(op.dp_ranks_to_remove))
+            _add_remove(op.cluster_id, list(op.dp_ranks_to_remove))
         for op in plan.sched_guided_shrink_ops:
-            _add(op.cluster_id, list(op.dp_ranks_to_remove))
+            _add_remove(op.cluster_id, list(op.dp_ranks_to_remove))
+        for op in plan.sched_guided_allocation_ops:
+            _add_add(op.cluster_id, list(op.dp_ranks_to_add))
 
-        calls: List[Tuple[Any, List[int]]] = []
-        for pipeline_id, dp_ranks in sorted(pipeline_to_dp_ranks.items()):
-            if not dp_ranks:
+        calls: List[Tuple[Any, List[int], List[int]]] = []
+        for pipeline_id in sorted(set(pipeline_to_remove.keys()) | set(pipeline_to_add.keys())):
+            removes = sorted(pipeline_to_remove.get(pipeline_id, set()))
+            adds = sorted(pipeline_to_add.get(pipeline_id, set()))
+            if removes and adds:
+                raise RuntimeError(
+                    "resize_infer mutual exclusivity violated in a single scheduling cycle: "
+                    f"pipeline_id={pipeline_id!r} dp_ranks_to_remove={removes} dp_ranks_to_add={adds}"
+                )
+            if not removes and not adds:
                 continue
             adapter = self._get_or_lookup_adapter_handle_locked(pipeline_id=pipeline_id)
-            calls.append((adapter, sorted(dp_ranks)))
+            calls.append((adapter, removes, adds))
         return calls
 
-    async def _execute_shrink_calls(self, calls: List[Tuple[Any, List[int]]]) -> None:
-        """Execute pipeline shrinks (ENG-123 Phase 3) outside the scheduler lock.
-
-        Contract: fail-fast; any adapter RPC failure raises and triggers orchestrator shutdown via caller.
-        """
-        for adapter, dp_ranks in calls:
-            if not dp_ranks:
-                continue
-            await adapter.shrink_workers.remote(list(dp_ranks))
+    async def _execute_resize_calls(self, calls: List[Tuple[Any, List[int], List[int]]]) -> None:
+        """Execute pipeline resizes outside the scheduler lock."""
+        for adapter, removes, adds in calls:
+            await adapter.resize_infer.remote(dp_ranks_to_remove=list(removes), dp_ranks_to_add=list(adds))
 
     def get_debug_state(self) -> Any:
         return self._state
@@ -891,8 +986,14 @@ class SchedulerImpl:
                 raise ValueError(f"pipeline_id={pipeline_id!r} has invalid actor_infer tp_size={tp_size}")
 
             step_target = float(progress.step_target_trajectories)
-            percent_completed = float(progress.percent_completed)
-            remaining = max(step_target * (1.0 - percent_completed), 0.0)
+            metrics = progress.metrics if isinstance(progress.metrics, dict) else {}
+            # Fork-aligned contract: queued/inflight (or metrics["remaining"]) is the source-of-truth for demand.
+            if "remaining" in metrics:
+                remaining = float(metrics["remaining"])
+            else:
+                remaining = float(int(progress.queued_trajectories) + int(progress.inflight_trajectories))
+            if remaining < 0:
+                remaining = 0.0
             percent_remaining = 0.0 if step_target <= 0 else remaining / step_target
 
             has_pending = self._has_pending_generation_request(cluster_id)
@@ -958,7 +1059,10 @@ class SchedulerImpl:
                 if state.cluster_id in plan.clusters_to_remove:
                     min_bundles = 0
                 elif _receiver_eligible(state):
-                    min_bundles = max(1, state.target_gpu_count // state.tp_size)
+                    if state.target_gpu_count <= 0:
+                        min_bundles = 0
+                    else:
+                        min_bundles = max(1, state.target_gpu_count // state.tp_size)
                 else:
                     min_bundles = 0
                 shrink_budget[state.pipeline_id] = max(0, len(state.active_dp_workers) - min_bundles)
@@ -1192,7 +1296,7 @@ class SchedulerImpl:
             )
             self._signal_pending_request(cluster_id=op.cluster_id, priority=priority, result=sorted(op.gpus_to_allocate))
 
-        # Apply expansions (state-only).
+        # Apply expansions (state commit; adapter.expand_workers executed in scheduling_cycle before commit).
         for op in plan.sched_guided_allocation_ops:
             if not op.gpus_to_allocate:
                 continue

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -86,6 +87,18 @@ def _ensure_scheduler_singleton():
         # Admission control / topology gating happens here (orchestrator-owned).
         # Scheduler only seeds its idle_gpus from the resource manager after this is ready.
         ray.get(resource_manager.snapshot.remote(wait_timeout_s=10.0, poll_interval_s=0.2))
+        required_gpus_per_node_raw = os.environ.get("SCHEDRL_REQUIRED_GPUS_PER_NODE", "8")
+        try:
+            required_gpus_per_node = int(required_gpus_per_node_raw)
+        except Exception as e:
+            raise RuntimeError(
+                f"Invalid SCHEDRL_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected int"
+            ) from e
+        if required_gpus_per_node <= 0:
+            raise RuntimeError(
+                f"Invalid SCHEDRL_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected > 0"
+            )
+        ray.get(resource_manager.init_topology.remote(required_gpus_per_node=required_gpus_per_node))
         ray.get(scheduler.initialize.remote(resource_manager=resource_manager))
     except Exception as e:
         raise RuntimeError("Failed to initialize SchedRL scheduler actor") from e

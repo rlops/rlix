@@ -42,19 +42,7 @@ class Adapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def close_admission(self, dp_ranks: List[int]) -> ActionResponse:
-        raise NotImplementedError
-
-    @abstractmethod
-    def open_admission(self, dp_ranks: List[int]) -> ActionResponse:
-        raise NotImplementedError
-
-    @abstractmethod
-    def shrink_workers(self, dp_ranks: List[int]) -> ActionResponse:
-        raise NotImplementedError
-
-    @abstractmethod
-    def expand_workers(self, dp_ranks: List[int]) -> ActionResponse:
+    def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> ActionResponse:
         raise NotImplementedError
 
     @abstractmethod

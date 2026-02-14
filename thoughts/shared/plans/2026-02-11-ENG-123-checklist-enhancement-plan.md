@@ -356,22 +356,31 @@ Items are organized by execution phase for practical implementation. The origina
 
 **Primary goals**: selective sync-on-resume; minimal upstream hooks; correctness under expand after weight update.
 
+**Decision record (implementation)**:
+- During ENG-123 implementation, we chose to follow the **fork pattern** from `third_party/ROLL_multi_pipeline` for selective model update behavior/control flow wherever practical.
+- If this checklist is ambiguous, treat the extraction plan Phase 4 text as authoritative, and prefer fork reference behavior unless explicitly overridden by ENG-123 constraints.
+
 ### Original Items (Preserved)
 
 - [ ] **P1 Issue 66 (selective expansion safety)**: ensure expansion is safe and does not admit stale weights; fail-fast on any mismatch.
 - [ ] **P1 Issue 207 (dual-path GPU release logic)**: implement/verify the correct release path(s) under the adapter contract.
-- [ ] Implement `ModelUpdateService` port + required upstream hooks (TP>1 bucket caching policy as documented).
+- [ ] Implement `ModelUpdateService` selective sync trigger (no promotion forwarding, no version choosing, no coalescing/validation).
 
 ### 🆕 ModelUpdateService Implementation Details
 
-- [ ] 🆕 **ModelUpdateService port details**: Port sender cache, subset targeting, bucket caching, strict versioning (Lines 1829-1866)
-- [ ] 🆕 **Bucket caching hook**: Wrap strategy in `ActorWorker.initialize`; backend dispatch; ENG-123 scope (megatron_train only) (Lines 1839-1850)
-- [ ] 🆕 **Selective Update Flow**: 5-step high-level orchestration for subset-DP targeting (Lines 1867-1882)
-- [ ] 🆕 **Worker Requirements**: Reuse upstream APIs: `setup_collective_group`, `broadcast_parameter`, `update_parameter_in_bucket` (Lines 1883-1897)
-- [ ] 🆕 **Required upstream change**: `GroupManager.destroy_collective_group()` must call `dist.destroy_process_group()` (Lines 1932-1935)
-- [ ] 🆕 **Integration code pattern**: `expand_workers` calling `model_update_service.sync_selected_workers` (Lines 1909-1924)
-- [ ] 🆕 **"Highest Version Wins" Coalescing**: If multiple sync requests arrive, skip intermediate versions and only sync the latest. Never abort an active sync in progress. (Line 1866)
-- [ ] 🆕 **Selective Update Staging Bypass**: Must rely on `ROLL_SELECTIVE_MODEL_UPDATE_RECEIVER_DISABLE_CPU_STAGING=1` env var to bypass fork's outdated CPU-staging logic (Line 1893)
+- [ ] 🆕 **Promotion is the source-of-truth (no version choosing in service)**: Coordinator must explicitly promote the active rollout checkpoint version (checkpoint_version + global_step) by calling the sender-side component that owns cache pointers (strategy method or minimal Worker RPC). Sender strategy holds the cache map + `active_cached` pointer; `ModelUpdateService` triggers sender-side selective sync and does **not** choose versions. (Phase 4; Lines 1829-1866)
+- [ ] 🆕 **Selective sync contract**: `ModelUpdateService.sync_selected_workers(tgt_dp_ranks)` only. No `requested_global_step`, no monotonic/anti-stale validation, no coalescing. Sender applies its currently promoted `active_cached` version.
+- [ ] 🆕 **Namespace dependency (Phase 3 prerequisite)**: Phase 4 assumes Phase 3 has already implemented `runtime_env.env_vars` injection so `ROLL_RAY_NAMESPACE` + `PIPELINE_ID` are set before worker imports; fail-fast if missing/mis-scoped
+- [ ] 🆕 **Bucket caching location/order (required)**: Sender-side bucket cache is built inside `train_step` after weights update and before any offload. Do not add a new requirement that caching cadence is driven by an `ActorWorker.initialize` hook.
+- [ ] 🆕 **Selective Update Flow (targeting vs membership)**: Service targets **DP engines** via `tgt_dp_ranks`; collective membership is “sender + selected receiver TP/PP workers inside those DP engines” (subset-scoped group creation) (Lines 1867-1882)
+- [ ] 🆕 **Worker requirements (verify then port minimal set)**: Do not assume upstream `Worker` already has selective-update RPCs; verify what exists in `third_party/ROLL` and port only the minimal required set used by the final implementation (Lines 1883-1897)
+- [ ] 🆕 **Guardrail allowlist semantics**: `set_model_update_allowed_dp_ranks(tgt_dp_ranks)` is a safety net only; excluded ranks must not be in any selective-update collective group membership
+- [ ] 🆕 **CRITICAL vLLM payload-shape constraint**: vLLM `update_parameter_in_bucket` indexes `serialized_named_tensors[self.rank]`; sender must provide a **rank-indexed list-like payload** covering the engine’s TP/PP workers (no sparse dict) unless an explicit upstream receiver change is made
+- [ ] 🆕 **Required upstream change**: `GroupManager.destroy_collective_group()` must call `dist.destroy_process_group()` and only destroy groups created by the current update instance (Lines 1932-1935)
+- [ ] 🆕 **Integration code pattern**: `expand_workers` calls selective sync for newly expanded `tgt_dp_ranks` and then proceeds with admission/routing reopen (Lines 1909-1924)
+- [ ] 🆕 **No coalescing**: No service-side coalescing logic. Service calls may arrive concurrently; end-to-end serialization is provided by the sender/trainer `cache_lock` (lock ordering is not guaranteed/FIFO is not a contract). (Line 1866)
+- [ ] 🆕 **No CPU-staging flag dependency (required)**: Do not rely on `ROLL_SELECTIVE_MODEL_UPDATE_RECEIVER_DISABLE_CPU_STAGING=1`, and do not rely on fork receiver-shard APIs (`meta_infos/buffer/ranks_in_worker`). Receiver-side target remains upstream vLLM `update_parameter_in_bucket(serialized_named_tensors)` indexing `serialized_named_tensors[self.rank]`; sender must provide a rank-indexed list-like payload compatible with upstream `send_recv_utils.py` serialization format.
+
 
 ### Validation Milestone (Phase 4)
 

@@ -2,7 +2,8 @@
 
 - DO NOT add new files, like ".md" ".txt" or test, unless explicitly told or approved by user. 
 - DO NOT make use of any new libraries or packages, unless explicitly told or approved by user.
-
+- DO NOT display using table, use list or bulletin points instead. 
+ 
 ## 1. Safety (Critical)
 - **No Secrets**: Never print, store, or commit tokens or keys.
 - **No Destruction**: Do not delete files or force-push without asking first.

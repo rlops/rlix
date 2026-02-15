@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from schedrl.protocol.request_id import validate_pipeline_id
 from schedrl.protocol.types import Priority
@@ -22,11 +22,18 @@ class ClusterAllocation:
     timestamp: Optional[float] = None
 
 
-@dataclass(frozen=True, slots=True)
 class ValidationError(RuntimeError):
-    message: str
-    condition: Optional[int] = None
-    context: Dict[str, Any] = field(default_factory=dict)
+    def __init__(
+        self,
+        message: str,
+        *,
+        condition: Optional[int] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.condition = condition
+        self.context = context or {}
 
     def __str__(self) -> str:
         return self.message
@@ -68,14 +75,6 @@ class ExecutionPlan:
     sched_guided_allocation_ops: List[SchedGuidedAllocationOp] = field(default_factory=list)
     clusters_to_remove: Set[str] = field(default_factory=set)
 
-    def has_operations(self) -> bool:
-        return bool(
-            self.completion_driven_suspension_ops
-            or self.sched_guided_shrink_ops
-            or self.signal_pending_allocation_ops
-            or self.sched_guided_allocation_ops
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class Request:
@@ -113,13 +112,6 @@ class PendingPlannedReleaseRequest:
     error: Optional[str] = None
 
 
-@dataclass(slots=True)
-class SimulatedState:
-    allocations: Dict[str, ClusterAllocation]
-    idle_gpus: Set[int]
-    gpu_states: Dict[int, Tuple[str, Optional[str]]]  # gpu_id -> (state, owner)
-
-
 def is_generation_cluster(cluster_id: str) -> bool:
     return cluster_id.endswith("_actor_infer")
 
@@ -136,7 +128,7 @@ def validate_cluster_id(cluster_id: str) -> None:
         raise ValueError(f"cluster_id contains invalid characters: {cluster_id!r}")
 
 
-def parse_cluster_id(cluster_id: str) -> Tuple[str, str]:
+def parse_cluster_id(cluster_id: str) -> tuple[str, str]:
     """Suffix-aware parser for cluster_id.
 
     Fail-fast (H2): do not fall back to parsing by `rsplit("_", 1)`, since pipeline_id may
@@ -156,16 +148,6 @@ def parse_cluster_id(cluster_id: str) -> Tuple[str, str]:
         f"Unrecognized cluster_id {cluster_id!r}. Expected suffix _<cluster_name> where cluster_name is one of "
         f"{sorted(known_clusters)!r}."
     )
-
-
-def derive_dp_ranks_from_gpus(gpu_ids: List[int], tp_size: int) -> Set[int]:
-    if tp_size <= 0:
-        return set()
-    sorted_gpus = sorted(gpu_ids)
-    dp_ranks = set()
-    for i in range(0, len(sorted_gpus), tp_size):
-        dp_ranks.add(i // tp_size)
-    return dp_ranks
 
 
 def build_dp_rank_mapping(gpu_ids: List[int], tp_size: int) -> Dict[int, List[int]]:

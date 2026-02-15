@@ -7,8 +7,10 @@ scheduler restart, pipelines are expected to re-register and be re-admitted.
 """
 
 import asyncio
+import math
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -32,12 +34,7 @@ from schedrl.scheduler.types import (
 )
 from schedrl.scheduler.validation import ValidationInputs, normalize_progress_oldest_ts, validate_execution_plan
 
-
-def _require_ray():
-    try:
-        import ray  # noqa: F401
-    except Exception as e:
-        raise RuntimeError("schedrl.scheduler requires ray") from e
+import ray
 
 
 def _validate_and_canonicalize_device_mapping(
@@ -139,7 +136,6 @@ class SchedulerImpl:
     _adapter_handle_cache: Dict[str, Tuple[str, Any]] = field(init=False)
 
     def __post_init__(self):
-        _require_ray()
         self._state = SchedulerState()
         self._lock = asyncio.Lock()
         self._wakeup_event = asyncio.Event()
@@ -224,9 +220,6 @@ class SchedulerImpl:
     async def initialize(self, *, resource_manager: Any | None = None) -> None:
         if self._topology_ready.is_set() and self._loop_task is not None:
             return
-
-        _require_ray()
-        import ray  # noqa: F401
 
         if resource_manager is not None:
             self._resource_manager = resource_manager
@@ -368,8 +361,10 @@ class SchedulerImpl:
         validate_pipeline_id(report.pipeline_id)
         if report.step_target_trajectories <= 0:
             raise ValueError("step_target_trajectories must be > 0")
-        if not (0.0 <= float(report.percent_completed) <= 1.0 + 1e-6):
-            raise ValueError(f"percent_completed must be in [0, 1], got {report.percent_completed!r}")
+        # Extraction plan: do not clamp percent_completed; allow > 1.0 (overshoot is tolerated).
+        # We only validate non-negativity here.
+        if float(report.percent_completed) < 0.0:
+            raise ValueError(f"percent_completed must be >= 0, got {report.percent_completed!r}")
         oldest_ts = normalize_progress_oldest_ts(report.oldest_unfinished_creation_ts, report.fifo_timestamp)
         if report.oldest_unfinished_creation_ts is None and oldest_ts is not None:
             report = ProgressReport(
@@ -765,9 +760,6 @@ class SchedulerImpl:
             raise
 
     def _get_or_lookup_adapter_handle_locked(self, *, pipeline_id: str) -> Any:
-        _require_ray()
-        import ray
-
         info = self._state.pipeline_registry.get(pipeline_id)
         if info is None:
             raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
@@ -847,13 +839,7 @@ class SchedulerImpl:
         for adapter, removes, adds in calls:
             await adapter.resize_infer.remote(dp_ranks_to_remove=list(removes), dp_ranks_to_add=list(adds))
 
-    def get_debug_state(self) -> Any:
-        return self._state
-
     async def _fail_fast_shutdown(self, *, reason: str) -> None:
-        _require_ray()
-        import ray
-
         try:
             orchestrator = ray.get_actor("schedrl:orchestrator", namespace="schedrl")
         except Exception as e:
@@ -945,8 +931,6 @@ class SchedulerImpl:
     ) -> Set[int]:
         # Ported from ROLL_multi_pipeline CentralizedGPUSchedulerImpl._plan_generation_gap_ratio_alternative,
         # adapted to SchedRL-standard progress reporting (percent_completed / step_target_trajectories).
-        import math
-        from collections import defaultdict
 
         def _round_half_up(value: float) -> int:
             return int(math.floor(value + 0.5))
@@ -1440,7 +1424,4 @@ class SchedulerImpl:
 
 
 def scheduler_actor_class():
-    _require_ray()
-    import ray
-
     return ray.remote(max_restarts=0, max_task_retries=0)(SchedulerImpl)

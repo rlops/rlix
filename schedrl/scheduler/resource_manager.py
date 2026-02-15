@@ -4,21 +4,21 @@ import time
 from dataclasses import dataclass
 
 from schedrl.utils.ray_head import head_node_affinity_strategy
+import ray
 
-
-def _require_ray():
-    try:
-        import ray  # noqa: F401
-    except Exception as e:
-        raise RuntimeError("schedrl.scheduler.resource_manager requires ray") from e
+# ENG-123: Platform/resource assumption
+# SchedRL and ROLL resource keys differ: this module uses Ray's "GPU" resource
+# key (as returned by `ray.cluster_resources()` / `ray.nodes()`), whereas ROLL's
+# scheduler stack references `current_platform.ray_device_key`. For parity across
+# deployment platforms we would need to align these abstractions. For ENG-123 we
+# document that SchedRL currently targets CUDA-only setups where the Ray GPU
+# resource key is present and meaningful. Prefer naming/standardizing the
+# platform-level device key if broader device types are required in future.
 
 
 @dataclass(slots=True)
 class ResourceManager:
     required_gpus_per_node: int | None = None
-
-    def __post_init__(self):
-        _require_ray()
 
     def init_topology(self, *, required_gpus_per_node: int | None = None) -> int:
         """Initialize and freeze required GPU topology assumptions for this job.
@@ -29,8 +29,6 @@ class ResourceManager:
         """
         if self.required_gpus_per_node is not None:
             raise RuntimeError("ResourceManager topology already initialized")
-        _require_ray()
-        import ray
 
         alive_nodes = [n for n in ray.nodes() if n.get("Alive")]
         gpu_counts = []
@@ -67,9 +65,6 @@ class ResourceManager:
 
     def get_num_gpus(self) -> int:
         """Return current Ray cluster GPU count (no waiting / gating)."""
-        _require_ray()
-        import ray
-
         cluster_resources = ray.cluster_resources()
         return int(cluster_resources.get("GPU", 0))
 
@@ -86,9 +81,6 @@ class ResourceManager:
             raise ValueError(f"poll_interval_s must be > 0, got {poll_interval_s!r}")
         if expected_num_gpus is not None and expected_num_gpus < 0:
             raise ValueError(f"expected_num_gpus must be >= 0, got {expected_num_gpus!r}")
-
-        _require_ray()
-        import ray
 
         deadline = time.monotonic() + float(wait_timeout_s)
         last_num_gpus = None
@@ -129,9 +121,6 @@ class ResourceManager:
 
 
 def get_or_create_resource_manager(*, name: str = "schedrl:resource_manager", namespace: str = "schedrl"):
-    _require_ray()
-    import ray
-
     try:
         return ray.get_actor(name, namespace=namespace)
     except ValueError:

@@ -16,6 +16,18 @@ source_docs:
 This is the main shared protocol for multi-pipeline GPU sharing across
 **ROLL** and **SkyRL-train** (current integration focus). NeMo-RL and Miles are deferred/archived for now.
 
+## Platform assumptions (ENG-123)
+
+- ENG-123: Resource key parity — Platform/device assumptions differ across stacks.
+  This document and the `schedrl/scheduler/resource_manager.py` implementation
+  assume Ray exposes GPUs via the "GPU" resource key (e.g., `ray.cluster_resources()` and
+  `ray.nodes()`); ROLL's scheduler stack uses `current_platform.ray_device_key`.
+  For parity across platforms/configurations we would need to unify these
+  abstractions. For ENG-123 we explicitly document that SchedRL targets CUDA-only
+  deployments (i.e., environments where Ray's `GPU` resource key reflects CUDA GPUs).
+  If non-CUDA device types are required later, update the platform abstraction
+  (and `current_platform.ray_device_key`) before relying on different resource keys.
+
 For concrete per-framework code entrypoints and limitations, see:
 - `design_doc/archive/adaptation_nemo_rl.md` (deferred; archived)
 - `design_doc/adaptation_roll.md`

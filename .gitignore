@@ -55,9 +55,8 @@ checkpoints/
 logs/
 wandb/
 
-# Only track ROLL submodule in external/
-external/*
-!external/ROLL/
+# Ignore non-submodule external directories
+external/linux_reference/
 
 hack/
 .claude*/

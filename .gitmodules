@@ -1,21 +1,40 @@
 [submodule "external/ROLL"]
 	path = external/ROLL
 	url = git@github.com:taoluo/_rlos_ROLL.git
+	update = none
 [submodule "external/SkyRL"]
 	path = external/SkyRL
 	url = git@github.com:NovaSky-AI/SkyRL.git
+	update = none
 [submodule "external/miles"]
 	path = external/miles
 	url = git@github.com:radixark/miles.git
+	update = none
 [submodule "external/nemo-gym"]
 	path = external/nemo-gym
 	url = git@github.com:NVIDIA-NeMo/Gym.git
+	update = none
 [submodule "external/nemo-rl"]
 	path = external/nemo-rl
 	url = git@github.com:NVIDIA-NeMo/RL.git
+	update = none
 [submodule "external/sglang"]
 	path = external/sglang
 	url = git@github.com:sgl-project/sglang.git
+	update = none
 [submodule "external/vllm"]
 	path = external/vllm
 	url = git@github.com:vllm-project/vllm.git
+	update = none
+[submodule "external/ROLL_multi_lora"]
+	path = external/ROLL_multi_lora
+	url = git@github.com:alibaba/ROLL.git
+	update = none
+[submodule "external/ROLL_multi_pipeline"]
+	path = external/ROLL_multi_pipeline
+	url = git@github.com:alibaba/ROLL.git
+	update = none
+[submodule "external/ROLL_upstream_main"]
+	path = external/ROLL_upstream_main
+	url = git@github.com:alibaba/ROLL.git
+	update = none

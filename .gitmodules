@@ -1,7 +1,7 @@
-[submodule "external/ROLL"]
-	path = external/ROLL
+[submodule "external/ROLL_schedrl"]
+	path = external/ROLL_schedrl
 	url = git@github.com:taoluo/_rlos_ROLL.git
-	update = none
+	update = merge
 	branch = main
 [submodule "external/SkyRL"]
 	path = external/SkyRL

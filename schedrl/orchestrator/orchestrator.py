@@ -52,8 +52,16 @@ def _ray_cli_path() -> str:
 
 
 def _kill_local_ray() -> None:
-    ray_executable = _ray_cli_path()
-    subprocess.run([ray_executable, "stop", "--force"], check=False)
+    # WARNING: Calling `ray stop --force` via subprocess from inside a Ray actor triggers
+    # a deepcopy bug with Sentinel enum objects (Ray 2.47.1 + Python 3.10).
+    # Use ray.shutdown() instead, which is safe to call from within Ray workers.
+    sys.stderr.write("[schedrl][WARN] _kill_local_ray() called from inside Ray actor - using ray.shutdown() instead of 'ray stop --force'\n")
+    sys.stderr.flush()
+    try:
+        ray.shutdown()
+    except Exception as e:
+        sys.stderr.write(f"[schedrl][WARN] ray.shutdown() failed: {e}\n")
+        sys.stderr.flush()
 
 
 def _ensure_scheduler_singleton():
@@ -377,6 +385,10 @@ class Orchestrator:
         self._pipelines.pop(pipeline_id, None)
 
     def shutdown(self, force: bool = True, reason: Optional[str] = None, source: Optional[str] = None) -> None:
+        import traceback
+        sys.stderr.write(f"[schedrl][DEBUG] orchestrator.shutdown called: force={force!r} reason={reason!r} source={source!r}\n")
+        sys.stderr.write("".join(traceback.format_stack()))
+        sys.stderr.flush()
         if self._shutdown_started:
             return
         self._shutdown_started = True

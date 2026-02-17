@@ -38,6 +38,4 @@ class ReleaseAndRequestAction:
 @dataclass(frozen=True, slots=True)
 class NotifyReadyToReleaseAction:
     pipeline_id: str
-    planned_release_gpu_ids: List[int]
     timeout_s: Optional[float] = None
-

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set
 
 from schedrl.protocol.types import Priority, ProgressReport
-from schedrl.scheduler.types import ClusterAllocation, PendingCompletionRequest, PendingPlannedReleaseRequest, PendingRequest
+from schedrl.scheduler.types import ClusterAllocation, PendingPlannedReleaseRequest, PendingRequest
 
 
 @dataclass(slots=True)
@@ -14,7 +14,6 @@ class SchedulerState:
     idle_gpus: Set[int] = field(default_factory=set)
     planned_available_gpus: Set[int] = field(default_factory=set)
 
-    pending_completion_requests: Dict[str, PendingCompletionRequest] = field(default_factory=dict)  # cluster_id -> request
     pending_planned_release_requests: Dict[str, PendingPlannedReleaseRequest] = field(default_factory=dict)  # cluster_id -> request
 
     pipeline_registry: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # pipeline_id -> info

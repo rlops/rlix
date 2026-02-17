@@ -74,16 +74,7 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
             context={"overlap": sorted(allocated_gpus & inputs.idle_gpus)},
         )
 
-    # Condition 1 (operation uniqueness): completion vs sched-guided shrink are mutually exclusive per cluster.
-    completion_clusters = {op.cluster_id for op in plan.completion_driven_suspension_ops if op.dp_ranks_to_remove}
-    shrink_clusters = {op.cluster_id for op in plan.sched_guided_shrink_ops if op.dp_ranks_to_remove}
-    overlap = completion_clusters & shrink_clusters
-    if overlap:
-        raise ValidationError(
-            "cluster_id appears in both completion_driven_suspension_ops and sched_guided_shrink_ops",
-            condition=1,
-            context={"cluster_ids": sorted(overlap)},
-        )
+    # Condition 1 (operation uniqueness): handled by construction for sched_guided_shrink_ops.
 
     # Condition 3 (mutual exclusivity): cannot both allocate and remove the same cluster in one cycle.
     alloc_targets = {op.cluster_id for op in plan.signal_pending_allocation_ops} | {op.cluster_id for op in plan.sched_guided_allocation_ops}
@@ -96,7 +87,7 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
         )
 
     # Condition 2 (state transitions): non-generation clusters must not be shrunk/expanded via DP-rank ops.
-    for op in list(plan.completion_driven_suspension_ops) + list(plan.sched_guided_shrink_ops):
+    for op in list(plan.sched_guided_shrink_ops):
         if not is_generation_cluster(op.cluster_id):
             raise ValidationError("shrink op applied to non-generation cluster", condition=2, context={"cluster_id": op.cluster_id})
     for op in plan.sched_guided_allocation_ops:
@@ -107,7 +98,7 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
                 context={"cluster_id": op.cluster_id},
             )
 
-    # Condition 11 (completion consistency): clusters_to_remove must only contain clusters that exist.
+    # Condition 11 (consistency): clusters_to_remove must only contain clusters that exist.
     missing = [cid for cid in plan.clusters_to_remove if cid not in inputs.active_allocations]
     if missing:
         raise ValidationError("clusters_to_remove contains unknown cluster_id", condition=11, context={"cluster_ids": missing})
@@ -159,8 +150,8 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
         tp_size = _cluster_tp_size(inputs, cluster_id)
         alloc.dp_rank_to_gpus = build_dp_rank_mapping(alloc.gpu_ids, tp_size)
 
-    # Apply shrinks (completion + sched-guided).
-    for op in plan.completion_driven_suspension_ops + plan.sched_guided_shrink_ops:
+    # Apply shrinks.
+    for op in plan.sched_guided_shrink_ops:
         if not op.dp_ranks_to_remove:
             continue
         alloc = sim_allocations.get(op.cluster_id)

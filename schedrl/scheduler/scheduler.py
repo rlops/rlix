@@ -19,9 +19,7 @@ from schedrl.protocol.types import Priority, ProgressReport
 from schedrl.scheduler.state import SchedulerState
 from schedrl.scheduler.types import (
     ClusterAllocation,
-    CompletionSuspensionOp,
     ExecutionPlan,
-    PendingCompletionRequest,
     PendingPlannedReleaseRequest,
     PendingRequest,
     Request,
@@ -200,13 +198,6 @@ class SchedulerImpl:
                     pending.error = f"Pipeline {pipeline_id!r} unregistered"
                     pending.event.set()
                 bucket[:] = remaining
-
-            for cluster_id, req in list(self._state.pending_completion_requests.items()):
-                if not cluster_id.startswith(f"{pipeline_id}_"):
-                    continue
-                req.error = f"Pipeline {pipeline_id!r} unregistered"
-                req.event.set()
-                self._state.pending_completion_requests.pop(cluster_id, None)
 
             for cluster_id, req in list(self._state.pending_planned_release_requests.items()):
                 if not cluster_id.startswith(f"{pipeline_id}_"):
@@ -493,50 +484,10 @@ class SchedulerImpl:
                 pending.error = error
                 pending.event.set()
             self._state.pending_bucket(priority).clear()
-        for _, req in list(self._state.pending_completion_requests.items()):
-            req.error = error
-            req.event.set()
-        self._state.pending_completion_requests.clear()
         for _, req in list(self._state.pending_planned_release_requests.items()):
             req.error = error
             req.event.set()
         self._state.pending_planned_release_requests.clear()
-
-    async def notify_completion(
-        self,
-        *,
-        cluster_id: str,
-        allocation_id: str,
-        global_step: Optional[int] = None,
-        timeout_s: Optional[float] = None,
-    ) -> None:
-        await self._topology_ready.wait()
-        if not isinstance(allocation_id, str) or allocation_id == "":
-            raise ValueError("allocation_id must be non-empty str")
-        if timeout_s is not None and (not isinstance(timeout_s, (int, float)) or timeout_s <= 0):
-            raise ValueError(f"timeout_s must be > 0, got {timeout_s!r}")
-        async with self._lock:
-            existing = self._state.pending_completion_requests.get(cluster_id)
-            if existing is not None:
-                return
-            req = PendingCompletionRequest(
-                cluster_id=cluster_id,
-                allocation_id=allocation_id,
-                event=asyncio.Event(),
-                global_step=global_step,
-            )
-            self._state.pending_completion_requests[cluster_id] = req
-            self._wakeup_event.set()
-        try:
-            if timeout_s is None:
-                await req.event.wait()
-            else:
-                await asyncio.wait_for(req.event.wait(), timeout=float(timeout_s))
-        except asyncio.TimeoutError:
-            await self._fail_fast_shutdown(reason=f"notify_completion_timeout: cluster_id={cluster_id!r}")
-            raise
-        if req.error is not None:
-            raise RuntimeError(req.error)
 
     async def _central_scheduling_loop(self) -> None:
         while True:
@@ -564,35 +515,6 @@ class SchedulerImpl:
             async with self._lock:
                 self._cycle_counter += 1
                 planned_available_gpus = set(self._state.idle_gpus)
-
-                # Phase 0: completion notifications (generation only).
-                for cluster_id, req in list(self._state.pending_completion_requests.items()):
-                    alloc = self._state.active_allocations.get(cluster_id)
-                    if alloc is None:
-                        req.event.set()
-                        self._state.pending_completion_requests.pop(cluster_id, None)
-                        continue
-                    if alloc.priority != Priority.GENERATION:
-                        raise RuntimeError(f"notify_completion is only valid for GENERATION clusters, got {cluster_id!r}")
-                    dp_ranks = sorted(alloc.active_dp_ranks)
-                    if dp_ranks:
-                        freed: Set[int] = set()
-                        for dp_rank in dp_ranks:
-                            bundle = alloc.dp_rank_to_gpus.get(dp_rank)
-                            if bundle is not None:
-                                freed |= set(bundle)
-                                continue
-                            pipeline_id, _ = parse_cluster_id(cluster_id)
-                            infer_cfg = self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"]
-                            tp_size = int(infer_cfg.get("tp_size", 1))
-                            device_mapping = list(infer_cfg.get("device_mapping") or [])
-                            start = dp_rank * tp_size
-                            freed |= set(device_mapping[start : start + tp_size])
-                        planned_available_gpus |= freed
-                    plan.completion_driven_suspension_ops.append(
-                        CompletionSuspensionOp(cluster_id=cluster_id, dp_ranks_to_remove=dp_ranks, allocation_id=req.allocation_id)
-                    )
-                    plan.clusters_to_remove.add(cluster_id)
 
                 # Phase 0.5: planned release requests (blocking release hint from pipeline/coordinator).
                 for cluster_id, req in list(self._state.pending_planned_release_requests.items()):
@@ -702,27 +624,30 @@ class SchedulerImpl:
                 # Phase 3: generation gap-ratio planning.
                 planned_available_gpus -= non_gen_reserved_gpus
 
-                # Unblock pending generation requests if there are already active workers (no allocation needed).
-                pending_gen = list(self._state.pending_bucket(Priority.GENERATION))
-                for pending in pending_gen:
-                    cluster_id = pending.request.cluster_id
-                    alloc = self._state.active_allocations.get(cluster_id)
-                    if alloc is None:
-                        continue
-                    if alloc.priority != Priority.GENERATION:
-                        continue
-                    if alloc.active_dp_ranks:
-                        plan.signal_pending_allocation_ops.append(
-                            SignalPendingAllocationOp(
-                                cluster_id=cluster_id,
-                                gpus_to_allocate=[],
-                                priority=Priority.GENERATION,
-                            )
-                        )
-
                 active_dp_workers, inactive_dp_workers, idle_for_gen = self._snapshot_generation_dp_workers(
                     plan=plan, idle_gpus=set(planned_available_gpus)
                 )
+
+                # Unblock pending generation requests only when all generation workers are already active.
+                # This must be mutually exclusive with expansion planning to avoid conflicting plan ops.
+                pending_gen = list(self._state.pending_bucket(Priority.GENERATION))
+                for pending in pending_gen:
+                    cluster_id = pending.request.cluster_id
+                    pipeline_id, cluster_name = parse_cluster_id(cluster_id)
+                    if cluster_name != "actor_infer":
+                        continue
+                    if inactive_dp_workers.get(pipeline_id):
+                        continue
+                    if not active_dp_workers.get(pipeline_id):
+                        continue
+                    plan.signal_pending_allocation_ops.append(
+                        SignalPendingAllocationOp(
+                            cluster_id=cluster_id,
+                            gpus_to_allocate=[],
+                            priority=Priority.GENERATION,
+                        )
+                    )
+
                 idle_for_gen = self._plan_generation_gap_ratio(
                     plan,
                     active_dp_workers=active_dp_workers,
@@ -812,8 +737,6 @@ class SchedulerImpl:
             for r in dp_ranks:
                 s.add(int(r))
 
-        for op in plan.completion_driven_suspension_ops:
-            _add_remove(op.cluster_id, list(op.dp_ranks_to_remove))
         for op in plan.sched_guided_shrink_ops:
             _add_remove(op.cluster_id, list(op.dp_ranks_to_remove))
         for op in plan.sched_guided_allocation_ops:
@@ -861,10 +784,6 @@ class SchedulerImpl:
         for pipeline_id in self._state.pipeline_registry:
             cluster_id = f"{pipeline_id}_actor_infer"
             planned_removed_ranks[cluster_id] = set()
-        for op in plan.completion_driven_suspension_ops:
-            if not is_generation_cluster(op.cluster_id):
-                continue
-            planned_removed_ranks.setdefault(op.cluster_id, set()).update(op.dp_ranks_to_remove)
         for op in plan.sched_guided_shrink_ops:
             if not is_generation_cluster(op.cluster_id):
                 continue
@@ -1002,12 +921,6 @@ class SchedulerImpl:
         assert idle_gpus.isdisjoint(non_gen_reserved_gpus), "idle_gpus must exclude non-GEN reserved GPUs"
 
         protected: Set[Tuple[str, int]] = set()
-        for op in plan.completion_driven_suspension_ops:
-            pipeline_id, cluster_name = parse_cluster_id(op.cluster_id)
-            if cluster_name != "actor_infer":
-                continue
-            for dp_rank in op.dp_ranks_to_remove:
-                protected.add((pipeline_id, dp_rank))
         for op in plan.sched_guided_shrink_ops:
             pipeline_id, cluster_name = parse_cluster_id(op.cluster_id)
             if cluster_name != "actor_infer":
@@ -1137,14 +1050,23 @@ class SchedulerImpl:
                 return False
             if state.cluster_id in plan.clusters_to_remove:
                 return False
-            plan.sched_guided_allocation_ops.append(
-                SchedGuidedAllocationOp(
-                    cluster_id=state.cluster_id,
-                    dp_ranks_to_add=[inactive.dp_rank],
-                    gpus_to_allocate=sorted(needed_bundle),
-                    has_pending_request=has_pending_request,
-                )
+            existing_alloc_op = next(
+                (op for op in plan.sched_guided_allocation_ops if op.cluster_id == state.cluster_id),
+                None,
             )
+            if existing_alloc_op is not None:
+                existing_alloc_op.dp_ranks_to_add.append(inactive.dp_rank)
+                existing_alloc_op.gpus_to_allocate.extend(sorted(needed_bundle))
+                existing_alloc_op.has_pending_request = existing_alloc_op.has_pending_request or has_pending_request
+            else:
+                plan.sched_guided_allocation_ops.append(
+                    SchedGuidedAllocationOp(
+                        cluster_id=state.cluster_id,
+                        dp_ranks_to_add=[inactive.dp_rank],
+                        gpus_to_allocate=sorted(needed_bundle),
+                        has_pending_request=has_pending_request,
+                    )
+                )
             active_dp_workers.setdefault(state.pipeline_id, []).append(inactive)
             receiver_inactive = inactive_dp_workers.setdefault(state.pipeline_id, [])
             receiver_inactive[:] = [w for w in receiver_inactive if w.dp_rank != inactive.dp_rank]
@@ -1206,22 +1128,6 @@ class SchedulerImpl:
             start = dp_rank * tp_size
             return set(device_mapping[start : start + tp_size])
 
-        # Apply shrinks (state-only for Phase 2).
-        for op in plan.completion_driven_suspension_ops:
-            if not op.dp_ranks_to_remove:
-                continue
-            alloc = self._state.active_allocations.get(op.cluster_id)
-            if alloc is None:
-                continue
-            for dp_rank in op.dp_ranks_to_remove:
-                bundle = set(alloc.dp_rank_to_gpus.get(dp_rank) or [])
-                if not bundle:
-                    bundle = _reconstruct_bundle(cluster_id=op.cluster_id, dp_rank=dp_rank)
-                alloc.active_dp_ranks.discard(dp_rank)
-                alloc.dp_rank_to_gpus.pop(dp_rank, None)
-                alloc.gpu_ids = [g for g in alloc.gpu_ids if g not in bundle]
-                self._state.idle_gpus |= bundle
-
         for op in plan.sched_guided_shrink_ops:
             if not op.dp_ranks_to_remove:
                 continue
@@ -1281,11 +1187,13 @@ class SchedulerImpl:
             self._signal_pending_request(cluster_id=op.cluster_id, priority=priority, result=sorted(op.gpus_to_allocate))
 
         # Apply expansions (state commit; adapter.expand_workers executed in scheduling_cycle before commit).
+        # State commit is unconditional; signaling is deferred to a set-based pass to handle
+        # the case where signal_pending_allocation_ops already consumed the pending request, or
+        # multiple ops target the same cluster (merged by _try_activate_one but guarded here too).
+        cluster_ids_to_signal: Set[str] = set()
         for op in plan.sched_guided_allocation_ops:
             if not op.gpus_to_allocate:
                 continue
-            if op.has_pending_request and not self._has_pending_request_locked(cluster_id=op.cluster_id, priority=Priority.GENERATION):
-                raise RuntimeError(f"Planned expansion has no pending waiter: cluster_id={op.cluster_id!r} priority=GENERATION")
             gpu_set = set(op.gpus_to_allocate)
             self._state.idle_gpus -= gpu_set
             alloc = self._state.active_allocations.get(op.cluster_id)
@@ -1300,13 +1208,11 @@ class SchedulerImpl:
                 alloc.active_dp_ranks.add(dp_rank)
             alloc.gpu_ids = sorted(set(alloc.gpu_ids) | gpu_set)
             if op.has_pending_request:
-                self._signal_pending_request(cluster_id=op.cluster_id, priority=Priority.GENERATION, result=sorted(op.gpus_to_allocate))
-
-        # Completion requests: signal completion events and clear.
-        for cluster_id, req in list(self._state.pending_completion_requests.items()):
-            if cluster_id in plan.clusters_to_remove or cluster_id not in self._state.active_allocations:
-                req.event.set()
-                self._state.pending_completion_requests.pop(cluster_id, None)
+                cluster_ids_to_signal.add(op.cluster_id)
+        for cluster_id in cluster_ids_to_signal:
+            if self._has_pending_request_locked(cluster_id=cluster_id, priority=Priority.GENERATION):
+                alloc = self._state.active_allocations[cluster_id]
+                self._signal_pending_request(cluster_id=cluster_id, priority=Priority.GENERATION, result=sorted(alloc.gpu_ids))
 
         # Planned release requests: signal after shrink commit.
         for cluster_id, req in list(self._state.pending_planned_release_requests.items()):
@@ -1332,12 +1238,11 @@ class SchedulerImpl:
         cluster_id: Optional[str] = None,
         global_step: Optional[int] = None,
         timeout_s: Optional[float] = None,
-        planned_release_gpu_ids: Optional[List[int]] = None,
     ) -> List[int]:
         """Blocking planned release API (SchedRL checklist).
 
-        Phase 2 implementation is state-only: we translate planned_release_gpu_ids into dp_ranks_to_remove for the
-        generation cluster and block until the scheduler commits a shrink in its next cycle.
+        Phase 2 implementation is state-only: scheduler selects dp_ranks_to_remove for the generation cluster from
+        allocation state and blocks until the scheduler commits a shrink in its next cycle.
         """
 
         await self._topology_ready.wait()
@@ -1346,11 +1251,6 @@ class SchedulerImpl:
         if cluster_id is None:
             validate_pipeline_id(str(pipeline_id))
             cluster_id = f"{pipeline_id}_actor_infer"
-        if not isinstance(planned_release_gpu_ids, list) or not planned_release_gpu_ids:
-            raise ValueError("planned_release_gpu_ids must be a non-empty list[int]")
-        for gpu in planned_release_gpu_ids:
-            if not isinstance(gpu, int) or gpu < 0:
-                raise ValueError(f"planned_release_gpu_ids must be list[int>=0], got {gpu!r}")
         if timeout_s is not None and (not isinstance(timeout_s, (int, float)) or timeout_s <= 0):
             raise ValueError(f"timeout_s must be > 0, got {timeout_s!r}")
 
@@ -1361,6 +1261,8 @@ class SchedulerImpl:
                 raise RuntimeError(f"cluster_id {cluster_id!r} not found in active_allocations")
             if alloc.priority != Priority.GENERATION:
                 raise RuntimeError(f"notify_ready_to_release only supports GENERATION clusters, got {cluster_id!r}")
+            if not alloc.active_dp_ranks:
+                return []
 
             # Idempotency: if already pending, wait on the existing request.
             existing = self._state.pending_planned_release_requests.get(cluster_id)
@@ -1379,28 +1281,17 @@ class SchedulerImpl:
                 if not device_mapping:
                     raise RuntimeError(f"Missing device_mapping for cluster_id {cluster_id!r}")
 
-                planned_set = set(planned_release_gpu_ids)
-                dp_ranks_to_remove: List[int] = []
+                dp_ranks_to_remove = sorted(alloc.active_dp_ranks)
                 released_gpu_ids: List[int] = []
                 for dp_rank in sorted(alloc.active_dp_ranks):
                     bundle = alloc.dp_rank_to_gpus.get(dp_rank)
                     if bundle is None:
                         start = dp_rank * tp_size
                         bundle = device_mapping[start : start + tp_size]
-                    bundle_set = set(bundle)
-                    if bundle_set and bundle_set.issubset(planned_set):
-                        dp_ranks_to_remove.append(dp_rank)
-                        released_gpu_ids.extend(list(bundle))
-
-                if not dp_ranks_to_remove:
-                    raise RuntimeError(
-                        "planned_release_gpu_ids does not correspond to any active dp-rank bundles; "
-                        f"cluster_id={cluster_id!r}, planned_release_gpu_ids={sorted(planned_set)!r}, active_dp_ranks={sorted(alloc.active_dp_ranks)!r}"
-                    )
+                    released_gpu_ids.extend(list(bundle or []))
 
                 req = PendingPlannedReleaseRequest(
                     cluster_id=cluster_id,
-                    planned_release_gpu_ids=list(planned_release_gpu_ids),
                     dp_ranks_to_remove=dp_ranks_to_remove,
                     event=event,
                     global_step=global_step,

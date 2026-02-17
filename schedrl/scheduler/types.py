@@ -40,13 +40,6 @@ class ValidationError(RuntimeError):
 
 
 @dataclass(slots=True)
-class CompletionSuspensionOp:
-    cluster_id: str
-    dp_ranks_to_remove: List[int]
-    allocation_id: Optional[str] = None
-
-
-@dataclass(slots=True)
 class SchedGuidedShrinkOp:
     cluster_id: str
     dp_ranks_to_remove: List[int]
@@ -69,7 +62,6 @@ class SchedGuidedAllocationOp:
 
 @dataclass(slots=True)
 class ExecutionPlan:
-    completion_driven_suspension_ops: List[CompletionSuspensionOp] = field(default_factory=list)
     sched_guided_shrink_ops: List[SchedGuidedShrinkOp] = field(default_factory=list)
     signal_pending_allocation_ops: List[SignalPendingAllocationOp] = field(default_factory=list)
     sched_guided_allocation_ops: List[SchedGuidedAllocationOp] = field(default_factory=list)
@@ -93,18 +85,8 @@ class PendingRequest:
 
 
 @dataclass(slots=True)
-class PendingCompletionRequest:
-    cluster_id: str
-    allocation_id: str
-    event: asyncio.Event
-    global_step: Optional[int] = None
-    error: Optional[str] = None
-
-
-@dataclass(slots=True)
 class PendingPlannedReleaseRequest:
     cluster_id: str
-    planned_release_gpu_ids: List[int]
     dp_ranks_to_remove: List[int]
     event: asyncio.Event
     global_step: Optional[int] = None

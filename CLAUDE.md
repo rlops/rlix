@@ -3,6 +3,8 @@
 - DO NOT add new files, like ".md" ".txt" or test, unless explicitly told or approved by user. 
 - DO NOT make use of any new libraries or packages, unless explicitly told or approved by user.
 - ALWAYS comment code changes: MUST add comments for short explanation first before changing existing code.
+- Copy-then-revise: When adding more than ~20 lines of new code, you MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class). Copy the closest match and adapt it, noting the source file. Only write from scratch if no similar pattern exists.
+- Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs at suspicious spots and key checkpoints to observe runtime state before touching any code.     
 
 ## 1. Safety (Critical)
 - **No Secrets**: Never print, store, or commit tokens or keys.
@@ -15,6 +17,7 @@
 - **No Fault Tolerance**: Assume rare failures cannot happen to simplify implementation, ignore failure handling and fault tolerance cases by failing fast and loudly, then terminating the whole program. Do not implement retry logic, recovery mechanisms, or graceful degradation unless explicitly requested.
 - **No Idempotent Operations**: Assume operations always succeed and execute exactly once. Do not design for idempotency, deduplication, or duplicate detection. Avoid idempotent operation patterns.
 - **Check Your Work**: Run the smallest relevant test. If you can't, tell the user what command to run.
+
 
 ## 3. Scope & Quality
 - **Small Changes**: Do the smallest change that solves the problem. No extra formatting.
@@ -36,6 +39,8 @@ IMPORTANT: When debugging, prefer using pycharm-debugger MCP tools to interact w
 # Repository Guidelines
 
 This repository is a multi-framework workspace for SchedRL design + integration across several RL/post-training stacks.
+
+default python env dir is /venv/main/bin/python
 
 ## Project Structure & Module Organization
 

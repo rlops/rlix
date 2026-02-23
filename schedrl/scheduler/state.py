@@ -18,7 +18,10 @@ class SchedulerState:
 
     pipeline_registry: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # pipeline_id -> info
 
-    latest_progress_by_pipeline: Dict[str, ProgressReport] = field(default_factory=dict)
+    # Keep latest snapshot per pipeline/mode/stream:
+    #   latest_progress_by_pipeline[pipeline_id][mode][stream_key] = ProgressReport
+    # where stream_key is adapter_id for adapter streams, or a reserved key for full-finetune.
+    latest_progress_by_pipeline: Dict[str, Dict[str, Dict[str, ProgressReport]]] = field(default_factory=dict)
 
     def pending_bucket(self, priority: Priority) -> List[PendingRequest]:
         bucket = self.pending_requests.get(priority)

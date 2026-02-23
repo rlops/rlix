@@ -350,6 +350,9 @@ class SchedulerImpl:
 
     async def report_progress(self, report: ProgressReport) -> None:
         validate_pipeline_id(report.pipeline_id)
+        # Fail fast with a clear message if caller violates ProgressReport counter contract.
+        if report.queued_trajectories is None or report.inflight_trajectories is None:
+            raise ValueError("queued_trajectories and inflight_trajectories must not be None")
         if report.step_target_trajectories <= 0:
             raise ValueError("step_target_trajectories must be > 0")
         # Extraction plan: do not clamp percent_completed; allow > 1.0 (overshoot is tolerated).
@@ -372,7 +375,51 @@ class SchedulerImpl:
         async with self._lock:
             if report.pipeline_id not in self._state.pipeline_registry:
                 raise RuntimeError(f"pipeline_id {report.pipeline_id!r} not registered")
-            self._state.latest_progress_by_pipeline[report.pipeline_id] = report
+            # Keep latest nested by pipeline->mode->stream in one store.
+            # stream_key is adapter_id for adapter streams, or reserved for full-finetune.
+            metrics = report.metrics if isinstance(report.metrics, dict) else {}
+            mode = str(metrics.get("mode", "train"))
+            adapter_id = metrics.get("adapter_id")
+            stream_key_full_ft = "__full_finetune__"
+            pipeline_bucket = self._state.latest_progress_by_pipeline.setdefault(report.pipeline_id, {})
+            has_full_ft = any(stream_key_full_ft in mode_bucket for mode_bucket in pipeline_bucket.values())
+            has_adapter = any(
+                any(stream_key != stream_key_full_ft for stream_key in mode_bucket.keys())
+                for mode_bucket in pipeline_bucket.values()
+            )
+            if adapter_id is None:
+                # Source type (full-ft vs adapter) is fixed at caller init and must not flip mid-run.
+                if has_adapter:
+                    # Report exact conflicting modes to avoid misleading mode-specific errors.
+                    conflicting_adapter_modes = sorted(
+                        mode_name
+                        for mode_name, mode_bucket in pipeline_bucket.items()
+                        if any(stream_key != stream_key_full_ft for stream_key in mode_bucket.keys())
+                    )
+                    raise RuntimeError(
+                        f"pipeline_id {report.pipeline_id!r} already has adapter streams in modes {conflicting_adapter_modes}; "
+                        "full-finetune report (adapter_id=None) is a source-type mismatch"
+                    )
+                mode_bucket = pipeline_bucket.setdefault(mode, {})
+                mode_bucket[stream_key_full_ft] = report
+            else:
+                adapter_key = str(adapter_id)
+                if adapter_key == stream_key_full_ft:
+                    raise ValueError(f"adapter_id {adapter_key!r} is reserved for full-finetune stream")
+                # Source type (full-ft vs adapter) is fixed at caller init and must not flip mid-run.
+                if has_full_ft:
+                    # Report exact conflicting modes to avoid misleading mode-specific errors.
+                    conflicting_full_ft_modes = sorted(
+                        mode_name
+                        for mode_name, mode_bucket in pipeline_bucket.items()
+                        if stream_key_full_ft in mode_bucket
+                    )
+                    raise RuntimeError(
+                        f"pipeline_id {report.pipeline_id!r} already has a full-finetune stream in modes {conflicting_full_ft_modes}; "
+                        f"adapter report (adapter_id={adapter_key!r}) is a source-type mismatch"
+                    )
+                mode_bucket = pipeline_bucket.setdefault(mode, {})
+                mode_bucket[adapter_key] = report
             self._wakeup_event.set()
 
     async def request_gpus(self, *, cluster_id: str, priority: Priority, global_step: Optional[int] = None) -> List[int]:
@@ -491,8 +538,29 @@ class SchedulerImpl:
 
     async def _central_scheduling_loop(self) -> None:
         while True:
-            await self._wakeup_event.wait()
-            self._wakeup_event.clear()
+            # Case 1: event-driven scheduling (request/progress/release wakeups) runs immediately.
+            # Case 2: if there is no wakeup, use a lightweight poll and run only when
+            # background rebalance triggers are met (see _should_background_rebalance_locked()).
+            poll_interval_s = 1.0
+            woke_by_event = False
+            try:
+                await asyncio.wait_for(self._wakeup_event.wait(), timeout=poll_interval_s)
+                woke_by_event = True
+            except asyncio.TimeoutError:
+                woke_by_event = False
+
+            should_schedule = woke_by_event
+            if not should_schedule:
+                async with self._lock:
+                    should_schedule = self._should_background_rebalance_locked()
+
+            if not should_schedule:
+                continue
+
+            # Only consume the wakeup edge when this cycle was actually event-driven.
+            # For timeout-triggered background cycles, keep any concurrently set event.
+            if woke_by_event:
+                self._wakeup_event.clear()
             try:
                 await self.scheduling_cycle()
             except asyncio.CancelledError:
@@ -504,6 +572,94 @@ class SchedulerImpl:
                     )
                 await self._fail_fast_shutdown(reason=f"central_scheduling_loop_failed: {type(e).__name__}: {e}")
                 raise
+
+    def _has_waiting_requests_locked(self) -> bool:
+        # Any pending request/release means scheduler should remain purely event-driven.
+        for priority in Priority:
+            if self._state.pending_bucket(priority):
+                return True
+        if self._state.pending_planned_release_requests:
+            return True
+        return False
+
+    def _iter_pipeline_reports_locked(self, *, pipeline_id: str) -> List[ProgressReport]:
+        # Aggregate all stored reports across mode+stream for this pipeline.
+        reports: List[ProgressReport] = []
+        for mode_bucket in self._state.latest_progress_by_pipeline.get(pipeline_id, {}).values():
+            reports.extend(mode_bucket.values())
+        return reports
+
+    def _pipeline_progress_totals_locked(self, *, pipeline_id: str) -> Tuple[float, float]:
+        # Compute remaining/required together so callers do one pass over reports.
+        total_required = 0.0
+        total_remaining = 0.0
+        for progress in self._iter_pipeline_reports_locked(pipeline_id=pipeline_id):
+            metrics = progress.metrics if isinstance(progress.metrics, dict) else {}
+            if "remaining" in metrics:
+                remaining = float(metrics["remaining"])
+            else:
+                remaining = float(int(progress.queued_trajectories) + int(progress.inflight_trajectories))
+            total_remaining += max(0.0, remaining)
+            total_required += float(max(int(progress.step_target_trajectories), 1))
+        return max(0.0, total_remaining), total_required
+
+    def _should_background_rebalance_locked(self) -> bool:
+        # Case 2 applies only when there is no waiting request.
+        if self._has_waiting_requests_locked():
+            return False
+
+        # Row schema:
+        #   (completion, weighted_remaining, active_gpu_count)
+        # where weighted_remaining = remaining * tp_size so the demand fraction matches
+        # the same weighting used by generation gap-ratio planning.
+        generation_rows: List[Tuple[float, float, int]] = []
+
+        for cluster_id, alloc in self._state.active_allocations.items():
+            if alloc.priority != Priority.GENERATION:
+                continue
+
+            pipeline_id, cluster_name = parse_cluster_id(cluster_id)
+            if cluster_name != "actor_infer":
+                continue
+
+            infer_cfg = self._state.pipeline_registry.get(pipeline_id, {}).get("cluster_configs", {}).get("actor_infer")
+            if infer_cfg is None:
+                continue
+
+            tp_size = int(infer_cfg.get("tp_size", 1))
+            if tp_size <= 0:
+                continue
+
+            # Derive both counters in one pass for this pipeline.
+            remaining, total_required = self._pipeline_progress_totals_locked(pipeline_id=pipeline_id)
+
+            # Case 2.2: suspended actor_infer with non-zero remaining demand.
+            if not alloc.active_dp_ranks and remaining > 0.0:
+                return True
+
+            weighted_remaining = remaining * float(tp_size)
+            active_gpu_count = len(alloc.active_dp_ranks) * tp_size
+            completion = 0.0 if total_required <= 0.0 else max(0.0, 1.0 - (remaining / total_required))
+            generation_rows.append((completion, weighted_remaining, active_gpu_count))
+
+        # Case 2.1: demand-vs-GPU imbalance in the worst 50% completion pipelines.
+        if len(generation_rows) < 2:
+            return False
+
+        total_weighted_remaining = sum(row[1] for row in generation_rows)
+        total_active_gpus = sum(row[2] for row in generation_rows)
+        if total_weighted_remaining <= 0.0 or total_active_gpus <= 0:
+            return False
+
+        generation_rows.sort(key=lambda row: row[0])  # low completion first
+        # Include the boundary cluster in the worst half.
+        worst_k = max(1, math.ceil(len(generation_rows) * 0.5))
+        worst_rows = generation_rows[:worst_k]
+
+        remaining_fraction = sum(row[1] for row in worst_rows) / total_weighted_remaining
+        active_gpu_fraction = sum(row[2] for row in worst_rows) / float(total_active_gpus)
+        deviation_percent_points = abs(remaining_fraction - active_gpu_fraction) * 100.0
+        return deviation_percent_points > 10.0
 
     async def scheduling_cycle(self) -> None:
         await self._topology_ready.wait()
@@ -582,6 +738,8 @@ class SchedulerImpl:
                         missing = needed - planned_available_gpus
                         if missing:
                             # Try to free by shrinking generation donors that hold missing GPUs.
+                            # Intentional behavior: non-GEN requests may preempt/suspend GEN workers.
+                            # Recovery is handled by background rebalance triggers in the central loop.
                             for donor_cid, donor_alloc in list(self._state.active_allocations.items()):
                                 if donor_alloc.priority != Priority.GENERATION:
                                     continue
@@ -878,9 +1036,6 @@ class SchedulerImpl:
         pipeline_states: List[_GapRatioPipelineState] = []
         for pipeline_id in self._state.pipeline_registry:
             cluster_id = f"{pipeline_id}_actor_infer"
-            progress = self._state.latest_progress_by_pipeline.get(pipeline_id)
-            if progress is None:
-                continue
             infer_cfg = self._state.pipeline_registry[pipeline_id].get("cluster_configs", {}).get("actor_infer")
             if infer_cfg is None:
                 raise KeyError(f"pipeline_id={pipeline_id!r} missing actor_infer cluster config")
@@ -888,15 +1043,11 @@ class SchedulerImpl:
             if tp_size <= 0:
                 raise ValueError(f"pipeline_id={pipeline_id!r} has invalid actor_infer tp_size={tp_size}")
 
-            step_target = float(progress.step_target_trajectories)
-            metrics = progress.metrics if isinstance(progress.metrics, dict) else {}
-            # Fork-aligned contract: queued/inflight (or metrics["remaining"]) is the source-of-truth for demand.
-            if "remaining" in metrics:
-                remaining = float(metrics["remaining"])
-            else:
-                remaining = float(int(progress.queued_trajectories) + int(progress.inflight_trajectories))
-            if remaining < 0:
-                remaining = 0.0
+            # Reuse the same per-stream clamping path as background rebalance to keep
+            # remaining-demand semantics consistent across planning paths.
+            remaining, step_target = self._pipeline_progress_totals_locked(pipeline_id=pipeline_id)
+            if step_target <= 0.0:
+                continue
             percent_remaining = 0.0 if step_target <= 0 else remaining / step_target
 
             has_pending = self._has_pending_generation_request(cluster_id)

@@ -283,8 +283,14 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
     for pipeline in inputs.pipeline_registry.values():
         for cfg in (pipeline.get("cluster_configs") or {}).values():
             universe |= set(cfg.get("device_mapping") or [])
-    if not universe:
-        universe = set(inputs.idle_gpus) | {g for a in inputs.active_allocations.values() for g in a.gpu_ids}
+
+    # Include the scheduler's currently known GPU pool so subset device_mappings do not
+    # trip false positives when some GPUs are intentionally left unmapped by a pipeline.
+    known_gpu_pool = set(inputs.idle_gpus) | {g for a in inputs.active_allocations.values() for g in a.gpu_ids}
+    if universe:
+        universe |= known_gpu_pool
+    else:
+        universe = known_gpu_pool
     final_allocated = {g for a in sim_allocations.values() for g in a.gpu_ids}
     if (final_allocated | sim_idle) != universe:
         missing_from_accounting = sorted(universe - (final_allocated | sim_idle))

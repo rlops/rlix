@@ -1139,18 +1139,28 @@ class SchedulerImpl:
                                     bundle = set(donor_alloc.dp_rank_to_gpus.get(dp_rank) or [])
                                     if not (bundle & missing):
                                         continue
+                                    # Track whether this dp_rank was already freed for a prior
+                                    # allocation in this cycle. Re-adding to planned_available would
+                                    # double-count the GPU, letting two allocations claim the same
+                                    # physical GPU.
+                                    already_in_shrink = False
                                     for existing in plan.sched_guided_shrink_ops:
                                         if existing.cluster_id != donor_cid:
                                             continue
                                         if dp_rank not in existing.dp_ranks_to_remove:
                                             existing.dp_ranks_to_remove.append(dp_rank)
+                                        else:
+                                            already_in_shrink = True
                                         break
                                     else:
                                         plan.sched_guided_shrink_ops.append(
                                             SchedGuidedShrinkOp(cluster_id=donor_cid, dp_ranks_to_remove=[dp_rank])
                                         )
-                                    planned_available_gpus |= bundle
-                                    missing -= bundle
+                                    if not already_in_shrink:
+                                        # Newly freed: make the GPU available for planning.
+                                        planned_available_gpus |= bundle
+                                    # Only subtract GPUs that are actually still unclaimed.
+                                    missing -= bundle & planned_available_gpus
                                     if not missing:
                                         break
                                 if not missing:
@@ -1292,10 +1302,15 @@ class SchedulerImpl:
         for pipeline_id in sorted(set(pipeline_to_remove.keys()) | set(pipeline_to_add.keys())):
             removes = sorted(pipeline_to_remove.get(pipeline_id, set()))
             adds = sorted(pipeline_to_add.get(pipeline_id, set()))
-            if removes and adds:
+            # A pipeline may legally shrink one dp_rank while expanding a different one in the same
+            # cycle (e.g. training preempts GPU 1 so infer moves to GPU 0). What is never valid is
+            # removing and re-adding the *same* dp_rank in one cycle.
+            overlapping = set(removes) & set(adds)
+            if overlapping:
                 raise RuntimeError(
-                    "resize_infer mutual exclusivity violated in a single scheduling cycle: "
-                    f"pipeline_id={pipeline_id!r} dp_ranks_to_remove={removes} dp_ranks_to_add={adds}"
+                    "resize_infer dp_rank overlap in a single scheduling cycle: "
+                    f"pipeline_id={pipeline_id!r} overlapping_dp_ranks={sorted(overlapping)} "
+                    f"dp_ranks_to_remove={removes} dp_ranks_to_add={adds}"
                 )
             if not removes and not adds:
                 continue
@@ -1304,9 +1319,29 @@ class SchedulerImpl:
         return calls
 
     async def _execute_resize_calls(self, calls: List[Tuple[Any, List[int], List[int]]]) -> None:
-        """Execute pipeline resizes outside the scheduler lock."""
-        for adapter, removes, adds in calls:
-            await adapter.resize_infer.remote(dp_ranks_to_remove=list(removes), dp_ranks_to_add=list(adds))
+        """Execute pipeline resizes outside the scheduler lock.
+
+        Order: all shrinks first, then all expands. This ensures GPU memory is released
+        before expansion broadcasts attempt to allocate, preventing OOM during transitions.
+        Matches fork behavior in external/ROLL_multi_pipeline/.../centralized_gpu_scheduler.py Phase 5.
+        """
+        # Phase 5.2: execute all shrinks (dp_ranks_to_remove) concurrently and wait for all to complete
+        shrink_tasks = [
+            adapter.resize_infer.remote(dp_ranks_to_remove=list(removes), dp_ranks_to_add=[])
+            for adapter, removes, adds in calls
+            if removes
+        ]
+        if shrink_tasks:
+            await asyncio.gather(*shrink_tasks)
+
+        # Phase 5.4: execute all expands (dp_ranks_to_add) concurrently after all shrinks complete
+        expand_tasks = [
+            adapter.resize_infer.remote(dp_ranks_to_remove=[], dp_ranks_to_add=list(adds))
+            for adapter, removes, adds in calls
+            if adds
+        ]
+        if expand_tasks:
+            await asyncio.gather(*expand_tasks)
 
     async def _fail_fast_shutdown(self, *, reason: str) -> None:
         try:

@@ -37,6 +37,8 @@ class ValidationError(RuntimeError):
         self.context = context or {}
 
     def __str__(self) -> str:
+        if self.context:
+            return f"{self.message} | context={self.context}"
         return self.message
 
 

@@ -239,6 +239,12 @@ class SchedulerImpl:
     _queue_groups: Dict[str, _QueueSubGroup] = field(init=False, default_factory=dict)
     # Active GPU counter track for utilization visualization
     _active_gpus_counter: Optional["CounterTrack"] = field(init=False, default=None)
+    # Marker track for exec instant events
+    _exec_marker_track: Optional["NormalTrack"] = field(init=False, default=None)
+    # Marker track for enqueue events (separate from exec_markers)
+    _enqueue_marker_track: Optional["NormalTrack"] = field(init=False, default=None)
+    # Marker track for release events (separate from exec_markers)
+    _release_marker_track: Optional["NormalTrack"] = field(init=False, default=None)
 
     def __post_init__(self):
         self._state = SchedulerState()
@@ -401,6 +407,46 @@ class SchedulerImpl:
         if track is not None:
             self._active_gpus_counter = track
         return track
+
+    def _init_active_gpus_counter(self) -> None:
+        """Eagerly create active_gpus counter track for correct ordering in Perfetto UI.
+
+        MUST be called BEFORE _init_gpu_tracks() to ensure counter appears above GPU tracks.
+        Track order in Perfetto is determined by creation order.
+        """
+        if not self._enable_gpu_tracing:
+            return
+        self._get_or_create_active_gpus_counter()
+
+    def _create_marker_track(self, name: str) -> Optional["NormalTrack"]:
+        """Create a marker track with given name. Returns None on failure."""
+        if not self._enable_gpu_tracing or self._scheduler_group is None:
+            return None
+        return self._safe_trace_get(self._scheduler_group.create_track, name)
+
+    def _init_exec_marker_track(self) -> None:
+        """Eagerly create marker track for exec instant events.
+
+        MUST be called FIRST among marker tracks to ensure correct ordering.
+        Track order in Perfetto is determined by creation order.
+        """
+        self._exec_marker_track = self._create_marker_track("exec_markers")
+
+    def _init_enqueue_marker_track(self) -> None:
+        """Eagerly create marker track for enqueue instant events.
+
+        MUST be called AFTER _init_exec_marker_track() and BEFORE _init_release_marker_track().
+        Track order in Perfetto is determined by creation order.
+        """
+        self._enqueue_marker_track = self._create_marker_track("enqueue_markers")
+
+    def _init_release_marker_track(self) -> None:
+        """Eagerly create marker track for release instant events.
+
+        MUST be called AFTER _init_enqueue_marker_track() and BEFORE _init_active_gpus_counter().
+        Track order in Perfetto is determined by creation order.
+        """
+        self._release_marker_track = self._create_marker_track("release_markers")
 
     def _create_queue_slice_track(self, cluster_id: str, priority: Priority) -> Optional["NormalTrack"]:
         """Create a per-cluster slice track for queue visualization.
@@ -592,21 +638,12 @@ class SchedulerImpl:
         for gpu_id in gpu_ids:
             self._end_gpu_trace(gpu_id)
 
-    def _trace_cycle_marker(self, name: str, payload: Optional[Dict[str, Any]] = None) -> None:
-        """Record a cycle marker instant event."""
-        if not self._enable_gpu_tracing or self._scheduler_group is None:
-            return
-        if payload:
-            self._safe_trace(self._scheduler_group.instant, time.time_ns(), name, kwargs=payload)
-        else:
-            self._safe_trace(self._scheduler_group.instant, time.time_ns(), name)
-
     def _trace_execution_marker(self, payload: Dict[str, Any]) -> None:
         """Record a per-cycle execution marker summarizing all GPU allocation changes."""
-        if not self._enable_gpu_tracing or self._scheduler_group is None:
+        if not self._enable_gpu_tracing or self._exec_marker_track is None:
             return
         self._safe_trace(
-            self._scheduler_group.instant,
+            self._exec_marker_track.instant,
             time.time_ns(),
             f"Exec C{self._cycle_counter}",
             kwargs=payload,
@@ -614,11 +651,11 @@ class SchedulerImpl:
 
     def _trace_enqueue_marker(self, cluster_id: str, priority: Priority) -> None:
         """Record an instant marker when request is successfully enqueued."""
-        if not self._enable_gpu_tracing or self._scheduler_group is None:
+        if not self._enable_gpu_tracing or self._enqueue_marker_track is None:
             return
         key = _PRIORITY_SHORT.get(priority, priority.name[:3])
         self._safe_trace(
-            self._scheduler_group.instant,
+            self._enqueue_marker_track.instant,
             time.time_ns(),
             f"Enqueue: {key}",
             kwargs={"cluster_id": cluster_id, "priority": priority.name},
@@ -626,10 +663,10 @@ class SchedulerImpl:
 
     def _trace_release_marker(self, cluster_id: str, gpus_released: List[int]) -> None:
         """Record an instant marker when GPUs are released via release_gpus()."""
-        if not self._enable_gpu_tracing or self._scheduler_group is None:
+        if not self._enable_gpu_tracing or self._release_marker_track is None:
             return
         self._safe_trace(
-            self._scheduler_group.instant,
+            self._release_marker_track.instant,
             time.time_ns(),
             f"Release: {cluster_id}",
             kwargs={"cluster_id": cluster_id, "gpus_released": gpus_released},
@@ -967,7 +1004,15 @@ class SchedulerImpl:
         if self._enable_gpu_tracing:
             # Prefer explicit parameter, fall back to env var, then cwd
             self._init_tracing(trace_output_dir or env_trace_dir)
-            # Eagerly create GPU tracks for correct UI ordering (before any queue operations)
+            # Eagerly create exec marker track FIRST for correct UI ordering (top of all tracks)
+            self._init_exec_marker_track()
+            # Eagerly create enqueue marker track for correct UI ordering (after exec_markers)
+            self._init_enqueue_marker_track()
+            # Eagerly create release marker track for correct UI ordering (after enqueue_markers)
+            self._init_release_marker_track()
+            # Eagerly create active_gpus counter for correct UI ordering (after markers)
+            self._init_active_gpus_counter()
+            # Eagerly create GPU tracks for correct UI ordering (after counter)
             self._init_gpu_tracks()
             # Active GPU counter: emit initial value (all GPUs idle = 0 active)
             self._trace_active_gpus_update()

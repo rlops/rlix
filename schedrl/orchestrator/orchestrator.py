@@ -84,6 +84,7 @@ def _ensure_scheduler_singleton():
                 scheduling_strategy=strategy,
                 max_restarts=0,
                 max_task_retries=0,
+                runtime_env={"env_vars": scheduler_env},
             )
             .remote()
         )

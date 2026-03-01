@@ -2,3 +2,4 @@
 # tg4perfetto: GPU/scheduler timeline tracing via Perfetto UI
 # Requires >=0.0.6 for Group.create_group() support (used by queue sub-group tracing)
 tg4perfetto>=0.0.6
+protobuf<3.21.0

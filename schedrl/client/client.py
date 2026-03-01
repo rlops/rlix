@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -33,7 +34,11 @@ def connect(
     if not ray.is_initialized():
         ray.init(address=address, namespace=namespace, ignore_reinit_error=True, log_to_driver=True)
 
-    opts = ConnectOptions(address=address, namespace=namespace, create_if_missing=create_if_missing, env_vars=env_vars)
+    # Ray actors don't inherit the driver's environment. Snapshot the full driver env
+    # so SchedRL actors (orchestrator, scheduler) see the same vars the driver sees.
+    # Explicit env_vars overrides take priority over the driver snapshot.
+    driver_env: dict[str, str] = {k: v for k, v in os.environ.items() if isinstance(v, str)}
+    opts = ConnectOptions(address=address, namespace=namespace, create_if_missing=create_if_missing, env_vars=driver_env)
     return _get_or_create_orchestrator(opts)
 
 

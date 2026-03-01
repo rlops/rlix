@@ -771,11 +771,13 @@ class SchedulerImpl:
         Ray terminates workers with SIGTERM/SIGKILL, which bypasses Python's atexit.
         The reliable path is explicit shutdown() via orchestrator integration.
         """
-        # Guard: tg4perfetto must be available
+
+        # Guard: tg4perfetto must be available when tracing is explicitly requested
         if not _TG4PERFETTO_AVAILABLE:
-            logging.getLogger(__name__).warning("GPU tracing requested but tg4perfetto not installed; tracing disabled")
-            self._enable_gpu_tracing = False
-            return
+            raise RuntimeError(
+                "SCHEDRL_ENABLE_GPU_TRACING is set but tg4perfetto is not installed."
+                " Install it with: pip install tg4perfetto"
+            )
 
         # Use correct extension: perfetto-trace (protobuf binary, NOT JSON)
         ts = time.strftime("%Y%m%d_%H%M%S")

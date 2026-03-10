@@ -8,6 +8,9 @@
 - ALWAYS comment code changes: MUST add comments for short explanation first before changing existing code.
 - Copy-then-revise: ALWAYS try copy verbatim then apply revision, noting the source file, when adding more than ~20 lines of new code. You MUST first search the codebase for a similar pattern (like use Grep/Glob for similar function or class).  Only write from scratch if no similar pattern exists.
 - Trace root cause first: NEVER fix an error without identifying the root cause. If unclear, add targeted logs     
+- NO backaward compatiblity is needed when changes existing code.
+- be general when adding new code, avoid adding code that is only for specific case or scenario, unless explicitly told or approved by user.
+- avoid use getattr or hasattr `is not None`, unless explicitly told or approved by user.
 
 ## 1. Safety (Critical)
 - **No Secrets**: Never print, store, or commit tokens or keys.
@@ -26,6 +29,7 @@
 - **Small Changes**: Do the smallest change that solves the problem. No extra formatting.
 - **Consistent Changes**: Keep the changes logically consistent across all files.
 - **Reuse Code**: Don't reinvent the wheel; use existing patterns and libraries.
+- **No fallbacks**: NEVER creats fallbacks path unless explictely told or confirmed by user.
 
 ## 4. Communication
 - **Always English**: Always think and respond to user in English.
@@ -38,17 +42,14 @@
 - **Keep Functions Small**: Prefer single-responsibility functions; split functions that become hard to explain quickly.
 - **No Magic Values**: Replace unexplained literals with well-named constants.
 - **Readable Control Flow**: Prefer simple branches and early returns; avoid deep nesting and clever one-liners.
-- **Typed Public Contracts**: Public functions/methods/classes MUST have explicit type annotations; use precise types, not vague ones.
-- **Minimize `Any`**: Use `Any` only at truly dynamic or untyped third-party boundaries.
-- **Comments Explain Why**: Add comments/docstrings only for non-obvious intent, constraints, or tradeoffs; do not narrate obvious code.
+- **Enforce Strict Typing**: ALL functions/methods/classes MUST have explicit type annotations; use precise types, not vague ones. Use `Any` only at truly dynamic or untyped third-party boundaries.
+- **Comments Explain Why**: Comprehensive comments/Google Style docstrings explain intent, reasons, constraints, and tradeoffs; replace magic values with named constants.
 - **Follow Local Style Tools**: Keep formatting/linting consistent with the subproject so reviews focus on behavior, not style noise.
 
 
 ## 6. IDE Integration
 
 IMPORTANT: Prefer use the `pycharm-index` MCP server when applicable for code navigation and refactoring:
-
-IMPORTANT: When debugging, prefer using pycharm-debugger MCP tools to interact with the IDE debugger.
 
 # Repository Guidelines
 
@@ -61,7 +62,7 @@ default python env dir is /venv/main/bin/python
 - `design_doc/`: SchedRL design docs (protocols, adaptation plans).
 - `external/`: third-party repos as git submodules.
 - `external/nemo-rl/`, `external/nemo-gym/`: NeMo-RL and environment components.
-- `external/ROLL/`: ROLL framework (Ray-based multi-role pipelines).
+- `external/ROLL_rlix/`: ROLL framework (Ray-based multi-role pipelines).
 - `external/miles/`: Miles RL framework + rollout engines.
 - `external/SkyRL/`: SkyRL train/agent framework.
 - `external/sglang/`, `external/vllm/`: rollout engines.
@@ -73,7 +74,7 @@ If a submodule folder is missing locally, run `git submodule update --init`.
 
 Run commands from the relevant subproject root:
 
-- ROLL: `cd external/ROLL && make test` (pytest) and `make precommit`.
+- ROLL: `cd external/ROLL_rlix && make test` (pytest) and `make precommit`.
 - NeMo-RL (uses `uv`): `cd external/nemo-rl && uv sync` and `uv run --group test pytest -q`.
 - Miles: `cd external/miles && pytest -q` (or follow `external/miles/docs/` and examples).
 - SkyRL: `cd external/SkyRL &&` follow `external/SkyRL/README.md` and `external/SkyRL/skyrl-train/` examples.
@@ -83,7 +84,7 @@ Run commands from the relevant subproject root:
 - Python: 4-space indentation; prefer explicit names over abbreviations.
 - Follow the tooling and conventions of the subproject you’re changing:
   - `external/nemo-rl/`: `ruff` + `black` configured in `external/nemo-rl/pyproject.toml` (run via `uv`).
-  - `external/ROLL/`: `pre-commit` hooks (`make precommit`).
+  - `external/ROLL_rlix/`: `pre-commit` hooks (`make precommit`).
 - Keep edits scoped: avoid reformatting unrelated files.
 
 ## Testing Guidelines

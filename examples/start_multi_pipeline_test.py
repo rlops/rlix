@@ -22,6 +22,7 @@ from dacite import from_dict
 from hydra import compose, initialize
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
+from rlix.pipeline import COORDINATOR_MAX_CONCURRENCY
 from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, RLIX_NAMESPACE
 
 
@@ -258,6 +259,7 @@ def main() -> None:
             get_if_exists=True,
             max_restarts=0,
             max_task_retries=0,
+            max_concurrency=COORDINATOR_MAX_CONCURRENCY,
             # Ray does not reliably propagate env vars from parent actors. Explicitly inject the
             # per-pipeline namespace + control-plane contract for this pipeline actor process.
             runtime_env={

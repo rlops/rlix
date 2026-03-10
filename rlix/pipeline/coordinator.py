@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import math
 import os
 import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import ray
 
 from rlix.protocol.coordinator import Coordinator
 from rlix.protocol.request_id import validate_pipeline_id
-from rlix.protocol.types import ActionResponse, PIPELINE_ACTOR_NAME_PREFIX
-
-
-def _get_pipeline_namespace(pipeline_id: str) -> str:
-    return f"pipeline_{pipeline_id}_NS"
+from rlix.protocol.types import (
+    ActionResponse,
+    get_pipeline_namespace,
+    PIPELINE_ACTOR_NAME_PREFIX,
+    ProgressReport,
+    SCHEDULER_ACTOR_NAME,
+    RLIX_NAMESPACE,
+)
 
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
@@ -125,11 +130,18 @@ def _validate_offload_nccl(*, pipeline_config: Any) -> None:
         )
 
 
+# Default Ray actor concurrency for RlixCoordinator. 4 slots let progress reports
+# (fire-and-forget, fast) run concurrently with resize_infer RPCs without blocking each other.
+# _progress_lock guards the shared progress state under concurrent calls.
+COORDINATOR_MAX_CONCURRENCY: int = 4
+
+
 class RlixCoordinator(Coordinator):
     """Per-pipeline coordinator actor (ENG-123 Phase 3).
 
     Contract:
-    - Does NOT forward progress reports (progress is emitted in ROLL GroupQueueManager.put()).
+    - Aggregates per-scheduler progress reports from GroupQueueManager (train + val + all LoRAs)
+      and forwards a single aggregated ProgressReport (mode="aggregated") to the rlix scheduler.
     - Exposes shrink/expand RPCs for the Rlix scheduler (fail-fast).
     """
 
@@ -141,7 +153,7 @@ class RlixCoordinator(Coordinator):
     ):
         validate_pipeline_id(pipeline_id)
         self._pipeline_id = pipeline_id
-        self._ray_namespace = _get_pipeline_namespace(pipeline_id)
+        self._ray_namespace = get_pipeline_namespace(pipeline_id)
         self._pipeline_env_vars = _build_pipeline_env_vars(pipeline_id=pipeline_id, ray_namespace=self._ray_namespace)
 
         _validate_cpu_only_reward(pipeline_config=pipeline_config)
@@ -164,6 +176,23 @@ class RlixCoordinator(Coordinator):
         # Serializes resize_infer and sync_lora_weights: prevents a weight sync from
         # racing with a concurrent shrink/expand triggered by the central scheduler.
         self._resize_sync_lock = threading.Lock()
+
+        # Serializes concurrent report_progress_from_scheduler calls when max_concurrency > 1.
+        # Separate from _resize_sync_lock — no shared state between progress and resize paths.
+        self._progress_lock = threading.Lock()
+        # Bookkeep latest snapshot per scheduler stream for aggregated progress reporting.
+        # Key: "{mode}:{adapter_id or '__fft__'}". Invariant: mode+adapter_id is unique per GQM instance;
+        # two GQMs sharing the same key is a misconfiguration (last-write-wins without error).
+        self._scheduler_reports: Dict[str, ProgressReport] = {}
+        self._coord_progress_last_bucket: Optional[int] = None
+        # Resolve rlix scheduler handle for forwarding aggregated progress.
+        try:
+            self._rlix_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to resolve {SCHEDULER_ACTOR_NAME!r} in namespace {RLIX_NAMESPACE!r}. "
+                "RlixCoordinator requires the central scheduler actor to exist at startup."
+            ) from exc
 
         # Driver is responsible for:
         # - orchestrator.allocate_pipeline_id()
@@ -213,6 +242,66 @@ class RlixCoordinator(Coordinator):
         # Initialization is executed lazily by pipeline.run() via _ensure_initialized(),
         # allowing multi-pipeline startup/admission to proceed concurrently.
         return self._pipeline_actor
+
+    def report_progress_from_scheduler(self, report: ProgressReport) -> None:
+        """Aggregate per-scheduler progress and forward to the rlix scheduler.
+
+        Called by each GroupQueueManager (train / val / all LoRAs) at 2% cadence.
+        Aggregates all streams for this pipeline and emits one report to the central
+        rlix scheduler at 2% cadence of the aggregate.
+        """
+        metrics = report.metrics if isinstance(report.metrics, dict) else {}
+        mode = str(metrics.get("mode", "train"))
+        adapter_id = metrics.get("adapter_id")
+        scheduler_key = f"{mode}:{adapter_id if adapter_id is not None else '__fft__'}"
+
+        with self._progress_lock:
+            # Last-write-wins: same key from a newer step overwrites the stale entry naturally.
+            self._scheduler_reports[scheduler_key] = report
+
+            # Aggregate remaining/required across all known scheduler streams.
+            total_required = sum(r.step_target_trajectories for r in self._scheduler_reports.values())
+            total_remaining = sum(
+                float(r.metrics.get("remaining", 0)) if isinstance(r.metrics, dict) else 0.0
+                for r in self._scheduler_reports.values()
+            )
+            if total_required <= 0:
+                return
+
+            total_collected = max(total_required - total_remaining, 0.0)
+            percent_completed = total_collected / float(total_required)
+            bucket = math.floor(percent_completed * 50)
+
+            is_new_batch = bool(metrics.get("new_batch", False))
+            # new_batch forces an immediate emit; otherwise only emit when the 2% bucket changes.
+            if bucket == self._coord_progress_last_bucket and not is_new_batch:
+                return
+            self._coord_progress_last_bucket = bucket
+
+            # Use the oldest unfinished timestamp across all streams for an accurate FIFO signal.
+            oldest_ts: Optional[float] = min(
+                (r.oldest_unfinished_creation_ts for r in self._scheduler_reports.values()
+                 if r.oldest_unfinished_creation_ts is not None),
+                default=None,
+            )
+
+        aggregated = ProgressReport(
+            pipeline_id=str(self._pipeline_id),
+            queued_trajectories=0,
+            inflight_trajectories=0,
+            step_target_trajectories=int(total_required),
+            percent_completed=percent_completed,
+            oldest_unfinished_creation_ts=oldest_ts,
+            fifo_timestamp=time.time(),
+            metrics={
+                "mode": "aggregated",
+                "remaining": int(total_remaining),
+                "bucket": int(bucket),
+                "new_batch": is_new_batch,
+            },
+        )
+        # Fire-and-forget: progress is a background signal; same pattern as existing direct reports.
+        self._rlix_scheduler.report_progress.remote(aggregated)
 
     def _inject_pipeline_env_vars(self, *, pipeline_config: Any) -> None:
         envs = dict(self._pipeline_env_vars)

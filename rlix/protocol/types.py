@@ -17,6 +17,11 @@ PIPELINE_ACTOR_NAME_PREFIX: str = "rlix:pipeline:"
 ROLL_RESOURCE_MANAGER_ACTOR_NAME: str = "rlix:roll_resource_manager"
 
 
+def get_pipeline_namespace(pipeline_id: str) -> str:
+    """Canonical Ray namespace for a per-pipeline coordinator actor."""
+    return f"pipeline_{pipeline_id}_NS"
+
+
 @dataclass(frozen=True, slots=True)
 class ActionResponse:
     success: bool

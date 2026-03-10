@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, List
 
-from rlix.protocol.types import ActionResponse
+from rlix.protocol.types import ActionResponse, ProgressReport
 
 
 class Coordinator(ABC):
@@ -21,6 +21,11 @@ class Coordinator(ABC):
         Returns:
             Ray actor reference to the pipeline actor.
         """
+        raise NotImplementedError
+
+    @abstractmethod
+    def report_progress_from_scheduler(self, report: ProgressReport) -> None:
+        """Receive a per-scheduler progress snapshot and forward aggregated progress to the rlix scheduler."""
         raise NotImplementedError
 
     @abstractmethod

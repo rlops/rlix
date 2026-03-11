@@ -57,6 +57,7 @@ model_download_type: HUGGINGFACE_HUB
 offload_nccl: true
 max_steps: 3
 model_update_buffer_size_mb: 100  # Limit broadcast bucket to 100 MB to avoid OOM with co-located infer workers
+model_update_transport: cpu_pickle  # CPU byte serialization; avoids pidfd_getfd error in restricted containers
 save_steps: 10000
 logging_steps: 1
 eval_steps: 20

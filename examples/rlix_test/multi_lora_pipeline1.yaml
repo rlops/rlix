@@ -11,18 +11,20 @@ hydra:
   output_subdir: null
 
 # pipeline_cls: roll.pipeline.agentic.agentic_multi_lora_pipeline.AgenticMultiLoraPipeline
+
+
+
+exp_name: "agent_train_sokoban_multi_lora1"
+seed: 42
+logging_dir: ./output/lora_pipeline1/logs
+output_dir: ./output/lora_pipeline1
+render_save_dir: /tmp/roll_output/lora_pipeline1/render
+
 track_with: wandb
 tracker_kwargs:
   entity: "khd6t7hdhn-university-of-pennsylvania"
   project: "rlix"
-  api_key: "PLACEHOLDER_WANDB_API_KEY"
-
-
-exp_name: "agent_train_sokoban_multi_lora2"
-seed: 42
-logging_dir: ./output/lora_pipeline2/logs
-output_dir: ./output/lora_pipeline2
-render_save_dir: /tmp/roll_output/lora_pipeline2/render
+  api_key: "${oc.env:WANDB_API_KEY}"
 
 
 system_envs:
@@ -48,7 +50,7 @@ system_envs:
 
 checkpoint_config:
   type: file_system
-  output_dir: /tmp/roll_output/multi_lora1/checkpoints
+  output_dir: /tmp/roll_output/multi_lora2/checkpoints
 
 num_gpus_per_node: 2
 model_download_type: HUGGINGFACE_HUB
@@ -86,11 +88,11 @@ actor_train:
     dtype: bf16
     model_type: ~
     adapters:
-      Sokoban3:
+      Sokoban1:
         lora_target: all-linear
         lora_rank: 8
         lora_alpha: 8
-      Sokoban4:
+      Sokoban2:
         lora_target: all-linear
         lora_rank: 8
         lora_alpha: 8
@@ -117,7 +119,7 @@ actor_train:
   # Note: use_sequence_packing is NOT enabled here — sequence packing mixes sequences from different
   # LoRA adapters into one microbatch, violating the adapter-homogeneity constraint in inner_forward_step.
   # Note: use_dynamic_batching_in_train is also NOT enabled — incompatible with is_lora_optimizer_isolated=true.
-  device_mapping: "[1, ]"
+  device_mapping: "[0, ]"
   infer_batch_size: 1
 
 actor_infer:
@@ -126,11 +128,11 @@ actor_infer:
     disable_gradient_checkpointing: true
     dtype: bf16
     adapters:
-      Sokoban3:
+      Sokoban1:
         lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
         lora_rank: 8
         lora_alpha: 8
-      Sokoban4:
+      Sokoban2:
         lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
         lora_rank: 8
         lora_alpha: 8
@@ -154,7 +156,7 @@ actor_infer:
       max_num_batched_tokens: 1024  # Match reduced sequence_length=1024
       max_num_seqs: 2
       enforce_eager: true
-      sleep_level: 2  # RLix requires sleep_level=2 for weight offload (ENG-123 Phase 3 guard in adapter init).
+      sleep_level: 2  # RLix requires sleep_level=2 for weight offload (vs sleep_level=1 for vanilla AgenticMultiLoraPipeline)
   device_mapping: "[0, 1, ]"
 
 reference:
@@ -177,7 +179,7 @@ reference:
   use_dynamic_batching_in_infer: true
   max_tokens_per_microbatch_in_infer: 1024  # Match reduced sequence_length=1024
   sequence_length_round_in_infer: 8
-  device_mapping: "[1, ]"
+  device_mapping: "[0, ]"
   infer_batch_size: 1
 
 reward_normalization:
@@ -189,20 +191,20 @@ train_env_manager:
   max_env_num_per_worker: 4
   num_env_groups: 2
   group_size: 2
-  tags: [Sokoban3, Sokoban4]
+  tags: [Sokoban1, Sokoban2]
   num_groups_partition: [1, 1]
 
 val_env_manager:
   max_env_num_per_worker: 4
   num_env_groups: 2
   group_size: 2
-  tags: [Sokoban3, Sokoban4]
+  tags: [Sokoban1, Sokoban2]
   num_groups_partition: [1, 1]
 
 max_tokens_per_step: 64
 
 custom_envs:
-  Sokoban3:
+  Sokoban1:
     ${custom_env.SimpleSokoban}
-  Sokoban4:
+  Sokoban2:
     ${custom_env.SimpleSokoban}

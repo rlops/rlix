@@ -10,17 +10,19 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "ft_pipeline1_sokoban_grpo"
-seed: 42
-logging_dir: ./output/ft_pipeline1/logs
-output_dir: ./output/ft_pipeline1
-# render_save_dir: ./output/ft_pipeline1/render
-render_save_dir: /tmp/roll_output/ft_pipeline1/render
+# pipeline_cls: roll.pipeline.agentic.agentic_multi_lora_pipeline.AgenticMultiLoraPipeline
 track_with: wandb
 tracker_kwargs:
   entity: "khd6t7hdhn-university-of-pennsylvania"
   project: "rlix"
-  api_key: "PLACEHOLDER_WANDB_API_KEY"
+  api_key: "${oc.env:WANDB_API_KEY}"
+
+
+exp_name: "agent_train_sokoban_multi_lora2"
+seed: 42
+logging_dir: ./output/lora_pipeline2/logs
+output_dir: ./output/lora_pipeline2
+render_save_dir: /tmp/roll_output/lora_pipeline2/render
 
 
 system_envs:
@@ -33,8 +35,10 @@ system_envs:
   ROLL_GPU_REQUEST_TIMEOUT_S: "120"
   ROLL_NOTIFY_READY_TIMEOUT_S: "300"
   ROLL_VERIFY_OFFLOAD_GPU_MEMORY: "1"
-  ROLL_SELECTIVE_MODEL_UPDATE_PG_TIMEOUT_S: '150'  # ProcessGroup/NCCL collective watchdog timeout (ms shown in logs).
-  ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S: '180'
+  ROLL_SELECTIVE_MODEL_UPDATE_PG_TIMEOUT_S: "150"
+  ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S: "180"
+  ROLL_LOG_PARTIAL_GPU_OPS: "1"
+  ROLL_DEBUG_LORA_ROUTING: "1"
   OMP_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
   OPENBLAS_NUM_THREADS: "1"
@@ -44,12 +48,11 @@ system_envs:
 
 checkpoint_config:
   type: file_system
-  # output_dir: ./output/ft_pipeline1/checkpoints
-  output_dir: /tmp/roll_output/ft_pipeline1/checkpoints
+  output_dir: /tmp/roll_output/multi_lora1/checkpoints
 
 num_gpus_per_node: 2
 model_download_type: HUGGINGFACE_HUB
-offload_nccl: true 
+offload_nccl: true
 max_steps: 3
 model_update_buffer_size_mb: 100  # Limit broadcast bucket to 100 MB to avoid OOM with co-located infer workers
 save_steps: 10000
@@ -82,6 +85,15 @@ actor_train:
     disable_gradient_checkpointing: false
     dtype: bf16
     model_type: ~
+    adapters:
+      Sokoban3:
+        lora_target: all-linear
+        lora_rank: 8
+        lora_alpha: 8
+      Sokoban4:
+        lora_target: all-linear
+        lora_rank: 8
+        lora_alpha: 8
   training_args:
     learning_rate: 1.0e-6
     weight_decay: 0
@@ -97,20 +109,15 @@ actor_train:
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-      # use_distributed_optimizer: false avoids multiprocessing.Manager() spawn in Megatron
-      # async checkpoint (filesystem_async.py), which exhausts pids.max when concurrent
-      # pipelines are also spawning actors. Single-GPU actor_train gains nothing from it.
       use_distributed_optimizer: false
+      is_lora_optimizer_isolated: true
       recompute_granularity: full
       sequence_parallel: true
-      overlap_grad_reduce: true
-  # Dynamic batching in train: groups sequences of similar lengths to reduce padding in train_step.
-  # Note: use_sequence_packing is NOT enabled — it causes logits/labels shape mismatch in compute_log_probs
-  # when combined with dynamic batching (packed lengths diverge between the two paths).
-  use_dynamic_batching_in_train: true
-  max_tokens_per_microbatch_in_train: 1024  # Must be >= longest actual sequence; Sokoban 5-action trajs reach ~600 tokens
-  sequence_length_round_in_train: 8
-  device_mapping: "[0, ]"  # Pipeline 1: GPU 0
+      overlap_grad_reduce: false # Isolated LoRA mode requires overlap_grad_reduce disabled to avoid grad-sync hang.
+  # Note: use_sequence_packing is NOT enabled here — sequence packing mixes sequences from different
+  # LoRA adapters into one microbatch, violating the adapter-homogeneity constraint in inner_forward_step.
+  # Note: use_dynamic_batching_in_train is also NOT enabled — incompatible with is_lora_optimizer_isolated=true.
+  device_mapping: "[1, ]"
   infer_batch_size: 1
 
 actor_infer:
@@ -118,6 +125,15 @@ actor_infer:
   model_args:
     disable_gradient_checkpointing: true
     dtype: bf16
+    adapters:
+      Sokoban3:
+        lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+        lora_rank: 8
+        lora_alpha: 8
+      Sokoban4:
+        lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+        lora_rank: 8
+        lora_alpha: 8
   generating_args:
     max_new_tokens: 64
     top_p: 1
@@ -131,15 +147,15 @@ actor_infer:
     strategy_name: vllm
     strategy_config:
       VLLM_USE_V1: 1
-      gpu_memory_utilization: 0.6 # cannot be too high due to residual memory of megatron
+      gpu_memory_utilization: 0.6 # Raise cache budget so vLLM has non-zero KV blocks during two-worker startup.
       block_size: 16
       load_format: auto
       tensor_parallel_size: 1
       max_num_batched_tokens: 1024  # Match reduced sequence_length=1024
       max_num_seqs: 2
       enforce_eager: true
-      sleep_level: 2
-  device_mapping: "[0, 1, ]"  # Single-node smoke: keep actor_infer off actor_train's GPU 0
+      sleep_level: 2  # RLix requires sleep_level=2 for weight offload (ENG-123 Phase 3 guard in adapter init).
+  device_mapping: "[0, 1, ]"
 
 reference:
   offload_nccl: ${offload_nccl}
@@ -156,11 +172,12 @@ reference:
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-  # Dynamic batching on reference (megatron_infer): trims padding per-microbatch to actual token length.
+  # Dynamic batching on reference (megatron_infer): trims padding per-microbatch to actual token length
+  # (rounded to sequence_length_round_in_infer). Reduces peak memory during log_prob computation.
   use_dynamic_batching_in_infer: true
   max_tokens_per_microbatch_in_infer: 1024  # Match reduced sequence_length=1024
   sequence_length_round_in_infer: 8
-  device_mapping: "[ 0,]"  # Pipeline 1: GPU 0
+  device_mapping: "[1, ]"
   infer_batch_size: 1
 
 reward_normalization:
@@ -172,18 +189,20 @@ train_env_manager:
   max_env_num_per_worker: 4
   num_env_groups: 2
   group_size: 2
-  tags: [SimpleSokoban]
-  num_groups_partition: [2]
+  tags: [Sokoban3, Sokoban4]
+  num_groups_partition: [1, 1]
 
 val_env_manager:
   max_env_num_per_worker: 4
   num_env_groups: 2
   group_size: 2
-  tags: [SimpleSokoban]
-  num_groups_partition: [2]
+  tags: [Sokoban3, Sokoban4]
+  num_groups_partition: [1, 1]
 
 max_tokens_per_step: 64
 
 custom_envs:
-  SimpleSokoban:
+  Sokoban3:
+    ${custom_env.SimpleSokoban}
+  Sokoban4:
     ${custom_env.SimpleSokoban}

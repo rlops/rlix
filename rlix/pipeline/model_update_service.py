@@ -132,6 +132,9 @@ class ModelUpdateService:
             master_port=master_port,
             tgt_devices=tgt_devices,
             src_rank=src_rank,
+            # Bookkeeping key for strategy._setup_collective_group_impl() dict indexing.
+            # Selective sync uses a single global sender (all PP layers gathered), so always 0.
+            src_pp_rank=0,
             # IPC routing: list of {dp_rank, local_ranks} for colocated workers.
             ipc_targets=ipc_targets,
             # Per-worker broadcast local rank masks so owner knows which ranks joined NCCL.

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlix"
+version = "0.0.0"
+description = "Ray-based multi-pipeline GPU time-sharing"
+requires-python = ">=3.10"
+dependencies = [
+    "tg4perfetto>=0.0.6",
+    "protobuf<3.21.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["rlix*"]

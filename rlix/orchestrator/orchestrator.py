@@ -52,7 +52,7 @@ def _kill_local_ray() -> None:
         sys.stderr.flush()
 
 
-def _ensure_scheduler_singleton():
+def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None):
     try:
         return ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
     except ValueError:
@@ -60,6 +60,8 @@ def _ensure_scheduler_singleton():
 
     strategy = head_node_affinity_strategy(soft=False)
     SchedulerActor = scheduler_actor_class()
+    # Thread-limiting env vars for the scheduler actor process.
+    scheduler_runtime_env = {"env_vars": env_vars} if env_vars else {}
     try:
         scheduler = (
             SchedulerActor.options(
@@ -68,7 +70,7 @@ def _ensure_scheduler_singleton():
                 scheduling_strategy=strategy,
                 max_restarts=0,
                 max_task_retries=0,
-                runtime_env={"env_vars": scheduler_env},
+                runtime_env=scheduler_runtime_env,
             )
             .remote()
         )
@@ -143,7 +145,7 @@ class Orchestrator:
                 if not isinstance(v, str):
                     raise ValueError(f"env_vars[{k!r}] must be str, got {type(v).__name__}")
         self._env_vars = dict(env_vars or {})
-        self._scheduler = _ensure_scheduler_singleton()
+        self._scheduler = _ensure_scheduler_singleton(env_vars=self._env_vars)
         self._pipelines: Dict[str, PipelineState] = {}
         self._shutdown_started = False
 

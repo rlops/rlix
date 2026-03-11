@@ -116,7 +116,7 @@ def _cluster_registry_inputs(*, pipeline_config: Any) -> tuple[Dict[str, int], D
 def _pipeline_type(pipeline_config: Any) -> str:
     """Return 'lora' if the config has LoRA adapters configured, else 'ft'.
 
-    Mirrors the same lora detection used in RLixCoordinator.create_pipeline_actor().
+    Mirrors the same lora detection used in RlixCoordinator.create_pipeline_actor().
     Source: rlix/pipeline/coordinator.py
     """
     adapters = getattr(getattr(pipeline_config, "actor_train", None), "model_args", None)
@@ -128,7 +128,7 @@ def main() -> None:
     repo_root, roll_root = _ensure_import_paths()
 
     from roll.pipeline.agentic.agentic_config import AgenticConfig
-    from rlix.pipeline.coordinator import RLixCoordinator, _get_pipeline_namespace
+    from rlix.pipeline.coordinator import RlixCoordinator, get_pipeline_namespace
 
     import rlix
 
@@ -225,7 +225,7 @@ def main() -> None:
     if orchestrator is None:
         raise RuntimeError("rlix.init returned None (expected orchestrator actor handle on rank 0)")
 
-    CoordinatorActor = ray.remote(RLixCoordinator)
+    CoordinatorActor = ray.remote(RlixCoordinator)
 
     coordinators = []
     pipeline_actors = []
@@ -240,7 +240,7 @@ def main() -> None:
         pipeline_ids.append(str(pipeline_id))
 
     for i, (pipeline_id, pipeline_config) in enumerate(zip(pipeline_ids, pipeline_configs)):
-        ray_namespace = _get_pipeline_namespace(str(pipeline_id))
+        ray_namespace = get_pipeline_namespace(str(pipeline_id))
         cluster_tp_configs, cluster_device_mappings = _cluster_registry_inputs(pipeline_config=pipeline_config)
 
         ray.get(

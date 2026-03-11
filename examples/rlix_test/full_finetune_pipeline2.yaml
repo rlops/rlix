@@ -20,7 +20,7 @@ track_with: wandb
 tracker_kwargs:
   entity: "khd6t7hdhn-university-of-pennsylvania"
   project: "rlix"
-  api_key: "PLACEHOLDER_WANDB_API_KEY"
+  api_key: "${oc.env:WANDB_API_KEY}"
 
 
 system_envs:

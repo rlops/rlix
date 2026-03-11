@@ -171,7 +171,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 resource_manager=self.resource_manager,
                 infer_cluster=self.actor_infer,
                 mode="train",
-                request_scheduler=self.generate_scheduler,
+                # RolloutScheduler discovers RequestScheduler via named actor lookup internally.
             )
 
         # Shut down parent's single global val_rollout_scheduler (replaced by per-tag schedulers below).
@@ -242,7 +242,7 @@ class RlixMultiLoraPipeline(RlixFullFinetunePipeline):
                 resource_manager=self.resource_manager,
                 infer_cluster=self.actor_infer,
                 mode="val",
-                request_scheduler=self.generate_scheduler,
+                # RolloutScheduler discovers RequestScheduler via named actor lookup internally.
             )
 
         # Point parent's handle to first per-tag scheduler for parent code compatibility.

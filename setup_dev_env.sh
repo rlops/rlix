@@ -25,6 +25,11 @@ fi
 uv pip install -r requirements_torch260_vllm.txt
 uv pip install --no-build-isolation transformer-engine[pytorch]==2.2.0
 
+# Install ROLL and RLix in editable mode so 'roll' and 'rlix' are importable
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+uv pip install -e "${SCRIPT_DIR}/external/ROLL_rlix"
+uv pip install -e "${SCRIPT_DIR}"
+
 # for tracing
 apt-get update && apt-get install -y protobuf-compiler libprotobuf-dev
 uv pip install "protobuf<3.21.0" "tg4perfetto>=0.0.6"
@@ -35,4 +40,4 @@ uv pip install "protobuf<3.21.0" "tg4perfetto>=0.0.6"
 curl -fsSL https://claude.ai/install.sh | bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 npm i -g @openai/codex
-bash -c "$(curl -fsSL https://gitee.com/iflow-ai/iflow-cli/raw/main/install.sh)"
+bash -c "$(curl -fsSL https://gist.githubusercontent.com/taoluo/d5ada7e9210c34e4108988bf1b34681d/raw/9e155e480db1d1efea37975b8f47b2b865a27cc0/iflow_cli_install.sh)"

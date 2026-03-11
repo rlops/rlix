@@ -1,0 +1,122 @@
+max_tokens_per_step: 128
+max_actions_per_traj: 10
+
+env_manager_cls: roll.pipeline.agentic.env_manager.traj_env_manager.TrajEnvManager
+gem_qa:
+  # RuleTaker Environments
+  RuleTaker-d0:
+    env_type: "logic:RuleTaker-d0"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    env_config:
+      dataset_name: axon-rl/RuleTaker-d0-70k
+  RuleTaker-d1:
+    env_type: "logic:RuleTaker-d1"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    env_config:
+      dataset_name: axon-rl/RuleTaker-d1-70k
+  RuleTaker-d2:
+    env_type: "logic:RuleTaker-d2"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    env_config:
+      dataset_name: axon-rl/RuleTaker-d2-70k
+  RuleTaker-d3:
+    env_type: "logic:RuleTaker-d3"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    env_config:
+      dataset_name: axon-rl/RuleTaker-d3-70k
+  RuleTaker-d5:
+    env_type: "logic:RuleTaker-d5"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    env_config:
+      dataset_name: axon-rl/RuleTaker-d5-70k
+
+  # QA Environments
+  NaturalQuestions:
+    env_type: "qa:NaturalQuestions"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    env_config:
+      dataset_name: axon-rl/NaturalQuestions
+  HotpotQA:
+    env_type: "roll_qa"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    env_config:
+      dataset_name: axon-rl/HotpotQA
+      split: train
+      question_key: problem
+      answer_key: answer
+  HotpotQA_with_mcp:
+    env_type: "roll_qa"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    max_env_step_concurrent: 10
+    env_config:
+      dataset_name: axon-rl/HotpotQA
+      split: train
+      question_key: problem
+      answer_key: answer
+    tool_wrapper:
+      wrapper_args:
+        tool_reward: 0.0
+        tool_success_reward: 0.2
+        max_tool_uses: 1
+      tool_configs:
+        - tool_id: mcp
+          tool_args:
+            server_url: xxx
+  HotpotQA_with_search:
+    env_type: "roll_qa"
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    agent_system_template: ${qa_agent_system_template}
+    agent_template: ${qa_agent_template}
+    max_env_step_concurrent: 10
+    env_config:
+      dataset_name: axon-rl/HotpotQA
+      split: train
+      question_key: problem
+      answer_key: answer
+    tool_wrapper:
+      wrapper_args:
+        tool_reward: 0.0
+        tool_success_reward: 0.0
+        max_tool_uses: 1
+      tool_configs:
+        - tool_id: search
+          tool_args:
+            search_url: http://localhost:8000/retrieve
+
+qa_agent_system_template: You're a helpful assistant.
+qa_agent_template: "{observation}"
+

@@ -229,7 +229,6 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                 resource_manager=self.resource_manager,
                 infer_cluster=self.actor_infer,
                 mode="train",
-                request_scheduler=self.generate_scheduler,
             )
             self.val_rollout_scheduler = ray.remote(RolloutScheduler).options(
                 name=f"RolloutScheduler-{self._pipeline_id}-val",
@@ -245,7 +244,6 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                 resource_manager=self.resource_manager,
                 infer_cluster=self.actor_infer,
                 mode="val",
-                request_scheduler=self.generate_scheduler,
             )
 
             # Create val dataset manager as in AgenticPipeline.
@@ -357,12 +355,10 @@ class RlixFullFinetunePipeline(AgenticPipeline):
                 finally:
                     self._release_static_cluster(cluster_id=self._reference_cluster_id, global_step=init_global_step)
 
-            # Setup model update pair and checkpoint clusters (required by BasePipeline.model_update/do_checkpoint).
-            self.set_model_update_pair(
-                src_cluster=self.actor_train,
-                tgt_cluster=self.actor_infer,
-                frequency=self.pipeline_config.actor_train.model_update_frequency,
-            )
+            # RLix mode: skip set_model_update_pair (old ROLL broadcast-based sync).
+            # Weight sync is handled by ModelUpdateService.sync_selected_workers (selective sync).
+            # Creating the old ModelUpdateGroup would set up a persistent NCCL broadcast group
+            # that interferes with the selective sync path.
             if self.pipeline_config.adv_estimator == "gae":
                 self.set_checkpoint_clusters(self.actor_train, self.critic)
             else:

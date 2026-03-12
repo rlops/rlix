@@ -7,7 +7,15 @@ set -eo pipefail
 
 CONDA_ENV_NAME="rlix"
 PYTHON_VERSION="3.10"
-CUDA_TOOLKIT_VERSION="12.4"
+CUDA_CHANNEL_LABEL="cuda-12.4.1"
+CUDA_NVCC_VERSION="12.4.131"
+CUDA_CUDART_DEV_VERSION="12.4.127"
+CUDA_NVRTC_DEV_VERSION="12.4.127"
+CUDA_CUBLAS_DEV_VERSION="12.4.5.8"
+CUDA_CUSPARSE_DEV_VERSION="12.3.1.170"
+CUDA_CUSOLVER_DEV_VERSION="11.6.1.9"
+CUDA_NVTX_VERSION="12.4.127"
+CUDNN_VERSION="9.1.1.17"
 
 touch ~/.no_auto_tmux
 
@@ -51,24 +59,53 @@ source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
 
-# --- Create conda env with Python 3.10 and CUDA toolkit 12.4 ---
+# --- Create conda env with Python 3.10 and the minimal CUDA stack needed by Transformer Engine ---
 if conda env list | grep -q "^${CONDA_ENV_NAME} "; then
-  echo "Conda env '${CONDA_ENV_NAME}' already exists, skipping creation."
+  echo "Conda env '${CONDA_ENV_NAME}' already exists, ensuring the required CUDA build packages are installed."
+  conda install -n "${CONDA_ENV_NAME}" \
+    "cuda-nvcc=${CUDA_NVCC_VERSION}" \
+    "cuda-cudart-dev=${CUDA_CUDART_DEV_VERSION}" \
+    "cuda-nvrtc-dev=${CUDA_NVRTC_DEV_VERSION}" \
+    "libcublas-dev=${CUDA_CUBLAS_DEV_VERSION}" \
+    "libcusparse-dev=${CUDA_CUSPARSE_DEV_VERSION}" \
+    "libcusolver-dev=${CUDA_CUSOLVER_DEV_VERSION}" \
+    "cuda-nvtx=${CUDA_NVTX_VERSION}" \
+    "cudnn=${CUDNN_VERSION}" \
+    -c "nvidia/label/${CUDA_CHANNEL_LABEL}" -c defaults \
+    --strict-channel-priority -y
 else
-  echo "Creating conda env '${CONDA_ENV_NAME}' with Python ${PYTHON_VERSION} and CUDA toolkit ${CUDA_TOOLKIT_VERSION}..."
-  # Use versioned nvidia channel for reproducible CUDA installs, include cudnn
+  echo "Creating conda env '${CONDA_ENV_NAME}' with Python ${PYTHON_VERSION}, CUDA nvcc ${CUDA_NVCC_VERSION}, CUDA runtime headers ${CUDA_CUDART_DEV_VERSION}, NVRTC headers ${CUDA_NVRTC_DEV_VERSION}, cuBLAS ${CUDA_CUBLAS_DEV_VERSION}, cuSPARSE ${CUDA_CUSPARSE_DEV_VERSION}, cuSOLVER ${CUDA_CUSOLVER_DEV_VERSION}, NVTX ${CUDA_NVTX_VERSION}, and cuDNN ${CUDNN_VERSION}..."
+  # Transformer Engine needs CUDA headers, nvcc, NVRTC, cuBLAS, cuSPARSE,
+  # cuSOLVER, NVTX, and cuDNN, but not the full toolkit metapackage. Keeping
+  # this solve minimal avoids the earlier clobber conflicts from the broader
+  # CUDA transaction.
   conda create -n "${CONDA_ENV_NAME}" python="${PYTHON_VERSION}" \
-    "cuda=${CUDA_TOOLKIT_VERSION}" "cudnn>=9.1.0" \
-    -c "nvidia/label/cuda-${CUDA_TOOLKIT_VERSION}.0" -c nvidia -y
+    "cuda-nvcc=${CUDA_NVCC_VERSION}" \
+    "cuda-cudart-dev=${CUDA_CUDART_DEV_VERSION}" \
+    "cuda-nvrtc-dev=${CUDA_NVRTC_DEV_VERSION}" \
+    "libcublas-dev=${CUDA_CUBLAS_DEV_VERSION}" \
+    "libcusparse-dev=${CUDA_CUSPARSE_DEV_VERSION}" \
+    "libcusolver-dev=${CUDA_CUSOLVER_DEV_VERSION}" \
+    "cuda-nvtx=${CUDA_NVTX_VERSION}" \
+    "cudnn=${CUDNN_VERSION}" \
+    -c "nvidia/label/${CUDA_CHANNEL_LABEL}" -c defaults \
+    --strict-channel-priority -y
 fi
 
 # Activate the conda env
 conda activate "${CONDA_ENV_NAME}"
 
 # Set CUDA_HOME so build tools (e.g. transformer-engine, apex) find the toolkit
-conda env config vars set CUDA_HOME="$CONDA_PREFIX"
-# Re-activate to pick up the new env var
+# Derive the toolkit root from the active nvcc path because CONDA_PREFIX is not
+# reliable in this non-interactive script path.
+CUDA_HOME_DIR="$(dirname "$(dirname "$(command -v nvcc)")")"
+# Export it in the current shell and persist it for future activations.
+export CUDA_HOME="$CUDA_HOME_DIR"
+conda env config vars set CUDA_HOME="$CUDA_HOME_DIR"
+# Re-activate to pick up persisted env vars in this shell too.
+conda deactivate
 conda activate "${CONDA_ENV_NAME}"
+export CUDA_HOME="$CUDA_HOME_DIR"
 
 echo "Active env: $(conda info --envs | grep '*')"
 echo "Python: $(python --version)"
@@ -87,7 +124,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "${SCRIPT_DIR}/external/ROLL_rlix"
 
 uv pip install -r requirements_torch260_vllm.txt
-uv pip install --no-build-isolation "transformer-engine[pytorch]==2.2.0"
+if python -c "import transformer_engine" >/dev/null 2>&1; then
+  echo "transformer-engine is already installed, skipping reinstall."
+else
+  uv pip install --no-build-isolation "transformer-engine[pytorch]==2.2.0"
+fi
 
 # Install ROLL in editable mode so 'roll' is importable
 uv pip install -e "${SCRIPT_DIR}/external/ROLL_rlix"
@@ -102,8 +143,11 @@ apt-get update && apt-get install -y protobuf-compiler libprotobuf-dev nvtop
 # Use the pure-Python protobuf backend so tg4perfetto's generated stubs work
 # with any protobuf version. This avoids the <3.21.0 pin and conflicts with
 # wandb/other packages that require a newer protobuf.
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 conda env config vars set PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+conda deactivate
 conda activate "${CONDA_ENV_NAME}"
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
 # Install tg4perfetto with --no-deps to skip its protobuf<3.21.0 constraint;
 # compatibility is handled via the pure-Python backend above.

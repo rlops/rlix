@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="559" viewBox="0 0 1024 559" fill="none">
+  <defs>
+    <linearGradient id="tileFill" x1="298" y1="77" x2="725" y2="482" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2A4150"/>
+      <stop offset="0.55" stop-color="#223746"/>
+      <stop offset="1" stop-color="#1C2F3D"/>
+    </linearGradient>
+
+    <radialGradient id="tileGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse"
+      gradientTransform="translate(512 279.5) rotate(90) scale(230 235)">
+      <stop offset="0" stop-color="#355162" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#355162" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="cyanBar" x1="350" y1="141" x2="674" y2="206" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#39B8CC"/>
+      <stop offset="1" stop-color="#4BC3D2"/>
+    </linearGradient>
+
+    <linearGradient id="blueBar" x1="350" y1="247" x2="499" y2="312" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6486A6"/>
+      <stop offset="1" stop-color="#6E90AF"/>
+    </linearGradient>
+
+    <linearGradient id="cyanMid" x1="461" y1="247" x2="674" y2="312" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3EB9CB"/>
+      <stop offset="1" stop-color="#48C0D0"/>
+    </linearGradient>
+
+    <linearGradient id="bottomBar" x1="350" y1="353" x2="674" y2="418" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6486A6"/>
+      <stop offset="1" stop-color="#6F91B0"/>
+    </linearGradient>
+
+    <filter id="softShadow" x="270" y="54" width="483" height="456" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#15242D" flood-opacity="0.14"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#softShadow)">
+    <path d="M344 77H680L725 122V437L680 482H344L298 437V122L344 77Z" fill="url(#tileFill)"/>
+    <path d="M344 77H680L725 122V437L680 482H344L298 437V122L344 77Z" fill="url(#tileGlow)"/>
+
+    <rect x="350" y="141" width="324" height="65" rx="2" fill="url(#cyanBar)"/>
+
+    <path d="M350 247H447L499 312H350V247Z" fill="url(#blueBar)"/>
+    <path d="M461 247H674V312H512L461 247Z" fill="url(#cyanMid)"/>
+
+    <rect x="350" y="353" width="324" height="65" rx="2" fill="url(#bottomBar)"/>
+  </g>
+</svg>

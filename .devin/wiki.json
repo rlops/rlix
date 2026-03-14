@@ -1,27 +1,16 @@
 {
   "repo_notes": [
-    {
-      "content": "A control plane for concurrent LLM RL on shared GPUs"
-    }
+    "RLix is a Ray-based control plane for concurrent LLM reinforcement learning on shared GPUs. Entry point: `rlix.init(create_if_missing=True)` in `rlix/init.py` returns the Orchestrator handle. Core modules: `rlix/orchestrator/`, `rlix/scheduler/`, `rlix/pipeline/`, `rlix/protocol/`. ROLL provides the actual training/inference workers; RLix coordinates their GPU allocation and lifecycle. "
   ],
   "pages": [
     {
       "title": "Overview",
       "purpose": "Introduce RLix, explain its purpose as a Ray-based control plane for concurrent LLM RL training with GPU time-sharing, and provide a high-level architectural summary",
       "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "What is RLix?",
-      "purpose": "Explain the problem RLix solves (underutilized GPUs during RL rollouts), core value proposition (multi-pipeline GPU time-sharing), and key features",
-      "parent": "Overview",
-      "page_notes": [
-        {
-          "content": ""
-        }
+        "Reference README.md for positioning. RLix is control-plane only — ROLL provides training/inference workers.",
+        "The core problem: RL pipelines alternate between training (GPU-heavy) and rollout (memory-bound). Training GPUs sit idle during rollout. RLix fills those gaps by running multiple pipelines concurrently.",
+        "The two-level GPU sharing model: (1) cross-pipeline elastic expand/shrink; (2) within-pipeline multi-LoRA on shared base model.",
+        "RLix integrates with ROLL via the `DO_TIME_SHARING` constant in ROLL and `RLIX_CONTROL_PLANE` env var injected by `PipelineCoordinator`."
       ]
     },
     {
@@ -29,9 +18,9 @@
       "purpose": "Present high-level system architecture diagrams showing Control Plane, Pipelines, GPU Clusters, and their relationships",
       "parent": "Overview",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "Three singleton actors in Ray namespace `rlix`: `rlix:orchestrator`, `rlix:scheduler`, `rlix:resource_manager`. Source: `rlix/orchestrator/orchestrator.py`, `rlix/scheduler/scheduler.py`, `rlix/scheduler/resource_manager.py`.",
+        "Per-pipeline: `rlix:coordinator:{pipeline_id}` actor in namespace `pipeline_{pipeline_id}_NS`. Source: `rlix/pipeline/coordinator.py`.",
+        "Flow: `rlix.init()` → `Orchestrator` → (`allocate_pipeline_id` → `register_pipeline` → `admit_pipeline`) → `PipelineCoordinator.create_pipeline_actor()` → ROLL pipeline `run()`."
       ]
     },
     {
@@ -39,18 +28,20 @@
       "purpose": "Define fundamental terminology: pipelines, coordinators, GPU time-sharing, priority-based scheduling, LoRA adapters, rollout workers, and scheduling stages",
       "parent": "Overview",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "Pipeline ID format: `{type}_{12_hex}` where type is `\"ft\"` or `\"lora\"`. See `rlix/protocol/request_id.py`.",
+        "`Priority` enum: 7 tiers in `rlix/protocol/types.py` — `INITIALIZATION=0, ACTOR_TRAINING=1, CRITIC_TRAINING=2, OLD_LOG_PROBS=3, REF_LOG_PROBS=4, VALUE_COMPUTE=5, GENERATION=6`. Only `GENERATION` is preemptable.",
+        "`ActionResponse(success, error)`: frozen dataclass returned by coordinator RPCs. In `rlix/protocol/types.py`.",
+        "`ProgressReport`: frozen dataclass with `pipeline_id, queued_trajectories, inflight_trajectories, step_target_trajectories, percent_completed`. In `rlix/protocol/types.py`.",
+        "Five cluster types parsed by `parse_cluster_id()` in `rlix/scheduler/types.py`: `actor_train`, `actor_infer`, `critic`, `reference`, `reward`.",
+        "`is_generation_cluster(cluster_id)` returns True for `*_actor_infer` — only generation clusters are elastically resized.",
+        "DP rank → GPU binding computed by `build_dp_rank_mapping(gpu_ids, tp_size)` in `rlix/scheduler/types.py`."
       ]
     },
     {
       "title": "Getting Started",
       "purpose": "Guide users through initial setup, running their first pipeline, and understanding basic configuration",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "Entry point is `rlix.init(create_if_missing=True)` in `rlix/init.py` → `rlix/client/client.py`. This creates all three singleton control plane actors if they don't exist."
       ]
     },
     {
@@ -58,9 +49,9 @@
       "purpose": "Cover dependencies, Ray cluster setup, environment variables, and initial configuration requirements",
       "parent": "Getting Started",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "`pip install -e .` / `pip install -e \".[dev]\"`. Required: `tg4perfetto>=0.0.6`, `protobuf<3.21.0`, `roll` from GitHub.",
+        "Ray must be running. All rlix actors use namespace `\"rlix\"` (constant `RLIX_NAMESPACE` in `rlix/protocol/types.py`).",
+        "Env var `RLIX_REQUIRED_GPUS_PER_NODE`: optional strict topology contract validated by ResourceManager at init."
       ]
     },
     {
@@ -68,9 +59,8 @@
       "purpose": "Walk through running start_multi_pipeline_test.py, explain the initialization sequence, and show expected output",
       "parent": "Getting Started",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "Canonical example: `examples/start_multi_pipeline_test.py`. Three modes: single pipeline, two full-finetune, full-finetune + multi-LoRA.",
+        "Full init sequence with code snippet from README.md: `rlix.init()` → `allocate_pipeline_id(\"ft\")` → `register_pipeline(...)` → `admit_pipeline(...)` → `coordinator.create_pipeline_actor(...)` → `pipeline_actor.run()`."
       ]
     },
     {
@@ -78,18 +68,22 @@
       "purpose": "Introduce Hydra configuration files, explain cluster_tp_configs and cluster_device_mappings, and show basic pipeline config structure",
       "parent": "Getting Started",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "Pipeline configs in `examples/rlix_test/`. Two required top-level keys: `cluster_tp_configs` (dict of cluster → TP size) and `cluster_device_mappings` (dict of cluster → GPU ID list).",
+        "For multi-LoRA: `model_args.adapters` dict mapping adapter name (lowercase canonical) → `LoraArguments`. Requires `megatron_train` strategy and `is_lora_optimizer_isolated=true`.",
+        "`train_device_mapping` must be a subset of `infer_device_mapping` for partial-GPU time-sharing."
       ]
     },
     {
       "title": "Control Plane",
       "purpose": "Document the singleton control plane components (Orchestrator, Scheduler, ResourceManager) that manage all pipelines",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "All three actors created lazily by `rlix.init(create_if_missing=True)` in `rlix/init.py` → `rlix/client/client.py`.",
+        "Fail-fast design: no retry, no recovery. Actor names defined as constants in `rlix/protocol/types.py`: `SCHEDULER_ACTOR_NAME`, `ORCHESTRATOR_ACTOR_NAME`, `RESOURCE_MANAGER_ACTOR_NAME`.",
+        "Source: `rlix/protocol/types.py`. Actor name constants: `RLIX_NAMESPACE=\"rlix\"`, `SCHEDULER_ACTOR_NAME=\"rlix:scheduler\"`, `ORCHESTRATOR_ACTOR_NAME=\"rlix:orchestrator\"`, `RESOURCE_MANAGER_ACTOR_NAME=\"rlix:resource_manager\"`.",
+        "`Priority(IntEnum)` — 7 values: `INITIALIZATION=0`, `ACTOR_TRAINING=1`, `CRITIC_TRAINING=2`, `OLD_LOG_PROBS=3`, `REF_LOG_PROBS=4`, `VALUE_COMPUTE=5`, `GENERATION=6`. Only `GENERATION` is preemptable.",
+        "`ActionResponse(success: bool, error: str)`: frozen dataclass with `__slots__` returned by all coordinator RPCs.",
+        "`ProgressReport` fields: `pipeline_id`, `queued_trajectories`, `inflight_trajectories`, `step_target_trajectories`, `percent_completed`, `oldest_unfinished_creation_ts`, `active_base_version`, `fifo_timestamp`, `metrics`.",
+        "`get_pipeline_namespace(pipeline_id)` returns `pipeline_{pipeline_id}_NS` — the Ray namespace for a pipeline's coordinator actor."
       ]
     },
     {
@@ -97,9 +91,14 @@
       "purpose": "Explain Orchestrator's role in pipeline lifecycle management: allocate_pipeline_id, register_pipeline, admit_pipeline, kill_pipeline, shutdown",
       "parent": "Control Plane",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "Source: `rlix/orchestrator/orchestrator.py`. Actor name: `ORCHESTRATOR_ACTOR_NAME = \"rlix:orchestrator\"`.",
+        "Four lifecycle methods: `allocate_pipeline_id(pipeline_type)` → `register_pipeline(pipeline_id, ray_namespace, cluster_tp_configs, cluster_device_mappings)` → `admit_pipeline(pipeline_id)` → `kill_pipeline(pipeline_id)`.",
+        "`kill_pipeline()` tears down the coordinator actor, cleans SharedStorage port claims, and releases all scheduler state.",
+        "`shutdown(force, reason, source)` flushes GPU trace (tg4perfetto) and kills Ray on all worker nodes.",
+        "Registration sequence: Step 1: `allocate_pipeline_id(pipeline_type)` → unique `{type}_{12_hex}` ID. See `rlix/protocol/request_id.py` for validation.",
+        "Step 2: `register_pipeline(pipeline_id, ray_namespace, cluster_tp_configs, cluster_device_mappings)` → validates topology via `rlix/scheduler/validation.py`.",
+        "Step 3: `admit_pipeline(pipeline_id)` → creates `PipelineCoordinator` actor in namespace `pipeline_{pipeline_id}_NS`. Returns `(pipeline_id, scheduler_handle)`.",
+        "Step 4: User calls `coordinator.create_pipeline_actor(pipeline_config)` → auto-selects pipeline class and calls `pipeline_actor.run()`."
       ]
     },
     {
@@ -107,9 +106,10 @@
       "purpose": "Document SchedulerImpl's priority-based GPU allocation, request/release APIs, pending request queuing, and central scheduling loop",
       "parent": "Control Plane",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "Source: `rlix/scheduler/scheduler.py` (`SchedulerImpl`). Actor name: `SCHEDULER_ACTOR_NAME = \"rlix:scheduler\"`.",
+        "Key APIs: `request_gpus(cluster_id, priority, global_step, timeout_s, lora_name)` — async generator yielding allocated GPU IDs; `notify_ready_to_release(pipeline_id, cluster_id, global_step, timeout_s)` — blocks until shrink committed; `report_progress(ProgressReport)`.",
+        "Internal state: `pending_requests` by priority tier, `active_allocations`, `idle_gpus`, `planned_available_gpus`. See `rlix/scheduler/state.py`.",
+        "`ExecutionPlan` dataclass in `rlix/scheduler/types.py` encapsulates shrink/expand/allocation operations resolved per scheduling cycle."
       ]
     },
     {
@@ -117,58 +117,23 @@
       "purpose": "Explain ResourceManager's role in GPU topology validation, cluster resource snapshots, and gpus-per-node enforcement",
       "parent": "Control Plane",
       "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "Pipeline Registration Flow",
-      "purpose": "Detail the complete pipeline registration sequence: ID allocation → registration → topology validation → admission",
-      "parent": "Control Plane",
-      "page_notes": [
-        {
-          "content": ""
-        }
+        "Source: `rlix/scheduler/resource_manager.py`. Actor name: `RESOURCE_MANAGER_ACTOR_NAME = \"rlix:resource_manager\"`.",
+        "`init_topology(required_gpus_per_node)`: validates consistent GPU count across alive Ray nodes; returns finalized gpus-per-node.",
+        "`snapshot(wait_timeout_s, poll_interval_s, expected_num_gpus)`: waits for cluster readiness; returns `{num_gpus, alive_nodes, cluster_resources}`.",
+        "`get_required_gpus_per_node()` and `get_num_gpus()` for runtime topology queries."
       ]
     },
     {
       "title": "Pipeline Coordination",
       "purpose": "Document the PipelineCoordinator actor's role in managing individual pipelines and coordinating with the control plane",
       "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "PipelineCoordinator Actor",
-      "purpose": "Explain PipelineCoordinator's initialization, configuration validation (CPU-only reward, vLLM sleep_level, offload_nccl), and environment variable injection",
-      "parent": "Pipeline Coordination",
-      "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "Progress Reporting",
-      "purpose": "Document how PipelineCoordinator aggregates progress from sub-schedulers and reports to central Scheduler at 2% cadence",
-      "parent": "Pipeline Coordination",
-      "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "Resize and Sync Coordination",
-      "purpose": "Explain how PipelineCoordinator serializes resize_infer and sync_lora_weights operations using locks to prevent race conditions",
-      "parent": "Pipeline Coordination",
-      "page_notes": [
-        {
-          "content": ""
-        }
+        "Source: `rlix/pipeline/coordinator.py`. Actor name: `rlix:coordinator:{pipeline_id}` in namespace `pipeline_{pipeline_id}_NS`. `max_concurrency=4`.",
+        "Implements abstract protocol in `rlix/protocol/coordinator.py`: `resize_infer()`, `create_pipeline_actor()`, `report_progress_from_scheduler()`, `sync_lora_weights()`.",
+        "Recipe-transparent scheduling: the coordinator calls `request_gpus()` and `notify_ready_to_release()` on behalf of the pipeline, so ROLL pipeline code has no knowledge of other pipelines or scheduling decisions. Training logic and GPU scheduling are fully decoupled.",
+        "Progress reporting: ROLL's GroupQueueManager sends `ProgressReport` → `coordinator.report_progress_from_scheduler()` → aggregated by `{mode}:{adapter_id}` key → forwarded to `rlix:scheduler`.",
+        "`ProgressReport` fields: `pipeline_id`, `queued_trajectories`, `inflight_trajectories`, `step_target_trajectories`, `percent_completed`, `oldest_unfinished_creation_ts`, `active_base_version`, `fifo_timestamp`, `metrics`.",
+        "`_resize_sync_lock` serializes `resize_infer()` and `sync_lora_weights()` to prevent interleaving.",
+        "`resize_infer(dp_ranks_to_remove, dp_ranks_to_add)`: exactly one list must be non-empty (validated in `rlix/pipeline/utils.py`). Returns `ActionResponse`. `_active_infer_dp_ranks` tracks current active inference DP ranks."
       ]
     },
     {
@@ -176,48 +141,22 @@
       "purpose": "Detail how PipelineCoordinator determines pipeline type (LoRA vs full finetune), injects environment variables, and creates the pipeline actor",
       "parent": "Pipeline Coordination",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "`create_pipeline_actor()` selects `RollFullFinetunePipeline` if `model_args.adapters is None`, else `RollMultiLoraPipeline`. Source: `rlix/pipeline/coordinator.py`.",
+        "Validates on `create_pipeline_actor()`: reward cluster must be CPU-only; `sleep_level=2` required; `offload_nccl=True` required on all clusters.",
+        "Injects env vars into ROLL pipeline's `runtime_env`: `PIPELINE_ID`, `ROLL_RAY_NAMESPACE`, `RLIX_CONTROL_PLANE=\"rlix\"`, cache dirs, thread-limiting vars (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `RAY_grpc_server_thread_pool_size`, etc.). See env var list in `rlix/pipeline/coordinator.py`.",
+        "Pipeline actor scheduled on node-0's placement group for CUDA visibility.",
+        "Pipeline namespace format: `pipeline_{pipeline_id}_NS` (from `get_pipeline_namespace()` in `rlix/protocol/types.py`)."
       ]
     },
     {
       "title": "Pipeline Implementations",
       "purpose": "Document the two pipeline implementations: RollFullFinetunePipeline for full finetuning and RollMultiLoraPipeline for multi-LoRA training",
       "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "RollFullFinetunePipeline",
-      "purpose": "Explain full finetune pipeline's training loop, GPU request/release cycle, and integration with Rlix scheduler",
-      "parent": "Pipeline Implementations",
-      "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "RollMultiLoraPipeline",
-      "purpose": "Document multi-LoRA pipeline's per-tag schedulers, first-ready dispatch model, isolated optimizers, and independent step tracking",
-      "parent": "Pipeline Implementations",
-      "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "GPU Cluster Components",
-      "purpose": "Describe the five cluster types: actor_train, actor_infer, critic, reference, reward, and their roles in the RL pipeline",
-      "parent": "Pipeline Implementations",
-      "page_notes": [
-        {
-          "content": ""
-        }
+        "Source: `rlix/pipeline/full_finetune_pipeline.py` and `rlix/pipeline/multi_lora_pipeline.py`.",
+        "RollFullFinetunePipeline wraps ROLL's `AgenticPipeline`. Loop: request GPUs (training priority) → expand inference → rollout (GENERATION priority, preemptable) → shrink → compute old/ref logprobs → train → sync weights → `notify_ready_to_release()` → report progress → repeat.",
+        "RollMultiLoraPipeline wraps ROLL's `AgenticMultiLoraPipeline`. Constraints: `sleep_level=2`, `megatron_train` strategy required, `is_lora_optimizer_isolated=true`.",
+        "Multi-LoRA ROLL side: per-tag `RolloutScheduler`, `ray.wait(num_returns=1)` first-ready dispatch, `train_step_lora()` RPC per adapter with isolated optimizer/scheduler/RNG state.",
+        "After multi-LoRA training tick: ROLL builds versioned CPU bucket cache, promotes it, then coordinator calls `sync_lora_weights()` to replay to infer workers."
       ]
     },
     {
@@ -225,38 +164,32 @@
       "purpose": "Detail the sequential phases in the training loop: expand → rollout → shrink → old log probs → advantage → training → sync",
       "parent": "Pipeline Implementations",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "7 priority tiers map directly to phases. Non-preemptable: INITIALIZATION(0), ACTOR_TRAINING(1), CRITIC_TRAINING(2), OLD_LOG_PROBS(3), REF_LOG_PROBS(4), VALUE_COMPUTE(5). Preemptable: GENERATION(6).",
+        "For multi-LoRA: adapter must be disabled during REF_LOG_PROBS (frozen base model) and enabled during OLD_LOG_PROBS (π_old importance sampling ratio). This is critical for correctness.",
+        "No GAE critic in multi-LoRA mode — a single critic cannot produce accurate values across distinct LoRA tasks."
       ]
     },
     {
       "title": "GPU Resource Management",
       "purpose": "Explain how RLix achieves GPU time-sharing through priority-based scheduling, elastic workers, and background rebalancing",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "GPU resource management spans `rlix/scheduler/scheduler.py`, `rlix/scheduler/state.py`, and `rlix/scheduler/types.py`.",
+        "Background rebalancing: scheduler's central loop uses `ProgressReport.percent_completed` and `ProgressReport.queued_trajectories` to recompute gap-ratio allocation. Emits `ExecutionPlan` with shrink ops for over-allocated pipelines and allocation ops for under-allocated ones.",
+        "`notify_ready_to_release()` is the mechanism by which a pipeline signals it's done with GPUs and the scheduler can commit the shrink.",
+        "Two-level GPU sharing — Level 1 (cross-pipeline): time-multiplexed via RLix Scheduler through `PipelineCoordinator.resize_infer()`. Level 2 (within-pipeline, multi-LoRA): multiple LoRA adapters share base model via `PipelineCoordinator.sync_lora_weights()`. Independent and composable: a multi-LoRA pipeline participates in both levels simultaneously."
       ]
     },
     {
-      "title": "Scheduling Priorities",
-      "purpose": "Document the six priority levels (0-6), explain which stages are preemptable, and how priority determines GPU allocation",
+      "title": "Scheduling Priorities and Allocation",
+      "purpose": "Document the seven priority levels (0-6), which stages are preemptable, and how priority determines GPU allocation strategy (fixed vs gap-ratio)",
       "parent": "GPU Resource Management",
       "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "GPU Allocation Strategies",
-      "purpose": "Contrast full device_mapping allocation for training clusters vs gap-ratio DP allocation for generation clusters",
-      "parent": "GPU Resource Management",
-      "page_notes": [
-        {
-          "content": ""
-        }
+        "Source: `rlix/protocol/types.py`, `Priority(IntEnum)` with 7 values: `INITIALIZATION=0` through `GENERATION=6`.",
+        "Only `GENERATION` is preemptable. All other priorities block until GPUs are released. Same pipeline uses different priorities for different phases — not a per-pipeline property.",
+        "`cluster_id` format: `{pipeline_id}_{cluster_name}` (e.g., `ft_abc123_actor_infer`).",
+        "Fixed allocation: `request_gpus()` with priority < GENERATION returns exact `device_mapping` GPUs.",
+        "Gap-ratio: `GENERATION` requests use gap-ratio planning. Each pipeline's gap = `(1 - percent_completed) * total_trajectories`. DP rank count proportional to `gap / gpu_count`.",
+        "`ExecutionPlan` in `rlix/scheduler/types.py` encodes resolved `sched_guided_allocation_ops` and `sched_guided_shrink_ops`."
       ]
     },
     {
@@ -264,39 +197,21 @@
       "purpose": "Explain how actor_infer workers expand onto idle GPUs and shrink when higher-priority stages need capacity",
       "parent": "GPU Resource Management",
       "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "Background Rebalancing",
-      "purpose": "Document the demand-driven rebalancing mechanism that redistributes generation workers based on progress reports and demand/GPU imbalance",
-      "parent": "GPU Resource Management",
-      "page_notes": [
-        {
-          "content": ""
-        }
-      ]
-    },
-    {
-      "title": "Two-Level GPU Sharing",
-      "purpose": "Explain cross-pipeline sharing (elastic expand/shrink) and within-pipeline sharing (multi-LoRA adapters on shared base model)",
-      "parent": "GPU Resource Management",
-      "page_notes": [
-        {
-          "content": ""
-        }
+        "Expand: Coordinator calls ROLL's `resize_infer(dp_ranks_to_add=[...])`. ROLL wakes vLLM workers on new GPU ranks.",
+        "Shrink (2-phase): (1) stop routing to shrinking ranks; (2) `sleep_level=2` — vLLM drops model weights, freeing GPU VRAM for other pipelines.",
+        "`sleep_level=2` is required (full weight drop), not `sleep_level=1`. This is validated in `PipelineCoordinator`."
       ]
     },
     {
       "title": "Model Synchronization",
       "purpose": "Document the ModelUpdateService's selective weight sync mechanism for pushing trained weights to inference workers",
       "page_notes": [
-        {
-          "content": ""
-        }
+        "Active only when running under RLix (`RLIX_CONTROL_PLANE` env var set). Standalone ROLL uses simpler full-broadcast sync.",
+        "Coordinator's `sync_lora_weights(loras_to_sync)` is called after training tick, serialized with `resize_infer()` via `_resize_sync_lock`.",
+        "ROLL side builds a versioned CPU bucket cache after each optimizer step, then replays it to vLLM inference workers via IPC (colocated) or NCCL broadcast (remote).",
+        "CPU bucket cache: versioned with `latest` and `active` slots. Only cache-owner rank (pp0/dp0/tp0/cp0) stores tensors. Per-adapter and base model stored separately. GC keeps only latest + active.",
+        "Transport: IPC (`torch.save` with pinned memory) for colocated workers; NCCL broadcast for remote workers. After transport: `add_lora()` called on each target vLLM worker, then temporary NCCL group destroyed."
       ]
     }
   ]
-}creation.
+}

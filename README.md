@@ -31,12 +31,13 @@ RLix addresses this by time-sharing GPUs across concurrent RL training jobs, exp
 RLix builds on **Partial Overlapping** scheduling from [**Alibaba/ROLL**](https://github.com/alibaba/ROLL) and extends it with a distributed control plane for coordinating multiple independent training jobs on a shared GPU cluster.
 
 RLix is an AI-native project, with AI deeply involved across design, planning, implementation, testing, and code review, alongside human oversight. Correctness, code quality, and maintainability remain first-class concerns.
+
 ## Features
 
-- **Recipe-Transparent Scheduling**: Training logic stays fully decoupled from GPU scheduling, so each pipeline can be developed in isolation.
-- **Two-Level GPU Sharing**: GPUs are shared both across pipelines through elastic expand/shrink and within a pipeline through multi-LoRA adapters on a shared base model.
-- **Demand-Driven Rollout Scaling**: Rollout workers expand onto idle GPU capacity and shrink based on heartbeat-reported demand.
-- **Efficient Memory Management**: Model weights are cached on the trainer CPU and synced on demand only to resumed rollout workers; when workers shrink, inference weights are dropped to minimize memory footprint.
+- **Recipe-Transparent Scheduling**: GPU scheduling stays decoupled from training logic, so researchers can develop each pipeline independently while preserving its original recipe semantics.
+- **Two-Level GPU Sharing**: GPUs are shared across pipelines through elastic expand/shrink and within pipelines through concurrent LoRA adapters on a shared base model.
+- **Demand-Driven Rollout Scaling**: Rollout workers expand into idle GPU capacity and shrink in response to heartbeat-reported demand.
+- **Minimal Rollout Memory Footprint**: Rollout workers load inference weights only when active. Weights are cached on the trainer CPU, synchronized on resume, and dropped when workers shrink.
 
 ## Installation
 

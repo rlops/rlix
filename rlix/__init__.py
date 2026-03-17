@@ -12,7 +12,7 @@ __all__ = [
 
 __version__ = "0.1.0"
 
-from rlix.init import init  # noqa: E402
+from rlix.client.client import connect as init  # noqa: E402
 
 
 # Lazy imports to avoid circular dependency: rlix.pipeline imports roll.pipeline

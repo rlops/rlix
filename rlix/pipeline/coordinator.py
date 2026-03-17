@@ -12,7 +12,7 @@ import ray
 
 from rlix.protocol.coordinator import Coordinator
 from rlix.protocol.request_id import validate_pipeline_id
-from rlix.pipeline.utils import validate_resize_params
+from rlix.pipeline.utils import parse_env_timeout_s, validate_resize_params
 from rlix.protocol.types import (
     ActionResponse,
     get_pipeline_namespace,
@@ -26,6 +26,12 @@ from rlix.utils.ray_actors import get_actor_or_raise
 # Max concurrent RPCs on the pipeline actor (resize + run can overlap).
 # Keep small: Ray uses a thread pool for sync actors; huge values hit thread limits.
 _PIPELINE_ACTOR_MAX_CONCURRENCY: int = 32
+
+# Timeout for acquiring _resize_sync_lock in resize_infer (scheduler path).
+# Limits how long the scheduler is stalled when sync_lora_weights holds the lock
+# during an NCCL weight sync. Default 180s covers the ModelUpdateService default
+# timeout (150s) plus headroom; override via env var for tighter SLOs.
+_RESIZE_LOCK_TIMEOUT_S: float = parse_env_timeout_s("RLIX_RESIZE_LOCK_TIMEOUT_S", default_s=180.0)
 
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
@@ -267,36 +273,102 @@ class PipelineCoordinator(Coordinator):
         mode = str(metrics.get("mode", "train"))
         adapter_id = metrics.get("adapter_id")
         scheduler_key = f"{mode}:{adapter_id if adapter_id is not None else '__fft__'}"
+        is_new_batch = bool(metrics.get("new_batch", False))
 
         with self._progress_lock:
             # Last-write-wins: same key from a newer step overwrites the stale entry naturally.
             self._scheduler_reports[scheduler_key] = report
+            self._aggregate_and_emit(force=is_new_batch)
 
-            # Aggregate remaining/required across all known scheduler streams.
-            total_required = sum(r.step_target_trajectories for r in self._scheduler_reports.values())
-            total_remaining = sum(
-                float(r.metrics.get("remaining", 0)) if isinstance(r.metrics, dict) else 0.0
-                for r in self._scheduler_reports.values()
-            )
-            if total_required <= 0:
-                return
+    def clear_progress_stream(self, *, mode: str, adapter_id: Optional[str]) -> None:
+        """Remove a scheduler stream from progress aggregation.
 
-            total_collected = max(total_required - total_remaining, 0.0)
-            percent_completed = total_collected / float(total_required)
-            bucket = math.floor(percent_completed * 50)
+        Called by GroupQueueManager.end_progress_batch() after get_batch() returns
+        to indicate this stream no longer contributes demand. If other streams
+        remain, re-aggregates and force-emits so the scheduler immediately sees
+        reduced demand. If all streams are gone, clears the scheduler's stored
+        progress entry entirely.
 
-            is_new_batch = bool(metrics.get("new_batch", False))
-            # new_batch forces an immediate emit; otherwise only emit when the 2% bucket changes.
-            if bucket == self._coord_progress_last_bucket and not is_new_batch:
-                return
-            self._coord_progress_last_bucket = bucket
+        Args:
+            mode: Stream mode ("train" or "val").
+            adapter_id: LoRA adapter ID, or None for full-finetune.
+        """
+        scheduler_key = f"{mode}:{adapter_id if adapter_id is not None else '__fft__'}"
 
-            # Use the oldest unfinished timestamp across all streams for an accurate FIFO signal.
-            oldest_ts: Optional[float] = min(
-                (r.oldest_unfinished_creation_ts for r in self._scheduler_reports.values()
-                 if r.oldest_unfinished_creation_ts is not None),
-                default=None,
-            )
+        with self._progress_lock:
+            removed = self._scheduler_reports.pop(scheduler_key, None)
+            if removed is None:
+                return  # Already cleared or never reported; idempotent.
+
+            if self._scheduler_reports:
+                # Other streams still active: re-aggregate and force-emit so
+                # the scheduler sees reduced demand immediately (not on next
+                # bucket transition from a remaining stream).
+                self._aggregate_and_emit(force=True)
+            else:
+                # All streams gone: reset emission state and tell the scheduler
+                # to drop this pipeline's progress entry entirely.
+                self._coord_progress_last_bucket = None
+                self._rlix_scheduler.clear_progress.remote(
+                    pipeline_id=self._pipeline_id,
+                )
+
+    def _aggregate_and_emit(self, *, force: bool) -> None:
+        """Recompute aggregate progress from _scheduler_reports and emit to scheduler.
+
+        Must be called with _progress_lock held.
+
+        Args:
+            force: If True, emit regardless of bucket throttling (lifecycle edge).
+        """
+        if not self._scheduler_reports:
+            return
+
+        # Aggregate using the most-behind adapter stream per mode.
+        #
+        # Multi-LoRA pipelines train adapters sequentially; completed adapters leave
+        # stale entries with remaining=0. Summing all streams inflates step_target
+        # (denominator) while remaining stays flat, making the pipeline look more
+        # "done" than it is. Instead, pick the stream with the highest percent_remaining
+        # per mode, so the active adapter drives the pipeline's demand signal.
+        total_required = 0.0
+        total_remaining = 0.0
+        modes: dict[str, list[ProgressReport]] = {}
+        for key, rpt in self._scheduler_reports.items():
+            mode_part = key.split(":", 1)[0]
+            modes.setdefault(mode_part, []).append(rpt)
+        for mode_reports in modes.values():
+            best_remaining = 0.0
+            best_step_target = 0.0
+            best_percent = 0.0
+            for rpt in mode_reports:
+                rpt_metrics = rpt.metrics if isinstance(rpt.metrics, dict) else {}
+                remaining = max(0.0, float(rpt_metrics.get("remaining", 0)))
+                step_target = float(max(int(rpt.step_target_trajectories), 1))
+                percent = remaining / step_target if step_target > 0 else 0.0
+                if percent > best_percent:
+                    best_percent = percent
+                    best_remaining = remaining
+                    best_step_target = step_target
+            total_remaining += best_remaining
+            total_required += best_step_target
+        if total_required <= 0:
+            return
+
+        total_collected = max(total_required - total_remaining, 0.0)
+        percent_completed = total_collected / float(total_required)
+        bucket = math.floor(percent_completed * 50)
+
+        if not force and bucket == self._coord_progress_last_bucket:
+            return
+        self._coord_progress_last_bucket = bucket
+
+        # Use the oldest unfinished timestamp across all streams for an accurate FIFO signal.
+        oldest_ts: Optional[float] = min(
+            (r.oldest_unfinished_creation_ts for r in self._scheduler_reports.values()
+             if r.oldest_unfinished_creation_ts is not None),
+            default=None,
+        )
 
         aggregated = ProgressReport(
             pipeline_id=str(self._pipeline_id),
@@ -310,7 +382,7 @@ class PipelineCoordinator(Coordinator):
                 "mode": "aggregated",
                 "remaining": int(total_remaining),
                 "bucket": int(bucket),
-                "new_batch": is_new_batch,
+                "new_batch": force,
             },
         )
         # Fire-and-forget: progress is a background signal; same pattern as existing direct reports.
@@ -391,7 +463,14 @@ class PipelineCoordinator(Coordinator):
         """
         validate_resize_params(dp_ranks_to_remove, dp_ranks_to_add)
 
-        with self._resize_sync_lock:
+        acquired = self._resize_sync_lock.acquire(timeout=_RESIZE_LOCK_TIMEOUT_S)
+        if not acquired:
+            raise RuntimeError(
+                f"resize_infer timed out waiting for _resize_sync_lock after {_RESIZE_LOCK_TIMEOUT_S}s "
+                f"(likely blocked by a long-running sync_lora_weights NCCL sync). "
+                f"pipeline_id={self._pipeline_id!r}"
+            )
+        try:
             # NOTE: coordinator does not coordinate train/val request schedulers directly; it delegates to the
             # per-pipeline pipeline actor (single serialization boundary owned by pipeline runtime).
             resize_actor_name = f"{PIPELINE_ACTOR_NAME_PREFIX}{self._pipeline_id}"
@@ -410,4 +489,6 @@ class PipelineCoordinator(Coordinator):
                 self._active_infer_dp_ranks -= set(dp_ranks_to_remove)
             else:
                 self._active_infer_dp_ranks |= set(dp_ranks_to_add)
+        finally:
+            self._resize_sync_lock.release()
         return ActionResponse(success=True)

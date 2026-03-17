@@ -363,20 +363,9 @@ class PipelineCoordinator(Coordinator):
             return
         self._coord_progress_last_bucket = bucket
 
-        # Use the oldest unfinished timestamp across all streams for an accurate FIFO signal.
-        oldest_ts: Optional[float] = min(
-            (r.oldest_unfinished_creation_ts for r in self._scheduler_reports.values()
-             if r.oldest_unfinished_creation_ts is not None),
-            default=None,
-        )
-
         aggregated = ProgressReport(
             pipeline_id=str(self._pipeline_id),
-            queued_trajectories=0,
-            inflight_trajectories=0,
             step_target_trajectories=int(total_required),
-            percent_completed=percent_completed,
-            oldest_unfinished_creation_ts=oldest_ts,
             fifo_timestamp=time.time(),
             metrics={
                 "mode": "aggregated",

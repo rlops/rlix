@@ -43,7 +43,7 @@ from rlix.scheduler.types import (
     parse_cluster_id,
     validate_cluster_id,
 )
-from rlix.scheduler.validation import ValidationInputs, normalize_progress_oldest_ts, validate_execution_plan
+from rlix.scheduler.validation import ValidationInputs, validate_execution_plan
 from rlix.utils.ray_actors import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
@@ -1168,28 +1168,8 @@ class SchedulerImpl:
 
     async def report_progress(self, report: ProgressReport) -> None:
         validate_pipeline_id(report.pipeline_id)
-        # Fail fast with a clear message if caller violates ProgressReport counter contract.
-        if report.queued_trajectories is None or report.inflight_trajectories is None:
-            raise ValueError("queued_trajectories and inflight_trajectories must not be None")
         if report.step_target_trajectories <= 0:
             raise ValueError("step_target_trajectories must be > 0")
-        # Extraction plan: do not clamp percent_completed; allow > 1.0 (overshoot is tolerated).
-        # We only validate non-negativity here.
-        if float(report.percent_completed) < 0.0:
-            raise ValueError(f"percent_completed must be >= 0, got {report.percent_completed!r}")
-        oldest_ts = normalize_progress_oldest_ts(report.oldest_unfinished_creation_ts, report.fifo_timestamp)
-        if report.oldest_unfinished_creation_ts is None and oldest_ts is not None:
-            report = ProgressReport(
-                pipeline_id=report.pipeline_id,
-                queued_trajectories=report.queued_trajectories,
-                inflight_trajectories=report.inflight_trajectories,
-                step_target_trajectories=report.step_target_trajectories,
-                percent_completed=report.percent_completed,
-                oldest_unfinished_creation_ts=oldest_ts,
-                active_base_version=report.active_base_version,
-                fifo_timestamp=report.fifo_timestamp,
-                metrics=report.metrics,
-            )
         async with self._lock:
             if report.pipeline_id not in self._state.pipeline_registry:
                 raise RuntimeError(f"pipeline_id {report.pipeline_id!r} not registered")
@@ -1460,10 +1440,7 @@ class SchedulerImpl:
         total_remaining = 0.0
         for progress in self._iter_pipeline_reports_locked(pipeline_id=pipeline_id):
             metrics = progress.metrics if isinstance(progress.metrics, dict) else {}
-            if "remaining" in metrics:
-                remaining = float(metrics["remaining"])
-            else:
-                remaining = float(int(progress.queued_trajectories) + int(progress.inflight_trajectories))
+            remaining = float(metrics.get("remaining", 0))
             total_remaining += max(0.0, remaining)
             total_required += float(max(int(progress.step_target_trajectories), 1))
         return max(0.0, total_remaining), total_required

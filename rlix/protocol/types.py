@@ -25,7 +25,6 @@ def get_pipeline_namespace(pipeline_id: str) -> str:
 @dataclass(frozen=True, slots=True)
 class ActionResponse:
     success: bool
-    error: Optional[str] = None
 
 
 class Priority(enum.IntEnum):
@@ -43,11 +42,6 @@ class Priority(enum.IntEnum):
 @dataclass(frozen=True, slots=True)
 class ProgressReport:
     pipeline_id: str
-    queued_trajectories: int
-    inflight_trajectories: int
     step_target_trajectories: int
-    percent_completed: float = 0.0
-    oldest_unfinished_creation_ts: Optional[float] = None
-    active_base_version: int = 0
     fifo_timestamp: Optional[float] = None
     metrics: Optional[Dict[str, Any]] = None

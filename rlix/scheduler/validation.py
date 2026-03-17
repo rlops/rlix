@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 from rlix.protocol.types import Priority
 from rlix.scheduler.types import (
@@ -339,10 +339,4 @@ def validate_execution_plan(plan: ExecutionPlan, *, inputs: ValidationInputs) ->
                     context={"gpu_id": gpu, "cluster_a": prev, "cluster_b": cid},
                 )
             owners[gpu] = cid
-
-
-def normalize_progress_oldest_ts(oldest_unfinished_creation_ts: Optional[float], fifo_timestamp: Optional[float]) -> Optional[float]:
-    if oldest_unfinished_creation_ts is not None:
-        return oldest_unfinished_creation_ts
-    return fifo_timestamp
 

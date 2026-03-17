@@ -1,13 +1,26 @@
+"""Per-pipeline service for selective model weight synchronization on pipeline expand.
+
+When the scheduler expands a pipeline (adds infer workers), the new workers need
+up-to-date model weights from the training cluster. This service orchestrates that
+transfer using two transport paths:
+
+- **CUDA IPC**: zero-copy transfer when sender and receiver share the same physical GPU.
+- **NCCL broadcast**: cross-GPU transfer via a temporary collective group.
+
+The service is a Ray actor, one per pipeline, created by the coordinator on expand.
+"""
+
 from __future__ import annotations
 
-import os
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import ray
-
 from roll.distributed.executor.cluster import Cluster
+from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE, STORAGE_NAME
 from roll.utils.logging import get_logger
+
+from rlix.utils.env import parse_env_timeout_s
 
 logger = get_logger()
 
@@ -22,35 +35,57 @@ class ModelUpdateService:
     """
 
     def __init__(self, *, pipeline_id: str, src_cluster: Cluster, tgt_cluster: Cluster):
+        """Initialize the model update service for a single pipeline.
+
+        Args:
+            pipeline_id: Unique identifier for the pipeline this service belongs to.
+            src_cluster: Training cluster that holds the authoritative model weights.
+            tgt_cluster: Inference cluster whose workers will receive weight updates.
+        """
         if not isinstance(pipeline_id, str) or pipeline_id == "":
             raise ValueError("pipeline_id must be non-empty str")
         self.pipeline_id = pipeline_id
         self.src_cluster: Any = src_cluster
         self.tgt_cluster: Any = tgt_cluster
 
+        # Nonce scopes NCCL group names to this service instance, avoiding collisions
+        # when multiple services coexist (e.g. after a coordinator restart).
         self._sync_nonce = uuid.uuid4().hex[:8]
-        self._timeout_s: Optional[float] = self._parse_timeout_s("ROLL_SELECTIVE_MODEL_UPDATE_TIMEOUT_S", default=150.0)
-        self._pg_timeout_s: Optional[float] = self._parse_timeout_s("ROLL_SELECTIVE_MODEL_UPDATE_PG_TIMEOUT_S", default=120.0)
-
-    @staticmethod
-    def _parse_timeout_s(env_key: str, *, default: float) -> Optional[float]:
-        raw = os.environ.get(env_key)
-        if raw is None:
-            return float(default)
-        try:
-            value = float(raw)
-        except ValueError as exc:
-            raise ValueError(f"{env_key} must be a number, got: {raw!r}") from exc
-        return None if value <= 0 else value
+        self._master_addr_by_src_rank: Dict[int, str] = {}
+        self._timeout_s: Optional[float] = parse_env_timeout_s("ROLL_SELECTIVE_MODEL_UPDATE_TIMEOUT_S", 150.0)
+        self._pg_timeout_s: Optional[float] = parse_env_timeout_s("ROLL_SELECTIVE_MODEL_UPDATE_PG_TIMEOUT_S", 120.0)
 
     @staticmethod
     def _ray_get_with_timeout(refs: Any, *, timeout_s: Optional[float], desc: str) -> Any:
+        """Wrapper around ``ray.get`` that raises ``TimeoutError`` with *desc* on timeout.
+
+        If *timeout_s* is ``None``, waits indefinitely.
+        """
         if timeout_s is None:
             return ray.get(refs)
         try:
             return ray.get(refs, timeout=float(timeout_s))
         except ray.exceptions.GetTimeoutError as exc:
             raise TimeoutError(f"{desc} timed out after {timeout_s}s") from exc
+
+    @staticmethod
+    def _release_master_port_claim(*, master_addr: str, master_port: int) -> None:
+        """Release a previously claimed rendezvous port after sync teardown completes."""
+        if master_addr == "" or master_port <= 0:
+            return
+        shared_storage = ray.get_actor(STORAGE_NAME, namespace=GLOBAL_STORAGE_NAMESPACE)
+        master_addr_port_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"
+        ray.get(shared_storage.delete.remote(master_addr_port_key))
+
+    def _get_master_addr(self, *, src_rank: int) -> str:
+        """Return the cached sender IP for *src_rank*, fetching it once on first use."""
+        cached = self._master_addr_by_src_rank.get(int(src_rank))
+        if cached is not None:
+            return cached
+        src_worker = self.src_cluster.rank2worker[int(src_rank)]
+        master_addr = str(ray.get(src_worker.get_node_ip.remote()))
+        self._master_addr_by_src_rank[int(src_rank)] = master_addr
+        return master_addr
 
     def _select_global_sender_rank(self) -> int:
         """Return the single global cache owner: pp_rank==0, dp_rank==0, tp_rank==0, cp_rank==0."""
@@ -74,29 +109,75 @@ class ModelUpdateService:
         src_rank: int,
         tgt_dp_ranks: List[int],
     ) -> Tuple[dict, str, List[int]]:
-        """Build comm plan for the single global cache owner.
+        """Build a communication plan for the single global cache owner.
 
-        Classifies each target worker's local ranks as IPC (same physical GPU as sender)
-        or broadcast (different GPU, needs NCCL). Returns:
-        - comm_plan: dict keyed by src_rank with all routing data the owner needs
-        - group_name: NCCL group name for broadcast-path setup
-        - tgt_ranks_in_group: sorted list of target dp_ranks that need broadcast setup
+        The plan decides, for every device on every target worker, which transport
+        path to use:
+
+        - **IPC path** — the target device sits on the same physical GPU as the
+          sender (identified by matching ``(node_rank, gpu_rank)``).  CUDA IPC
+          gives zero-copy access so no NCCL group is needed.  NCCL *cannot* form
+          a group when two ranks share a GPU, so IPC is not just faster — it is
+          the only correct path for colocated devices.
+        - **Broadcast path** — the target device is on a different GPU.  A
+          temporary NCCL collective group is created (sender as rank 0, receivers
+          as ranks 1..N) and weights are broadcast over it.
+
+        A single target worker may have a mix of IPC and broadcast devices (e.g.
+        TP across 4 GPUs where 1 is colocated with the sender and 3 are not).
+
+        The method also queries the sender worker for a free port and IP to use
+        as the NCCL rendezvous master.
+
+        Args:
+            sync_id: Unique identifier for this sync operation, embedded in the
+                NCCL group name to avoid collisions with concurrent syncs.
+            src_rank: Global rank of the cache owner in the training cluster.
+            tgt_dp_ranks: Data-parallel ranks in the inference cluster to sync.
+
+        Returns:
+            A 3-tuple of ``(comm_plan, group_name, tgt_ranks_in_group)``:
+
+            - **comm_plan**: ``{src_rank: plan_dict}`` — keyed by the owner's
+              rank. ``plan_dict`` contains:
+
+              - ``group_name`` / ``master_addr`` / ``master_port``: NCCL
+                rendezvous coordinates for the broadcast path.
+              - ``src_rank``, ``src_pp_rank``: bookkeeping for
+                ``_setup_collective_group_impl()``; ``src_pp_rank`` is always 0
+                because selective sync gathers all PP layers into one sender.
+              - ``ipc_targets``: ``[{dp_rank, local_ranks}]`` — **IPC path**
+                targets: for each target worker with colocated devices, lists
+                which of its device ranks share a physical GPU with the sender.
+              - ``tgt_devices``: ``[{rank, device}]`` — **broadcast path**
+                targets: the complement of ``ipc_targets``; devices on different
+                GPUs from the sender that will join the NCCL collective group.
+              - ``broadcast_local_ranks_by_dp_rank``: ``{dp_rank: [local_ranks]}``
+                — tells the owner which local ranks on each target worker joined
+                the NCCL group, so it broadcasts to the right subset.
+
+            - **group_name**: NCCL group name for broadcast-path setup.
+
+            - **tgt_ranks_in_group**: sorted dp_ranks that have at least one
+              broadcast-path device. Drives which workers call
+              ``setup_collective_group`` before the sync. Empty when all targets
+              are IPC-only (no NCCL setup needed).
         """
         src_rank = int(src_rank)
         src_worker = self.src_cluster.rank2worker[src_rank]
-        master_addr = ray.get(src_worker.get_node_ip.remote())
-        master_port = int(ray.get(src_worker.get_free_port.remote()))
 
         src_devices = self.src_cluster.rank2devices.get(src_rank, [])
         if not src_devices:
             raise RuntimeError(f"Missing src devices for src_rank={src_rank}")
+        for device in src_devices:
+            if device.get("node_rank") is None or device.get("gpu_rank") is None:
+                raise RuntimeError(
+                    f"Incomplete device metadata for src_rank={src_rank}: "
+                    f"node_rank={device.get('node_rank')}, gpu_rank={device.get('gpu_rank')}"
+                )
         src_gpu_keys: Set[Tuple[int, int]] = {
-            (int(d["node_rank"]), int(d["gpu_rank"]))
-            for d in src_devices
-            if d.get("node_rank") is not None and d.get("gpu_rank") is not None
+            (int(d["node_rank"]), int(d["gpu_rank"])) for d in src_devices
         }
-        if not src_gpu_keys:
-            raise RuntimeError(f"Missing src gpu keys for src_rank={src_rank}: {src_devices}")
 
         # Classify each device of each target worker as IPC or broadcast.
         tgt_devices: List[Dict[str, Any]] = []  # broadcast-only devices (for NCCL group setup)
@@ -126,6 +207,14 @@ class ModelUpdateService:
         safe_sync_id = str(sync_id).replace("/", "_")
         group_name = f"selective_model_update_{safe_sync_id}_src{src_rank}"
 
+        # Only fetch NCCL rendezvous coordinates when broadcast-path workers exist.
+        if tgt_ranks_in_group:
+            master_addr = self._get_master_addr(src_rank=src_rank)
+            master_port = int(ray.get(src_worker.get_free_port.remote()))
+        else:
+            master_addr = ""
+            master_port = 0
+
         comm_plan_args: Dict[str, Any] = dict(
             group_name=group_name,
             master_addr=master_addr,
@@ -146,6 +235,23 @@ class ModelUpdateService:
     def sync_selected_workers(
         self, tgt_dp_ranks: List[int], adapters_to_sync: list[str] | None = None, verify: bool = True,
     ) -> None:
+        """Push model weights from the training cluster to specific infer workers.
+
+        High-level flow:
+        1. Validate target ranks and read cluster topology.
+        2. Select the single global cache owner on the training side.
+        3. Build a comm plan that classifies each target device as IPC or broadcast.
+        4. Stand up temporary NCCL groups for broadcast-path workers.
+        5. Dispatch ``selective_sync_active_cache`` to all training workers
+           (only the owner actually transfers; others return immediately).
+        6. Optionally verify transferred weights against sender-side checksums.
+
+        Args:
+            tgt_dp_ranks: Data-parallel ranks in the inference cluster to update.
+            adapters_to_sync: If provided, only sync these LoRA adapter names
+                instead of the full model weights.
+            verify: When ``True``, run a post-sync weight verification pass.
+        """
         tgt_dp_ranks = sorted(set(int(r) for r in tgt_dp_ranks))
         if not tgt_dp_ranks:
             raise ValueError("tgt_dp_ranks must be non-empty")
@@ -155,6 +261,8 @@ class ModelUpdateService:
         if invalid:
             raise ValueError(f"Invalid tgt_dp_ranks={invalid}; infer_world_size={infer_world_size}")
 
+        # device_mapping tells us which physical GPUs each infer worker occupies,
+        # needed to decide IPC vs broadcast for each target device.
         tgt_device_mapping = getattr(self.tgt_cluster.worker_config, "device_mapping", None)
         tgt_num_gpus_per_worker = getattr(self.tgt_cluster.worker_config, "num_gpus_per_worker", None)
 
@@ -186,7 +294,11 @@ class ModelUpdateService:
             f"ipc_targets={[e['dp_rank'] for e in comm_plan[src_rank].get('ipc_targets', [])]} "
             f"pg_timeout_s={self._pg_timeout_s}"
         )
+        master_addr = str(comm_plan[src_rank]["master_addr"])
+        master_port = int(comm_plan[src_rank]["master_port"])
+        sync_completed = False
 
+        # --- Phase 1: Set up temporary NCCL collective groups for broadcast-path workers ---
         setup_refs = []
         if tgt_ranks_in_group:
             # Sender joins as rank 0; receivers join as ranks 1..N (dynamic comm_plan pattern).
@@ -220,8 +332,9 @@ class ModelUpdateService:
                     ),
                 )
 
-            # Dispatch sync RPC to all train workers. Only the global owner does transport;
-            # non-owners return immediately. ray.get(sync_refs) provides the sync barrier.
+            # --- Phase 2: Dispatch sync to all training workers ---
+            # Only the global cache owner actually transfers weights; non-owners return
+            # immediately. ray.get(sync_refs) acts as the sync barrier.
             sync_refs = []
             for rank, worker in enumerate(self.src_cluster.workers):
                 is_owner = int(rank) == src_rank
@@ -247,6 +360,7 @@ class ModelUpdateService:
                     f"pipeline_id={self.pipeline_id} sync_id={sync_id} tgt_dp_ranks={tgt_dp_ranks}"
                 ),
             )
+            sync_completed = True
         except Exception as exc:
             raise RuntimeError(
                 "[ModelUpdateService] selective sync failed. "
@@ -254,11 +368,17 @@ class ModelUpdateService:
                 f"timeout_s={self._timeout_s}. "
                 "This is a fail-fast guard to avoid indefinite hangs in sync_selected_workers."
             ) from exc
+        finally:
+            # Release only after the full barrier — on failure, remote workers
+            # may still hold the port; leaking the claim is safer than a collision.
+            if sync_completed:
+                self._release_master_port_claim(master_addr=master_addr, master_port=master_port)
         # NCCL groups are destroyed inside selective_sync_active_cache (owner side) before returning.
         # ray.get(sync_refs) above confirms teardown is complete.
 
-        # Post-sync verification: compare sender stats against receiver live weights.
-        # Only the cache owner returns non-None with weight_stats; non-owners return None.
+        # --- Phase 3: Post-sync verification ---
+        # The cache owner returns weight_stats (checksums / norms) alongside the sync result.
+        # We forward these to each target worker's verify_model to confirm weights landed correctly.
         if verify:
             sender_stats: dict = {}
             for result in sync_results:

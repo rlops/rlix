@@ -82,6 +82,7 @@ _QUEUE_TRACK_CAP: int = 1000
 # Gap-ratio generation planning iteration limits (safety bounds).
 _MAX_GAP_ITERATIONS: int = 10_000
 _MAX_GAP_ACTIVATIONS: int = 1_000
+_TOPOLOGY_READY_TIMEOUT_S: float = float(os.environ.get("RLIX_TOPOLOGY_READY_TIMEOUT_S", "120"))
 
 
 def _validate_and_canonicalize_device_mapping(
@@ -148,6 +149,12 @@ def _validate_and_canonicalize_device_mapping(
 
 @dataclass(frozen=True, slots=True)
 class _GapRatioDPWorker:
+    """Immutable snapshot of one data-parallel worker for gap-ratio planning.
+
+    Each worker maps to exactly one TP-sized bundle of GPUs on a single pipeline's
+    generation (actor_infer) cluster.
+    """
+
     pipeline_id: str
     dp_rank: int
     gpu_ids: List[int]
@@ -155,6 +162,13 @@ class _GapRatioDPWorker:
 
 @dataclass(slots=True)
 class _GapRatioPipelineState:
+    """Mutable per-pipeline bookkeeping used during a single gap-ratio iteration.
+
+    Fields are recomputed each iteration by ``_update_gaps`` and
+    ``_compute_shrink_budget_by_pipeline_id``; the dataclass avoids passing many
+    loose locals through the nested helpers.
+    """
+
     pipeline_id: str
     cluster_id: str
     remaining: float
@@ -213,6 +227,27 @@ class _QueueSubGroup:
 
 @dataclass(slots=True)
 class SchedulerImpl:
+    """Priority-based GPU scheduler for concurrent RL pipelines.
+
+    Manages a central scheduling loop that allocates and reclaims GPUs across
+    registered pipelines.  Non-generation requests (training, ref-log-probs, etc.)
+    use fixed device mappings and preempt generation workers when necessary.
+    Generation allocation uses a gap-ratio algorithm that distributes DP workers
+    proportionally to each pipeline's remaining demand.
+
+    Lifecycle::
+
+        initialize  ->  register_pipeline  ->  admit_pipeline
+                                                    |
+                        request_gpus / release_gpus / release_then_request_gpus
+                                                    |
+                        unregister_pipeline  ->  shutdown
+
+    Thread-safety: all mutable state is guarded by ``_lock``.  The central
+    scheduling loop and public APIs acquire the lock independently; coordinator
+    resize RPCs are executed *outside* the lock to avoid deadlocks.
+    """
+
     _state: SchedulerState = field(init=False)
     _lock: asyncio.Lock = field(init=False)
     _wakeup_event: asyncio.Event = field(init=False)
@@ -254,7 +289,12 @@ class SchedulerImpl:
     # Marker track for release events (separate from exec_markers)
     _release_marker_track: Optional["NormalTrack"] = field(init=False, default=None)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Initialize mutable internal state.
+
+        Topology fields (``_num_gpus``, ``_required_gpus_per_node``) remain ``None``
+        until ``initialize()`` queries the ResourceManager.
+        """
         self._state = SchedulerState()
         self._lock = asyncio.Lock()
         self._wakeup_event = asyncio.Event()
@@ -266,6 +306,20 @@ class SchedulerImpl:
         self._num_gpus: Optional[int] = None
         self._required_gpus_per_node: Optional[int] = None
         self._coordinator_handle_cache = {}
+
+    async def _wait_topology_ready(self) -> None:
+        """Wait for topology initialization with a bounded timeout.
+
+        Raises RuntimeError if initialize() has not completed within the deadline.
+        """
+        try:
+            await asyncio.wait_for(self._topology_ready.wait(), timeout=_TOPOLOGY_READY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Scheduler topology not ready after {_TOPOLOGY_READY_TIMEOUT_S}s — "
+                f"initialize() was never called or failed. "
+                f"Set RLIX_TOPOLOGY_READY_TIMEOUT_S to adjust."
+            ) from None
 
     # =========================================================================
     # GPU Tracing: Core Methods
@@ -535,9 +589,8 @@ class SchedulerImpl:
             # CRITICAL: Only store state AFTER successful open
             if ok:
                 # Fail fast: duplicate cluster_id means scheduler violated one-request-per-cluster invariant
-                assert cluster_id not in self._pending_queue_trace_state, (
-                    f"Duplicate queue trace enqueue for cluster_id={cluster_id!r}"
-                )
+                if cluster_id in self._pending_queue_trace_state:
+                    raise RuntimeError(f"Duplicate queue trace enqueue for cluster_id={cluster_id!r}")
                 self._pending_queue_trace_state[cluster_id] = (slice_track, now_ns, priority)
 
         # Counter: depth = current bucket size (AFTER append, so correct)
@@ -903,8 +956,13 @@ class SchedulerImpl:
         cluster_tp_configs: Dict[str, int],
         cluster_device_mappings: Dict[str, List[int]],
     ) -> None:
+        """Register a pipeline's cluster topology with the scheduler.
+
+        Must be called before ``admit_pipeline``.  Delegates to
+        ``register_pipeline_topology`` after validating the pipeline ID.
+        """
         validate_pipeline_id(pipeline_id)
-        await self._topology_ready.wait()
+        await self._wait_topology_ready()
         await self.register_pipeline_topology(
             pipeline_id=pipeline_id,
             ray_namespace=ray_namespace,
@@ -913,6 +971,7 @@ class SchedulerImpl:
         )
 
     async def admit_pipeline(self, *, pipeline_id: str) -> None:
+        """Mark a registered pipeline as admitted so it can issue GPU requests."""
         validate_pipeline_id(pipeline_id)
         async with self._lock:
             info = self._state.pipeline_registry.get(pipeline_id)
@@ -921,6 +980,13 @@ class SchedulerImpl:
             info["admitted"] = True
 
     async def unregister_pipeline(self, *, pipeline_id: str) -> None:
+        """Remove a pipeline and release all of its resources.
+
+        Two-phase approach under the lock:
+          1. **Validate** — parse every cluster_id; fail-fast on corruption.
+          2. **Mutate** — remove allocations, pending requests, and planned releases.
+        Pending waiters are woken with an error so callers do not hang.
+        """
         validate_pipeline_id(pipeline_id)
         async with self._lock:
             # ============================================================
@@ -1013,6 +1079,13 @@ class SchedulerImpl:
         enable_gpu_tracing: bool = False,
         trace_output_dir: Optional[str] = None,
     ) -> None:
+        """Bootstrap the scheduler: query GPU topology, seed idle pool, start loop.
+
+        Idempotent — returns immediately if already initialized.  Must be called
+        after the ResourceManager has completed ``init_topology()``.  Optionally
+        enables Perfetto GPU tracing via parameter or ``RLIX_ENABLE_GPU_TRACING``
+        env var.
+        """
         if self._topology_ready.is_set() and self._loop_task is not None:
             return
 
@@ -1069,6 +1142,7 @@ class SchedulerImpl:
             self._trace_active_gpus_update()
 
     def _has_any_pending_request_locked(self, *, cluster_id: str) -> bool:
+        """Return True if *any* priority bucket contains a pending request for ``cluster_id``."""
         for priority in Priority:
             for pending in self._state.pending_bucket(priority):
                 if pending.request.cluster_id == cluster_id:
@@ -1076,6 +1150,7 @@ class SchedulerImpl:
         return False
 
     def _has_pending_request_locked(self, *, cluster_id: str, priority: Priority) -> bool:
+        """Return True if the bucket for ``priority`` contains a pending request for ``cluster_id``."""
         return any(pending.request.cluster_id == cluster_id for pending in self._state.pending_bucket(priority))
 
     async def register_pipeline_topology(
@@ -1086,7 +1161,18 @@ class SchedulerImpl:
         cluster_tp_configs: Dict[str, int],
         cluster_device_mappings: Dict[str, List[int]],
     ) -> None:
-        await self._topology_ready.wait()
+        """Validate and store per-cluster TP sizes and device mappings for a pipeline.
+
+        Enforces topology constraints (contiguous TP groups, node-boundary alignment)
+        and records the cluster configs in ``pipeline_registry`` under the lock.
+
+        Args:
+            pipeline_id: Unique pipeline identifier (``{type}_{12_hex}``).
+            ray_namespace: Ray namespace for the pipeline's coordinator actor.
+            cluster_tp_configs: Mapping of cluster name to tensor-parallel size.
+            cluster_device_mappings: Mapping of cluster name to ordered GPU id list.
+        """
+        await self._wait_topology_ready()
         validate_pipeline_id(pipeline_id)
         if not isinstance(ray_namespace, str) or ray_namespace == "":
             raise ValueError("ray_namespace must be non-empty str")
@@ -1150,10 +1236,17 @@ class SchedulerImpl:
             }
 
     async def get_pipeline_namespace(self, *, pipeline_id: str) -> str:
+        """Return the Ray namespace for a pipeline (deterministic from pipeline_id)."""
         validate_pipeline_id(pipeline_id)
         return get_pipeline_namespace(pipeline_id)
 
     async def report_progress(self, report: ProgressReport) -> None:
+        """Accept a progress report from a coordinator and wake the scheduling loop.
+
+        Reports are keyed by (pipeline_id, mode, stream_key) where stream_key is
+        the adapter_id for LoRA pipelines or a reserved sentinel for full-finetune.
+        Source-type mixing (LoRA vs full-finetune) within a pipeline is rejected.
+        """
         validate_pipeline_id(report.pipeline_id)
         if report.step_target_trajectories <= 0:
             raise ValueError("step_target_trajectories must be > 0")
@@ -1227,7 +1320,13 @@ class SchedulerImpl:
         global_step: Optional[int] = None,
         lora_name: Optional[str] = None,  # GPU Tracing: LoRA name for non-generation clusters
     ) -> List[int]:
-        await self._topology_ready.wait()
+        """Block until GPUs are allocated for ``cluster_id`` at ``priority``.
+
+        Returns the list of allocated GPU ids.  If the cluster already has a
+        matching allocation, the existing GPU list is returned immediately.
+        Duplicate pending requests for the same cluster_id are rejected.
+        """
+        await self._wait_topology_ready()
         validate_cluster_id(cluster_id)
         event = asyncio.Event()
         pending: PendingRequest | None = None
@@ -1273,7 +1372,8 @@ class SchedulerImpl:
         return list(pending.result)
 
     async def release_gpus(self, *, cluster_id: str, global_step: Optional[int] = None) -> None:
-        await self._topology_ready.wait()
+        """Release all GPUs held by ``cluster_id`` back to the idle pool."""
+        await self._wait_topology_ready()
         async with self._lock:
             alloc = self._state.active_allocations.pop(cluster_id, None)
             if alloc is None:
@@ -1296,7 +1396,13 @@ class SchedulerImpl:
         request_global_step: Optional[int] = None,
         request_lora_name: Optional[str] = None,  # GPU Tracing: LoRA name for non-generation clusters
     ) -> List[int]:
-        await self._topology_ready.wait()
+        """Atomically release one cluster's GPUs and enqueue a request for another.
+
+        Both operations happen under a single lock acquisition so the freed GPUs
+        are immediately visible to the scheduler when planning the new request.
+        Rejects same-priority release-and-request (would be a no-op).
+        """
+        await self._wait_topology_ready()
         event = asyncio.Event()
         pending: PendingRequest | None = None
         async with self._lock:
@@ -1306,20 +1412,19 @@ class SchedulerImpl:
                 raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
             if not bool(info.get("admitted", False)):
                 raise RuntimeError(f"pipeline_id {pipeline_id!r} not admitted; call orchestrator.admit_pipeline first")
-            assert release_cluster_id in self._state.active_allocations, (
-                f"release_cluster_id {release_cluster_id!r} is not currently allocated"
-            )
+            if release_cluster_id not in self._state.active_allocations:
+                raise RuntimeError(f"release_cluster_id {release_cluster_id!r} is not currently allocated")
             existing_to_release = self._state.active_allocations.get(release_cluster_id)
             # Redundant guard: the in-check above already ensures this, but kept explicit.
-            assert existing_to_release is not None, (
-                f"release_cluster_id {release_cluster_id!r} not found in active_allocations"
-            )
+            if existing_to_release is None:
+                raise RuntimeError(f"release_cluster_id {release_cluster_id!r} not found in active_allocations")
             # Releasing a cluster whose priority already matches the incoming request priority
             # indicates a caller bug (e.g. releasing GENERATION to re-request GENERATION).
-            assert existing_to_release.priority != request_priority, (
-                f"release_cluster_id {release_cluster_id!r} priority is already {existing_to_release.priority}; "
-                f"releasing and immediately re-requesting the same priority {request_priority!r} is a no-op"
-            )
+            if existing_to_release.priority == request_priority:
+                raise RuntimeError(
+                    f"release_cluster_id {release_cluster_id!r} priority is already {existing_to_release.priority}; "
+                    f"releasing and immediately re-requesting the same priority {request_priority!r} is a no-op"
+                )
 
             alloc = self._state.active_allocations.pop(release_cluster_id, None)
             if alloc is None:
@@ -1353,6 +1458,11 @@ class SchedulerImpl:
         return list(pending.result)
 
     def _signal_all_waiters_with_error(self, *, error: str) -> None:
+        """Wake every pending request and planned release with an error message.
+
+        Used during fail-fast shutdown to unblock all waiters so they can propagate
+        the error instead of hanging indefinitely.
+        """
         # Queue Tracing: Close all queue slices (track from stored state)
         for priority in Priority:
             for pending in list(self._state.pending_bucket(priority)):
@@ -1369,6 +1479,16 @@ class SchedulerImpl:
         self._state.pending_planned_release_requests.clear()
 
     async def _central_scheduling_loop(self) -> None:
+        """Async event loop that drives scheduling cycles.
+
+        Two trigger modes:
+          1. **Event-driven** — woken by ``_wakeup_event`` (request, progress, release).
+          2. **Background poll** — 1 s timeout triggers ``_should_background_rebalance_locked``
+             to detect demand-vs-GPU imbalance without an explicit wakeup.
+
+        On any unhandled exception the loop signals all waiters with an error and
+        initiates fail-fast shutdown via the orchestrator.
+        """
         while True:
             # Case 1: event-driven scheduling (request/progress/release wakeups) runs immediately.
             # Case 2: if there is no wakeup, use a lightweight poll and run only when
@@ -1406,6 +1526,7 @@ class SchedulerImpl:
                 raise
 
     def _has_waiting_requests_locked(self) -> bool:
+        """Return True if any pending request or planned release exists."""
         # Any pending request/release means scheduler should remain purely event-driven.
         for priority in Priority:
             if self._state.pending_bucket(priority):
@@ -1415,14 +1536,14 @@ class SchedulerImpl:
         return False
 
     def _iter_pipeline_reports_locked(self, *, pipeline_id: str) -> List[ProgressReport]:
-        # Aggregate all stored reports across mode+stream for this pipeline.
+        """Return all stored progress reports for ``pipeline_id`` across modes and streams."""
         reports: List[ProgressReport] = []
         for mode_bucket in self._state.latest_progress_by_pipeline.get(pipeline_id, {}).values():
             reports.extend(mode_bucket.values())
         return reports
 
     def _pipeline_progress_totals_locked(self, *, pipeline_id: str) -> Tuple[float, float]:
-        # Compute remaining/required together so callers do one pass over reports.
+        """Compute (total_remaining, total_required) for ``pipeline_id`` in one pass."""
         total_required = 0.0
         total_remaining = 0.0
         for progress in self._iter_pipeline_reports_locked(pipeline_id=pipeline_id):
@@ -1433,6 +1554,13 @@ class SchedulerImpl:
         return max(0.0, total_remaining), total_required
 
     def _should_background_rebalance_locked(self) -> bool:
+        """Heuristic: should the scheduler run a background rebalance cycle?
+
+        Returns True when no explicit requests are pending AND either:
+          - A suspended generation cluster has non-zero remaining demand (Case 2.2), or
+          - The worst-50%-completion pipelines' demand fraction deviates from their GPU
+            fraction by more than 10 percentage points (Case 2.1).
+        """
         # Case 2 applies only when there is no waiting request.
         if self._has_waiting_requests_locked():
             return False
@@ -1491,7 +1619,22 @@ class SchedulerImpl:
         return deviation_percent_points > 10.0
 
     async def scheduling_cycle(self) -> None:
-        await self._topology_ready.wait()
+        """Execute one full scheduling cycle: plan, validate, resize, commit.
+
+        Phases (under lock):
+          0.5. Process planned release requests (generation shrinks from coordinators).
+          2. Non-generation allocation (priorities 0–5) with generation preemption.
+          3. Generation gap-ratio planning (proportional DP worker distribution).
+          4. Validate the execution plan against current state.
+          5. Prepare resize RPC calls (shrink/expand dp_ranks per pipeline).
+
+        Outside lock:
+          5. Execute resize RPCs: shrinks first, then expands.
+
+        Under lock again:
+          6. Commit state mutations and signal pending waiters.
+        """
+        await self._wait_topology_ready()
         plan = ExecutionPlan()
         planned_allocation_targets: Set[str] = set()
         resize_calls: List[Tuple[Any, List[int], List[int]]] = []
@@ -1500,6 +1643,8 @@ class SchedulerImpl:
             async with self._lock:
                 self._cycle_counter += 1
 
+                # Shadow of the real idle pool used for planning-time lookahead: GPUs freed
+                # and re-allocated within this cycle are tracked here before any state is committed.
                 planned_available_gpus = set(self._state.idle_gpus)
 
                 # Phase 0.5: planned release requests (blocking release hint from pipeline/coordinator).
@@ -1544,6 +1689,8 @@ class SchedulerImpl:
                         )
 
                 # Phase 2: non-generation planning (priorities 0-5).
+                # Track GPUs held by non-GEN allocations from prior cycles so they can be
+                # explicitly excluded from the generation budget in Phase 3.
                 non_gen_reserved_gpus: Set[int] = set()
                 for alloc in self._state.active_allocations.values():
                     if alloc.priority != Priority.GENERATION:
@@ -1627,6 +1774,9 @@ class SchedulerImpl:
                             )
 
                 # Phase 3: generation gap-ratio planning.
+                # Re-exclude non-GEN GPUs: planned_available_gpus was seeded from idle_gpus (which
+                # already omits them), but Phase 2 may have added GPUs freed from GEN donors that
+                # overlap with non-GEN reservations from prior cycles.
                 planned_available_gpus -= non_gen_reserved_gpus
 
                 active_dp_workers, inactive_dp_workers, idle_for_gen = self._snapshot_generation_dp_workers(
@@ -1682,6 +1832,7 @@ class SchedulerImpl:
                 exec_details = self._plan_to_exec_details(plan)
 
             # GPU Tracing: Emit execution marker right after planning, before resize RPCs.
+            # Guard: skip no-op cycles to avoid thousands of empty markers in the Perfetto timeline.
             if any([exec_details.get("shrinks"), exec_details.get("removes"),
                     exec_details.get("allocates"), exec_details.get("expands")]):
                 self._trace_execution_marker(exec_details)
@@ -1706,6 +1857,7 @@ class SchedulerImpl:
             raise
 
     def _get_or_lookup_coordinator_handle_locked(self, *, pipeline_id: str) -> Any:
+        """Return the cached Ray actor handle for a pipeline's coordinator, or look it up."""
         info = self._state.pipeline_registry.get(pipeline_id)
         if info is None:
             raise RuntimeError(f"pipeline_id {pipeline_id!r} not registered")
@@ -1900,6 +2052,7 @@ class SchedulerImpl:
             )
 
     async def _fail_fast_shutdown(self, *, reason: str) -> None:
+        """Trigger a forced orchestrator shutdown on unrecoverable scheduler error."""
         try:
             orchestrator = ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=RLIX_NAMESPACE)
         except Exception as e:
@@ -1914,6 +2067,11 @@ class SchedulerImpl:
     def _snapshot_generation_dp_workers(
         self, *, plan: ExecutionPlan, idle_gpus: Set[int]
     ) -> Tuple[Dict[str, List[_GapRatioDPWorker]], Dict[str, List[_GapRatioDPWorker]], Set[int]]:
+        """Snapshot active and inactive generation DP workers for gap-ratio planning.
+
+        Accounts for shrink ops already in the plan (treats those ranks as inactive).
+        Returns (active_by_pipeline, inactive_by_pipeline, idle_gpus_for_gen).
+        """
         active_dp_workers: Dict[str, List[_GapRatioDPWorker]] = {}
         inactive_dp_workers: Dict[str, List[_GapRatioDPWorker]] = {}
 
@@ -1969,10 +2127,12 @@ class SchedulerImpl:
             active_dp_workers[pipeline_id] = active_list
             inactive_dp_workers[pipeline_id] = inactive_list
 
-        assert idle_gpus.isdisjoint(non_gen_reserved_gpus), "idle_gpus must exclude non-GEN reserved GPUs"
+        if not idle_gpus.isdisjoint(non_gen_reserved_gpus):
+            raise RuntimeError("idle_gpus must exclude non-GEN reserved GPUs")
         return active_dp_workers, inactive_dp_workers, idle_gpus
 
     def _has_pending_generation_request(self, cluster_id: str) -> bool:
+        """Return True if the GENERATION priority bucket has a pending request for ``cluster_id``."""
         return any(p.request.cluster_id == cluster_id for p in self._state.pending_bucket(Priority.GENERATION))
 
     def _plan_generation_gap_ratio(
@@ -1985,6 +2145,14 @@ class SchedulerImpl:
         idle_gpus: Set[int],
         epsilon: float = 0.0,
     ) -> Set[int]:
+        """Distribute generation GPU budget across pipelines proportionally to remaining demand.
+
+        Iteratively activates inactive DP workers on the pipeline with the largest
+        normalized gap (target_ratio - existing_ratio) / target_ratio.  When idle GPUs
+        are insufficient, workers are donated from over-provisioned pipelines.
+
+        Returns the set of GPU ids that remain idle after planning.
+        """
         # Ported from ROLL_multi_pipeline CentralizedGPUSchedulerImpl._plan_generation_gap_ratio_alternative,
         # adapted to RLix-standard progress reporting (percent_completed / step_target_trajectories).
 
@@ -2031,6 +2199,8 @@ class SchedulerImpl:
 
             has_pending = self._has_pending_generation_request(cluster_id)
             if has_pending:
+                # Inflate demand so a pipeline that hasn't started generating yet (remaining == 0)
+                # still receives a non-zero weight and gets allocated at least one DP worker.
                 remaining += step_target
                 percent_remaining = remaining / step_target if step_target > 0 else 0.0
 
@@ -2048,7 +2218,8 @@ class SchedulerImpl:
                 )
             )
 
-        assert idle_gpus.isdisjoint(non_gen_reserved_gpus), "idle_gpus must exclude non-GEN reserved GPUs"
+        if not idle_gpus.isdisjoint(non_gen_reserved_gpus):
+            raise RuntimeError("idle_gpus must exclude non-GEN reserved GPUs")
 
         protected: Set[Tuple[str, int]] = set()
         for op in plan.sched_guided_shrink_ops:
@@ -2059,6 +2230,8 @@ class SchedulerImpl:
                 protected.add((pipeline_id, dp_rank))
 
         eligible_for_target = [p for p in pipeline_states if _receiver_eligible(p)]
+        # target_weight sums only eligible pipelines, but budget includes all pipelines' active
+        # GPUs — ineligible pipelines' GPUs are redistributed, not kept.
         total_target_weight = sum(p.remaining * p.tp_size for p in eligible_for_target)
         total_gen_budget_gpus = len(idle_gpus) + sum(len(p.active_dp_workers) * p.tp_size for p in pipeline_states)
         if total_gen_budget_gpus == 0:
@@ -2072,6 +2245,8 @@ class SchedulerImpl:
                 p.target_ratio = (p.remaining * p.tp_size) / total_target_weight
                 raw_target_bundles = (p.target_ratio * total_gen_budget_gpus) / p.tp_size
                 rounded_bundles = _round_half_up(raw_target_bundles)
+                # Floor: every pipeline with non-zero demand gets at least one TP bundle,
+                # otherwise the gap never closes and the pipeline stays starved.
                 p.target_gpu_count = max(rounded_bundles * p.tp_size, p.tp_size)
 
         def _update_gaps() -> None:
@@ -2081,6 +2256,7 @@ class SchedulerImpl:
                 state.gap = state.target_ratio - state.existing_ratio
 
         def _compute_shrink_budget_by_pipeline_id() -> Dict[str, int]:
+            """Max workers each pipeline can donate without dropping below its target allocation."""
             shrink_budget: Dict[str, int] = {}
             for state in pipeline_states:
                 if state.cluster_id in plan.clusters_to_remove:
@@ -2149,6 +2325,8 @@ class SchedulerImpl:
                         continue
                     donor_plan.extend(picked)
 
+                # Score prefers: (1) free idle GPUs over donor shrinks, (2) donors with least
+                # remaining work (least harmful to shrink), (3) lower dp_rank for determinism.
                 needs_shrink = 0 if not donor_plan else 1
                 donor_percents = sorted([percent_remaining_by_pipeline_id[donor_worker.pipeline_id] for _, donor_worker, _ in donor_plan])
                 score = (needs_shrink, tuple([-p for p in donor_percents]), inactive.dp_rank)
@@ -2228,10 +2406,14 @@ class SchedulerImpl:
             ]
             acceptors_with_norm_gap = [(_normalized_gap(p), p) for p in acceptors]
             acceptors_with_norm_gap = [(ng, p) for ng, p in acceptors_with_norm_gap if ng is not None]
+            # Sort by normalized gap desc (scale-invariant underservice), absolute gap desc as
+            # tiebreaker, then pipeline_id for determinism.
             acceptors = [p for _, p in sorted(acceptors_with_norm_gap, key=lambda x: (-x[0], -x[1].gap, x[1].pipeline_id))]
             if not acceptors:
                 break
 
+            # Activate at most one worker per iteration: _update_gaps() must recompute
+            # existing_ratio after each activation to avoid using stale ratios.
             any_activation = False
             for acceptor in acceptors:
                 if _try_activate_one(
@@ -2404,9 +2586,9 @@ class SchedulerImpl:
                 alloc = self._state.active_allocations[cluster_id]
                 self._signal_pending_request(cluster_id=cluster_id, priority=Priority.GENERATION, result=sorted(alloc.gpu_ids))
 
-        # Planned release requests: signal after shrink commit.
+        # Planned release requests: signal unconditionally — by this point the shrink RPCs
+        # have already executed in _execute_resize_calls, so the release is committed.
         for cluster_id, req in list(self._state.pending_planned_release_requests.items()):
-            # If the cluster still exists, we assume shrink commit applied.
             req.event.set()
             self._state.pending_planned_release_requests.pop(cluster_id, None)
 
@@ -2418,6 +2600,12 @@ class SchedulerImpl:
         }
 
     def _signal_pending_request(self, *, cluster_id: str, priority: Priority, result: Optional[List[int]] = None) -> None:
+        """Find and fulfill a pending request in ``priority`` bucket for ``cluster_id``.
+
+        Closes the queue trace slice, pops the request from the bucket, and wakes
+        the waiting coroutine.  Tolerates a missing request when the pipeline was
+        concurrently unregistered (benign race).
+        """
         bucket = self._state.pending_bucket(priority)
         for idx, pending in enumerate(bucket):
             if pending.request.cluster_id != cluster_id:
@@ -2454,7 +2642,7 @@ class SchedulerImpl:
         allocation state and blocks until the scheduler commits a shrink in its next cycle.
         """
 
-        await self._topology_ready.wait()
+        await self._wait_topology_ready()
         if (pipeline_id is None) == (cluster_id is None):
             raise ValueError("Exactly one of pipeline_id or cluster_id must be provided")
         if cluster_id is None:
@@ -2524,4 +2712,5 @@ class SchedulerImpl:
 
 
 def scheduler_actor_class():
+    """Return a Ray remote actor class wrapping ``SchedulerImpl`` with no restarts."""
     return ray.remote(max_restarts=0, max_task_retries=0)(SchedulerImpl)

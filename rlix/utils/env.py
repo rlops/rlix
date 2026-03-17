@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 
-def parse_env_timeout_s(env_key: str, default_s: float) -> float:
+def parse_env_timeout_s(env_key: str, default_s: float) -> Optional[float]:
     """Read a timeout in seconds from an env var; fail-fast on invalid values.
 
-    Returns default_s if the env var is not set.
-    Raises RuntimeError if the value is not a valid positive number.
+    Returns *default_s* when the env var is unset.  Returns ``None`` when the
+    env var is explicitly set to a value <= 0, which callers should interpret
+    as "no timeout" (i.e. wait indefinitely).
+
+    Raises RuntimeError if the value cannot be parsed as a number.
     """
     raw = os.environ.get(env_key)
     if raw is None:
@@ -16,6 +20,4 @@ def parse_env_timeout_s(env_key: str, default_s: float) -> float:
         value = float(raw)
     except ValueError as exc:
         raise RuntimeError(f"{env_key} must be a number, got: {raw!r}") from exc
-    if value <= 0:
-        raise RuntimeError(f"{env_key} must be > 0, got {value}")
-    return value
+    return None if value <= 0 else value

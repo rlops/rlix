@@ -30,13 +30,13 @@ from rlix.utils.ray import get_head_node_id
 from rlix.utils.ray import head_node_affinity_strategy
 import ray
 
-# Timeouts for orchestrator operations (seconds).
-_RESOURCE_SNAPSHOT_TIMEOUT_S: float = parse_env_timeout_s("RLIX_RESOURCE_SNAPSHOT_TIMEOUT_S", 10.0)
-_RESOURCE_SNAPSHOT_POLL_S: float = parse_env_timeout_s("RLIX_RESOURCE_SNAPSHOT_POLL_S", 0.2)
-_WORKER_STOP_TIMEOUT_S: float = parse_env_timeout_s("RLIX_WORKER_STOP_TIMEOUT_S", 10.0)
-_POST_STOP_SETTLE_S: float = parse_env_timeout_s("RLIX_POST_STOP_SETTLE_S", 0.2)
-_UNNAMED_ACTOR_CLEANUP_TIMEOUT_S: float = parse_env_timeout_s("RLIX_UNNAMED_ACTOR_CLEANUP_TIMEOUT_S", 10.0)
-_SCHEDULER_FLUSH_TIMEOUT_S: float = parse_env_timeout_s("RLIX_SCHEDULER_FLUSH_TIMEOUT_S", 0.5)
+# Timeouts for orchestrator operations (seconds).  None means "no timeout".
+_RESOURCE_SNAPSHOT_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_RESOURCE_SNAPSHOT_TIMEOUT_S", 10.0)
+_RESOURCE_SNAPSHOT_POLL_S: Optional[float] = parse_env_timeout_s("RLIX_RESOURCE_SNAPSHOT_POLL_S", 0.2)
+_WORKER_STOP_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_WORKER_STOP_TIMEOUT_S", 10.0)
+_POST_STOP_SETTLE_S: Optional[float] = parse_env_timeout_s("RLIX_POST_STOP_SETTLE_S", 0.2)
+_UNNAMED_ACTOR_CLEANUP_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_UNNAMED_ACTOR_CLEANUP_TIMEOUT_S", 10.0)
+_SCHEDULER_FLUSH_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_SCHEDULER_FLUSH_TIMEOUT_S", 0.5)
 # 12 hex chars = 48 bits of entropy; unique enough for any realistic cluster size.
 _PIPELINE_ID_RANDOM_HEX_LEN: int = 12
 

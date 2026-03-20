@@ -72,6 +72,7 @@ class SignalPendingAllocationOp:
     gpus_to_allocate: List[int]
     priority: Optional[Any] = None
     lora_name: Optional[str] = None  # GPU Tracing: carried from PendingRequest at planning time
+    tp_size: int = 1  # Snapshotted at planning time; avoids registry lookup at commit
 
 
 @dataclass(slots=True)
@@ -82,6 +83,7 @@ class SchedGuidedAllocationOp:
     dp_ranks_to_add: List[int]
     gpus_to_allocate: List[int]
     has_pending_request: bool = False
+    tp_size: int = 1  # Snapshotted at planning time; avoids registry lookup at commit
 
 
 @dataclass(slots=True)

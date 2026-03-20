@@ -1774,6 +1774,10 @@ class SchedulerImpl:
                             planned_available_gpus -= needed
                             non_gen_reserved_gpus |= needed
                             planned_allocation_targets.add(cluster_id)
+                            pipeline_id_for_op, cluster_name_for_op = parse_cluster_id(cluster_id)
+                            snapshot_tp_size = int(
+                                self._state.pipeline_registry[pipeline_id_for_op]["cluster_configs"][cluster_name_for_op].get("tp_size", 1)
+                            )
                             plan.signal_pending_allocation_ops.append(
                                 SignalPendingAllocationOp(
                                     cluster_id=cluster_id,
@@ -1782,6 +1786,7 @@ class SchedulerImpl:
                                     # Carry lora_name directly from the pending so _apply_plan_and_signal
                                     # does not need to re-search the bucket for it.
                                     lora_name=pending.lora_name,
+                                    tp_size=snapshot_tp_size,
                                 )
                             )
 
@@ -1813,6 +1818,7 @@ class SchedulerImpl:
                             cluster_id=cluster_id,
                             gpus_to_allocate=[],
                             priority=Priority.GENERATION,
+                            tp_size=0,  # Not used at commit (gpus_to_allocate is empty)
                         )
                     )
 
@@ -2386,6 +2392,7 @@ class SchedulerImpl:
                         dp_ranks_to_add=[inactive.dp_rank],
                         gpus_to_allocate=sorted(needed_bundle),
                         has_pending_request=has_pending_request,
+                        tp_size=state.tp_size,
                     )
                 )
             active_dp_workers.setdefault(state.pipeline_id, []).append(inactive)
@@ -2504,11 +2511,25 @@ class SchedulerImpl:
             if op.priority is None:
                 raise RuntimeError(f"signal_pending_allocation_ops missing priority for cluster_id={op.cluster_id!r}")
             priority = Priority(op.priority)
+            pipeline_id, _ = parse_cluster_id(op.cluster_id)
+            # Stale-plan tolerance: if unregister_pipeline ran during the lock gap,
+            # the pipeline is gone and its waiters are already cleaned up.
+            if pipeline_id not in self._state.pipeline_registry:
+                if self._has_pending_request_locked(cluster_id=op.cluster_id, priority=priority):
+                    raise RuntimeError(
+                        f"Pipeline {pipeline_id!r} removed from registry but pending waiter still present "
+                        f"for cluster_id={op.cluster_id!r} — cleanup corruption"
+                    )
+                logger.warning(
+                    "Skipping stale signal_pending_allocation_op for unregistered pipeline %r "
+                    "(cluster_id=%r); unregister_pipeline already cleaned up",
+                    pipeline_id, op.cluster_id,
+                )
+                continue
             if not self._has_pending_request_locked(cluster_id=op.cluster_id, priority=priority):
                 raise RuntimeError(f"Planned allocation has no pending waiter: cluster_id={op.cluster_id!r} priority={priority!r}")
             gpu_set = set(op.gpus_to_allocate)
-            pipeline_id, cluster_name = parse_cluster_id(op.cluster_id)
-            tp_size = int(self._state.pipeline_registry[pipeline_id]["cluster_configs"][cluster_name].get("tp_size", 1))
+            tp_size = op.tp_size
             sorted_gpus = sorted(op.gpus_to_allocate)
             dp_rank_to_gpus = build_dp_rank_mapping(sorted_gpus, tp_size)
             active_dp_ranks = set(dp_rank_to_gpus.keys()) if is_generation_cluster(op.cluster_id) else set()
@@ -2557,7 +2578,16 @@ class SchedulerImpl:
                 continue
             gpu_set = set(op.gpus_to_allocate)
             pipeline_id, _ = parse_cluster_id(op.cluster_id)
-            tp_size = int(self._state.pipeline_registry[pipeline_id]["cluster_configs"]["actor_infer"].get("tp_size", 1))
+            # Stale-plan tolerance: if unregister_pipeline ran during the lock gap,
+            # the pipeline is gone and GPUs were already returned to idle.
+            if pipeline_id not in self._state.pipeline_registry:
+                logger.warning(
+                    "Skipping stale sched_guided_allocation_op for unregistered pipeline %r "
+                    "(cluster_id=%r); unregister_pipeline already cleaned up",
+                    pipeline_id, op.cluster_id,
+                )
+                continue
+            tp_size = op.tp_size
             sorted_needed = sorted(op.gpus_to_allocate)
             dp_rank_to_gpus_to_add = {
                 dp_rank: sorted_needed[i * tp_size : (i + 1) * tp_size]

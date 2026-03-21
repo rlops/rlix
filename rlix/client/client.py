@@ -43,7 +43,12 @@ def connect(
         Ray actor handle for the orchestrator.
     """
     if not ray.is_initialized():
-        ray.init(address=address, namespace=RLIX_NAMESPACE, ignore_reinit_error=True, log_to_driver=True)
+        from rlix.utils.env import thread_limit_env_vars
+        ray.init(
+            address=address, namespace=RLIX_NAMESPACE,
+            ignore_reinit_error=True, log_to_driver=True,
+            runtime_env={"env_vars": thread_limit_env_vars()},
+        )
 
     opts = ConnectOptions(address=address, create_if_missing=create_if_missing, env_vars=env_vars)
     return _get_or_create_orchestrator(opts)

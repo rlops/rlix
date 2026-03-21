@@ -22,6 +22,21 @@ from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
 from rlix.pipeline import COORDINATOR_MAX_CONCURRENCY
 from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, RLIX_NAMESPACE
+from rlix.utils.env import pipeline_identity_env_vars, thread_limit_env_vars
+
+
+def _set_launcher_logging_env(*, config_names: List[str]) -> str:
+    """Pin the launcher process to one stable log directory.
+
+    Pipeline configs mutate process env during config parsing, including ROLL_LOG_DIR.
+    In a multi-pipeline launcher, that can cause the shared driver logger to keep
+    rebinding to the most recently parsed pipeline's log directory. We give the
+    launcher its own fixed log target and restore it after each config compose.
+    """
+    launcher_name = "__".join(config_names) if config_names else "launcher"
+    launcher_log_dir = str((Path("./output/multi_pipeline_driver/logs") / launcher_name).resolve())
+    os.environ["ROLL_LOG_DIR"] = launcher_log_dir
+    return launcher_log_dir
 
 
 def _resolve_hydra_config_path(arg_config_path: str) -> tuple[str, Path]:
@@ -112,29 +127,14 @@ def main() -> None:
     if not config_names:
         raise ValueError("--config_name must be non-empty")
 
-    # Initialize a local Ray runtime if one is not already running.
-    _grpc_pool = os.environ.get("RAY_num_server_call_thread", "4")
-    _omp = os.environ.get("OMP_NUM_THREADS", "1")
-    print(f"[ENV] RAY_num_server_call_thread={_grpc_pool}")
-    print(f"[ENV] OMP_NUM_THREADS={_omp}")
-    if not ray.is_initialized():
-        # Pass thread-limiting vars as the Ray-side global default runtime_env.
-        ray.init(
-            namespace=RLIX_NAMESPACE,
-            ignore_reinit_error=True,
-            log_to_driver=True,
-            runtime_env={"env_vars": {
-                "OMP_NUM_THREADS": _omp,
-                "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
-                "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
-                "RAY_num_server_call_thread": _grpc_pool,
-            }},
-        )
+    launcher_log_dir = _set_launcher_logging_env(config_names=config_names)
 
     hydra_config_path, _ = _resolve_hydra_config_path(arg_config_path=args.config_path)
     GlobalHydra.instance().clear()
     initialize(config_path=hydra_config_path, job_name="rlix_multi_pipeline", version_base=None)
 
+    # Parse all configs before ray.init() so that BaseConfig.__post_init__ sets
+    # env vars (e.g. MODEL_DOWNLOAD_TYPE) that Ray workers will inherit.
     pipeline_configs: List[AgenticConfig] = []
     for idx, cn in enumerate(config_names, start=1):
         cfg = compose(config_name=cn)
@@ -153,11 +153,29 @@ def main() -> None:
         if args.print_config or os.environ.get("ROLL_PRINT_CONFIG", "0") == "1":
             print(OmegaConf.to_yaml(cfg, resolve=True))
 
+        pipeline_cls_path = getattr(cfg, "pipeline_cls", None)
         pipeline_config = from_dict(
             data_class=AgenticConfig,
             data=OmegaConf.to_container(cfg, resolve=True),
         )
+        if pipeline_cls_path:
+            pipeline_config.pipeline_cls = pipeline_cls_path
         pipeline_configs.append(pipeline_config)
+
+        # Config parsing mutates process-global logging env (for example ROLL_LOG_DIR).
+        # Restore the launcher's fixed log target before parsing the next config and before
+        # the shared driver starts orchestrating all pipelines.
+        os.environ["ROLL_LOG_DIR"] = launcher_log_dir
+
+    # Initialize a local Ray runtime if one is not already running.
+    _thread_env = thread_limit_env_vars()
+    if not ray.is_initialized():
+        ray.init(
+            namespace=RLIX_NAMESPACE,
+            ignore_reinit_error=True,
+            log_to_driver=True,
+            runtime_env={"env_vars": _thread_env},
+        )
 
     # Ensure RLix control plane is up (creates orchestrator + scheduler actors).
     orchestrator = rlix.init(create_if_missing=True)
@@ -199,20 +217,10 @@ def main() -> None:
             max_restarts=0,
             max_task_retries=0,
             max_concurrency=COORDINATOR_MAX_CONCURRENCY,
-            # Inject per-pipeline namespace + control-plane contract for this pipeline actor.
-            runtime_env={
-                "env_vars": {
-                    "PIPELINE_ID": str(pipeline_id),
-                    "ROLL_RAY_NAMESPACE": ray_namespace,
-                    "RLIX_CONTROL_PLANE": "rlix",
-                    # Propagate thread-limiting vars so coordinator + pipeline actors
-                    # stay within container pids.max.
-                    "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
-                    "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
-                    "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
-                    "RAY_num_server_call_thread": os.environ.get("RAY_num_server_call_thread", "4"),
-                }
-            },
+            runtime_env={"env_vars": {
+                **pipeline_identity_env_vars(pipeline_id=str(pipeline_id), ray_namespace=ray_namespace),
+                **thread_limit_env_vars(),
+            }},
         ).remote(
             pipeline_id=pipeline_id,
             pipeline_config=pipeline_config,

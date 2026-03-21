@@ -22,7 +22,7 @@ from rlix.protocol.types import (
     get_pipeline_namespace,
 )
 from rlix.protocol.validation import validate_pipeline_id
-from rlix.utils.env import parse_env_timeout_s
+from rlix.utils.env import parse_env_timeout_s, pipeline_identity_env_vars, thread_limit_env_vars
 from rlix.utils.ray import get_actor_or_raise
 
 _T = TypeVar("_T")
@@ -55,43 +55,18 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     # installed via pip are automatically available without PYTHONPATH.
 
     env_vars = {
-        # Pipeline identity — associates workers/actors with this pipeline.
-        "PIPELINE_ID": pipeline_id,
-        # Ray namespace for this pipeline's actors; isolates named actors across concurrent pipelines.
-        "ROLL_RAY_NAMESPACE": ray_namespace,
-        # Mode switch: tells ROLL to run under the RLix control plane instead of standalone.
-        "RLIX_CONTROL_PLANE": "rlix",
+        **pipeline_identity_env_vars(pipeline_id=pipeline_id, ray_namespace=ray_namespace),
+        **thread_limit_env_vars(),
         # --- Shared weights/cache (big, reusable across pipelines) ---
-        # Root for all Hugging Face local state (cache, tokens, configs).
         "HF_HOME": f"{shared_root}/hf",
-        # Preferred Hugging Face Hub cache path for downloaded repos/snapshots.
         "HF_HUB_CACHE": f"{shared_root}/hf/hub",
-        # Legacy compatibility alias; prefer HF_HUB_CACHE in new code.
         "HUGGINGFACE_HUB_CACHE": f"{shared_root}/hf/hub",
-        # Legacy Transformers cache variable retained for compatibility.
-        # Modern Hugging Face cache configuration should prefer HF_HOME / HF_HUB_CACHE.
         "TRANSFORMERS_CACHE": f"{shared_root}/hf/transformers",
-        # Cache for the datasets library (downloaded + processed dataset artifacts).
         "HF_DATASETS_CACHE": f"{shared_root}/hf/datasets",
         # --- Job/pipeline-scoped scratch (write-hot / collision-prone) ---
-        # Cache for auto-mapped remote-code modules (read by mcore_adapter).
-        # Per-pipeline to avoid write collisions when concurrent pipelines load different model code.
         "HUGGINGFACE_AUTOMAP_CACHE": f"{scratch_root}/hf/automap",
-        # Root directory for vLLM cache files.
-        # Isolated per pipeline to reduce contention between concurrent runs.
         "VLLM_CACHE_ROOT": f"{scratch_root}/vllm",
-        # FlashInfer runtime workspace directory. Isolated per pipeline for the same
-        # write-contention reasons as VLLM_CACHE_ROOT.
         "FLASHINFER_WORKSPACE_DIR": f"{scratch_root}/flashinfer",
-        # --- Thread limits (prevent hitting container pids.max) ---
-        # Read from env so shell export overrides; defaults are safe minimums for
-        # multi-pipeline deployments with many co-tenant worker processes per node.
-        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
-        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
-        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
-        # Ray server-call thread setting (num_server_call_thread in Ray config).
-        # Lower values help bound per-process thread count in high-actor deployments.
-        "RAY_num_server_call_thread": os.environ.get("RAY_num_server_call_thread", "4"),
     }
     logger.info(
         "[_build_pipeline_env_vars] pid=%d pipeline_id=%s OMP_NUM_THREADS=%s RAY_num_server_call_thread=%s",

@@ -60,14 +60,14 @@ def validate_register_pipeline(inp: RegisterValidationInput) -> None:
     if set(inp.cluster_tp_configs.keys()) != set(inp.cluster_device_mappings.keys()):
         missing_tp = sorted(set(inp.cluster_device_mappings.keys()) - set(inp.cluster_tp_configs.keys()))
         missing_map = sorted(set(inp.cluster_tp_configs.keys()) - set(inp.cluster_device_mappings.keys()))
-        raise ValueError(f"cluster config mismatch: missing tp_size for {missing_tp}, missing device_mapping for {missing_map}")
+        raise ValueError(
+            f"cluster config mismatch: missing tp_size for {missing_tp}, missing device_mapping for {missing_map}"
+        )
 
     # --- Per-cluster checks ---
     for cluster_name, tp_size_raw in inp.cluster_tp_configs.items():
         if cluster_name not in ALL_CLUSTER_NAMES:
-            raise ValueError(
-                f"Unknown cluster name {cluster_name!r}. Must be one of {sorted(ALL_CLUSTER_NAMES)!r}."
-            )
+            raise ValueError(f"Unknown cluster name {cluster_name!r}. Must be one of {sorted(ALL_CLUSTER_NAMES)!r}.")
         # Coerce to int to handle numeric strings; fail fast on non-numeric values.
         try:
             tp_size = int(tp_size_raw)
@@ -91,7 +91,9 @@ def validate_register_pipeline(inp: RegisterValidationInput) -> None:
 
         for gpu in device_mapping:
             if not isinstance(gpu, int):
-                raise ValueError(f"device_mapping must be list[int] for cluster {cluster_name!r}, got {type(gpu).__name__}")
+                raise ValueError(
+                    f"device_mapping must be list[int] for cluster {cluster_name!r}, got {type(gpu).__name__}"
+                )
 
         # GPUs must split evenly into DP workers — each worker gets exactly tp_size GPUs
         # for tensor parallelism.

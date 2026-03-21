@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
+
+import ray
 
 from rlix.orchestrator.orchestrator import Orchestrator
 from rlix.protocol.types import ORCHESTRATOR_ACTOR_NAME, RLIX_NAMESPACE
 from rlix.utils.ray import head_node_affinity_strategy
-import ray
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +26,7 @@ def connect(
     create_if_missing: bool = True,
     address: str = "auto",
     env_vars: Optional[dict[str, str]] = None,
-):
+) -> Any:
     """Initialize Ray and return the Rlix orchestrator actor handle.
 
     Exported as ``rlix.init()``. Initializes Ray if not already connected,
@@ -48,7 +49,7 @@ def connect(
     return _get_or_create_orchestrator(opts)
 
 
-def _get_or_create_orchestrator(opts: ConnectOptions):
+def _get_or_create_orchestrator(opts: ConnectOptions) -> Any:
     try:
         return ray.get_actor(ORCHESTRATOR_ACTOR_NAME, namespace=RLIX_NAMESPACE)
     except ValueError:

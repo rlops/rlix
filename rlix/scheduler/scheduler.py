@@ -146,7 +146,7 @@ class SchedulerImpl:
     _lock: asyncio.Lock = field(init=False)
     _wakeup_event: asyncio.Event = field(init=False)
     _topology_ready: asyncio.Event = field(init=False)
-    _loop_task: Optional[asyncio.Task] = field(init=False)
+    _loop_task: Optional[asyncio.Task[None]] = field(init=False)
     _resource_manager: Any = field(init=False)
     _cycle_counter: int = field(init=False)
     _request_seq: int = field(init=False)
@@ -165,7 +165,7 @@ class SchedulerImpl:
         self._lock = asyncio.Lock()
         self._wakeup_event = asyncio.Event()
         self._topology_ready = asyncio.Event()
-        self._loop_task: Optional[asyncio.Task] = None
+        self._loop_task: Optional[asyncio.Task[None]] = None
         self._resource_manager = None
         self._cycle_counter = 0
         self._request_seq = 0
@@ -475,7 +475,7 @@ class SchedulerImpl:
                     cluster_name=cluster_name,
                     tp_size=tp_size,
                     device_mapping=device_mapping,
-                    required_gpus_per_node=int(self._required_gpus_per_node),
+                    required_gpus_per_node=int(self._required_gpus_per_node or 0),
                 )
             is_gen = cluster_name == GENERATION_CLUSTER_NAME
             cfg: Dict[str, Any] = {"tp_size": tp_size, "is_generation": is_gen, "device_mapping": device_mapping}
@@ -1038,8 +1038,8 @@ class SchedulerImpl:
                                 )
                                 active_ranks = sorted(donor_alloc.active_dp_ranks)
                                 for dp_rank in active_ranks:
-                                    bundle = set(donor_alloc.dp_rank_to_gpus.get(dp_rank) or [])
-                                    if not (bundle & missing):
+                                    donor_bundle: Set[int] = set(donor_alloc.dp_rank_to_gpus.get(dp_rank) or [])
+                                    if not (donor_bundle & missing):
                                         continue
                                     # Track whether this dp_rank was already freed for a prior
                                     # allocation in this cycle. Re-adding to planned_available would
@@ -1060,9 +1060,9 @@ class SchedulerImpl:
                                         )
                                     if not already_in_shrink:
                                         # Newly freed: make the GPU available for planning.
-                                        planned_available_gpus |= bundle
+                                        planned_available_gpus |= donor_bundle
                                     # Only subtract GPUs that are actually still unclaimed.
-                                    missing -= bundle & planned_available_gpus
+                                    missing -= donor_bundle & planned_available_gpus
                                     if not missing:
                                         break
                                 if not missing:
@@ -1328,10 +1328,10 @@ class SchedulerImpl:
             for r in dp_ranks:
                 s.add(int(r))
 
-        for op in plan.sched_guided_shrink_ops:
-            _add_remove(op.cluster_id, list(op.dp_ranks_to_remove))
-        for op in plan.sched_guided_allocation_ops:
-            _add_add(op.cluster_id, list(op.dp_ranks_to_add))
+        for shrink_op in plan.sched_guided_shrink_ops:
+            _add_remove(shrink_op.cluster_id, list(shrink_op.dp_ranks_to_remove))
+        for alloc_op in plan.sched_guided_allocation_ops:
+            _add_add(alloc_op.cluster_id, list(alloc_op.dp_ranks_to_add))
 
         calls: List[Tuple[Any, List[int], List[int]]] = []
         for pipeline_id in sorted(set(pipeline_to_remove.keys()) | set(pipeline_to_add.keys())):
@@ -1428,16 +1428,16 @@ class SchedulerImpl:
 
         # GPU Tracing: shrink/remove trace closes already happened in _execute_resize_calls
         # (right after shrink RPCs completed). Only state mutations happen here.
-        for op in plan.sched_guided_shrink_ops:
-            if not op.dp_ranks_to_remove:
+        for shrink_op in plan.sched_guided_shrink_ops:
+            if not shrink_op.dp_ranks_to_remove:
                 continue
-            alloc = self._state.active_allocations.get(op.cluster_id)
+            alloc = self._state.active_allocations.get(shrink_op.cluster_id)
             if alloc is None:
                 continue
-            for dp_rank in op.dp_ranks_to_remove:
+            for dp_rank in shrink_op.dp_ranks_to_remove:
                 bundle = set(alloc.dp_rank_to_gpus.get(dp_rank) or [])
                 if not bundle:
-                    bundle = self._reconstruct_bundle_for_dp_rank(cluster_id=op.cluster_id, dp_rank=dp_rank)
+                    bundle = self._reconstruct_bundle_for_dp_rank(cluster_id=shrink_op.cluster_id, dp_rank=dp_rank)
                 alloc.active_dp_ranks.discard(dp_rank)
                 alloc.dp_rank_to_gpus.pop(dp_rank, None)
                 alloc.gpu_ids = [g for g in alloc.gpu_ids if g not in bundle]
@@ -1448,7 +1448,7 @@ class SchedulerImpl:
                 # Collect shrink detail for execution marker
                 exec_shrinks.append(
                     {
-                        "cluster_id": op.cluster_id,
+                        "cluster_id": shrink_op.cluster_id,
                         "gpus_freed": sorted(bundle),
                         "dp_rank": dp_rank,
                     }
@@ -1470,77 +1470,79 @@ class SchedulerImpl:
                 )
 
         # Apply allocations.
-        for op in plan.signal_pending_allocation_ops:
-            if not op.gpus_to_allocate:
-                if op.priority is None:
+        for signal_op in plan.signal_pending_allocation_ops:
+            if not signal_op.gpus_to_allocate:
+                if signal_op.priority is None:
                     raise RuntimeError(
-                        f"signal_pending_allocation_ops missing priority for cluster_id={op.cluster_id!r}"
+                        f"signal_pending_allocation_ops missing priority for cluster_id={signal_op.cluster_id!r}"
                     )
-                priority = Priority(op.priority)
-                existing = self._state.active_allocations.get(op.cluster_id)
+                priority = Priority(signal_op.priority)
+                existing = self._state.active_allocations.get(signal_op.cluster_id)
                 # If this is a wake-only signal (no new GPUs needed), return the existing allocation
                 # so callers don't misinterpret [] as "no allocation".
                 if existing is not None and existing.priority == priority and existing.gpu_ids:
                     self._signal_pending_request(
-                        cluster_id=op.cluster_id, priority=priority, result=list(existing.gpu_ids)
+                        cluster_id=signal_op.cluster_id, priority=priority, result=list(existing.gpu_ids)
                     )
                 else:
-                    self._signal_pending_request(cluster_id=op.cluster_id, priority=priority, result=[])
+                    self._signal_pending_request(cluster_id=signal_op.cluster_id, priority=priority, result=[])
                 continue
-            if op.priority is None:
-                raise RuntimeError(f"signal_pending_allocation_ops missing priority for cluster_id={op.cluster_id!r}")
-            priority = Priority(op.priority)
-            pipeline_id, _ = parse_cluster_id(op.cluster_id)
+            if signal_op.priority is None:
+                raise RuntimeError(
+                    f"signal_pending_allocation_ops missing priority for cluster_id={signal_op.cluster_id!r}"
+                )
+            priority = Priority(signal_op.priority)
+            pipeline_id, _ = parse_cluster_id(signal_op.cluster_id)
             # Stale-plan tolerance: if unregister_pipeline ran during the lock gap,
             # the pipeline is gone and its waiters are already cleaned up.
             if pipeline_id not in self._state.pipeline_registry:
-                if self._has_pending_request_locked(cluster_id=op.cluster_id, priority=priority):
+                if self._has_pending_request_locked(cluster_id=signal_op.cluster_id, priority=priority):
                     raise RuntimeError(
                         f"Pipeline {pipeline_id!r} removed from registry but pending waiter still present "
-                        f"for cluster_id={op.cluster_id!r} — cleanup corruption"
+                        f"for cluster_id={signal_op.cluster_id!r} — cleanup corruption"
                     )
                 logger.warning(
                     "Skipping stale signal_pending_allocation_op for unregistered pipeline %r "
                     "(cluster_id=%r); unregister_pipeline already cleaned up",
                     pipeline_id,
-                    op.cluster_id,
+                    signal_op.cluster_id,
                 )
                 continue
-            if not self._has_pending_request_locked(cluster_id=op.cluster_id, priority=priority):
+            if not self._has_pending_request_locked(cluster_id=signal_op.cluster_id, priority=priority):
                 raise RuntimeError(
-                    f"Planned allocation has no pending waiter: cluster_id={op.cluster_id!r} priority={priority!r}"
+                    f"Planned allocation has no pending waiter: cluster_id={signal_op.cluster_id!r} priority={priority!r}"
                 )
-            gpu_set = set(op.gpus_to_allocate)
-            tp_size = op.tp_size
-            sorted_gpus = sorted(op.gpus_to_allocate)
+            gpu_set = set(signal_op.gpus_to_allocate)
+            tp_size = signal_op.tp_size
+            sorted_gpus = sorted(signal_op.gpus_to_allocate)
             dp_rank_to_gpus = build_dp_rank_mapping(sorted_gpus, tp_size)
-            active_dp_ranks = set(dp_rank_to_gpus.keys()) if is_generation_cluster(op.cluster_id) else set()
+            active_dp_ranks = set(dp_rank_to_gpus.keys()) if is_generation_cluster(signal_op.cluster_id) else set()
             allocation = ClusterAllocation(
-                cluster_id=op.cluster_id,
+                cluster_id=signal_op.cluster_id,
                 gpu_ids=sorted_gpus,
                 priority=priority,
                 active_dp_ranks=active_dp_ranks,
                 dp_rank_to_gpus=dp_rank_to_gpus,
             )
             self._state.idle_gpus -= gpu_set
-            self._state.active_allocations[op.cluster_id] = allocation
+            self._state.active_allocations[signal_op.cluster_id] = allocation
             self._tracer.trace_active_gpus_update(num_gpus=self._num_gpus, idle_gpu_count=len(self._state.idle_gpus))
             # GPU Tracing: Start traces for initial allocation
             if self._tracer.enabled:
                 # lora_name was stamped onto the op at planning time (from PendingRequest.lora_name),
                 # so no bucket search is needed here.
-                lora_name = op.lora_name
+                lora_name = signal_op.lora_name
                 for gpu_id in sorted_gpus:
                     # Extract DP rank for generation clusters
-                    dp_ranks = None
-                    if is_generation_cluster(op.cluster_id):
-                        for dp_rank, bundle in dp_rank_to_gpus.items():
-                            if gpu_id in bundle:
+                    dp_ranks: Optional[List[int]] = None
+                    if is_generation_cluster(signal_op.cluster_id):
+                        for dp_rank, gpu_bundle in dp_rank_to_gpus.items():
+                            if gpu_id in gpu_bundle:
                                 dp_ranks = [dp_rank]
                                 break
                     self._tracer.start_gpu_trace(
                         gpu_id,
-                        op.cluster_id,
+                        signal_op.cluster_id,
                         pipeline_id,
                         priority,
                         "initial",
@@ -1550,13 +1552,13 @@ class SchedulerImpl:
                         cycle_counter=self._cycle_counter,
                     )
             self._signal_pending_request(
-                cluster_id=op.cluster_id, priority=priority, result=sorted(op.gpus_to_allocate)
+                cluster_id=signal_op.cluster_id, priority=priority, result=sorted(signal_op.gpus_to_allocate)
             )
             # Collect allocate detail for execution marker
             exec_allocates.append(
                 {
-                    "cluster_id": op.cluster_id,
-                    "gpus_allocated": sorted(op.gpus_to_allocate),
+                    "cluster_id": signal_op.cluster_id,
+                    "gpus_allocated": sorted(signal_op.gpus_to_allocate),
                     "priority": priority.name,
                 }
             )
@@ -1566,11 +1568,11 @@ class SchedulerImpl:
         # the case where signal_pending_allocation_ops already consumed the pending request, or
         # multiple ops target the same cluster (merged by _try_activate_one but guarded here too).
         cluster_ids_to_signal: Set[str] = set()
-        for op in plan.sched_guided_allocation_ops:
-            if not op.gpus_to_allocate:
+        for alloc_op in plan.sched_guided_allocation_ops:
+            if not alloc_op.gpus_to_allocate:
                 continue
-            gpu_set = set(op.gpus_to_allocate)
-            pipeline_id, _ = parse_cluster_id(op.cluster_id)
+            gpu_set = set(alloc_op.gpus_to_allocate)
+            pipeline_id, _ = parse_cluster_id(alloc_op.cluster_id)
             # Stale-plan tolerance: if unregister_pipeline ran during the lock gap,
             # the pipeline is gone and GPUs were already returned to idle.
             if pipeline_id not in self._state.pipeline_registry:
@@ -1578,26 +1580,26 @@ class SchedulerImpl:
                     "Skipping stale sched_guided_allocation_op for unregistered pipeline %r "
                     "(cluster_id=%r); unregister_pipeline already cleaned up",
                     pipeline_id,
-                    op.cluster_id,
+                    alloc_op.cluster_id,
                 )
                 continue
-            tp_size = op.tp_size
-            sorted_needed = sorted(op.gpus_to_allocate)
+            tp_size = alloc_op.tp_size
+            sorted_needed = sorted(alloc_op.gpus_to_allocate)
             dp_rank_to_gpus_to_add = {
                 dp_rank: sorted_needed[i * tp_size : (i + 1) * tp_size]
-                for i, dp_rank in enumerate(sorted(op.dp_ranks_to_add))
+                for i, dp_rank in enumerate(sorted(alloc_op.dp_ranks_to_add))
             }
-            alloc = self._state.active_allocations.get(op.cluster_id)
+            alloc = self._state.active_allocations.get(alloc_op.cluster_id)
             if alloc is None:
                 updated_alloc = ClusterAllocation(
-                    cluster_id=op.cluster_id,
+                    cluster_id=alloc_op.cluster_id,
                     gpu_ids=sorted_needed,
                     priority=Priority.GENERATION,
                     active_dp_ranks=set(dp_rank_to_gpus_to_add.keys()),
                     dp_rank_to_gpus=dict(dp_rank_to_gpus_to_add),
                 )
                 self._state.idle_gpus -= gpu_set
-                self._state.active_allocations[op.cluster_id] = updated_alloc
+                self._state.active_allocations[alloc_op.cluster_id] = updated_alloc
             else:
                 updated_dp_rank_to_gpus = dict(alloc.dp_rank_to_gpus)
                 updated_dp_rank_to_gpus.update(dp_rank_to_gpus_to_add)
@@ -1610,14 +1612,14 @@ class SchedulerImpl:
             self._tracer.trace_active_gpus_update(num_gpus=self._num_gpus, idle_gpu_count=len(self._state.idle_gpus))
             # GPU Tracing: proactive expand trace opens already happened in _execute_resize_calls
             # (right after expand RPCs completed, before this state commit).
-            if op.has_pending_request:
-                cluster_ids_to_signal.add(op.cluster_id)
+            if alloc_op.has_pending_request:
+                cluster_ids_to_signal.add(alloc_op.cluster_id)
             # Collect expand detail for execution marker
             exec_expands.append(
                 {
-                    "cluster_id": op.cluster_id,
-                    "gpus_allocated": sorted(op.gpus_to_allocate),
-                    "dp_ranks_added": sorted(op.dp_ranks_to_add),
+                    "cluster_id": alloc_op.cluster_id,
+                    "gpus_allocated": sorted(alloc_op.gpus_to_allocate),
+                    "dp_ranks_added": sorted(alloc_op.dp_ranks_to_add),
                 }
             )
         for cluster_id in cluster_ids_to_signal:
@@ -1739,6 +1741,6 @@ class SchedulerImpl:
             raise RuntimeError(req.error)
 
 
-def scheduler_actor_class():
+def scheduler_actor_class() -> Any:
     """Return a Ray remote actor class wrapping ``SchedulerImpl`` with no restarts."""
     return ray.remote(max_restarts=0, max_task_retries=0)(SchedulerImpl)

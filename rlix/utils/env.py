@@ -4,7 +4,7 @@ import os
 from typing import Optional
 
 
-def parse_env_timeout_s(env_key: str, default_s: float) -> Optional[float]:
+def parse_env_timeout_s(env_key: str, default_s: Optional[float] = None) -> Optional[float]:
     """Read a timeout in seconds from an env var; fail-fast on invalid values.
 
     Returns *default_s* when the env var is unset.  Returns ``None`` when the

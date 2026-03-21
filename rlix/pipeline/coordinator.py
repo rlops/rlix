@@ -1,30 +1,31 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, TypeVar
 
 import ray
 
-from rlix.protocol.coordinator import Coordinator
-from rlix.protocol.validation import validate_pipeline_id
 from rlix.pipeline.utils import validate_resize_params
-from rlix.utils.env import parse_env_timeout_s
+from rlix.protocol.coordinator import Coordinator
 from rlix.protocol.types import (
-    ActionResponse,
     GPU_CLUSTER_NAMES,
-    get_pipeline_namespace,
     PIPELINE_ACTOR_NAME_PREFIX,
-    ProgressReport,
-    SCHEDULER_ACTOR_NAME,
     RLIX_NAMESPACE,
+    SCHEDULER_ACTOR_NAME,
+    ActionResponse,
+    ProgressReport,
+    get_pipeline_namespace,
 )
+from rlix.protocol.validation import validate_pipeline_id
+from rlix.utils.env import parse_env_timeout_s
 from rlix.utils.ray import get_actor_or_raise
 
-import logging
+_T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +95,10 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     }
     logger.info(
         "[_build_pipeline_env_vars] pid=%d pipeline_id=%s OMP_NUM_THREADS=%s RAY_num_server_call_thread=%s",
-        os.getpid(), pipeline_id,
-        env_vars["OMP_NUM_THREADS"], env_vars["RAY_num_server_call_thread"],
+        os.getpid(),
+        pipeline_id,
+        env_vars["OMP_NUM_THREADS"],
+        env_vars["RAY_num_server_call_thread"],
     )
     return env_vars
 
@@ -227,6 +230,7 @@ class PipelineCoordinator(Coordinator):
         # Singleton ResourceManager (rlix:roll_resource_manager) shared across all pipelines.
         # Created before any pipeline actor so placement groups are ready.
         from roll.distributed.scheduler.resource_manager import RollResourceManagerProxy
+
         self._resource_manager_proxy = RollResourceManagerProxy(num_gpus_per_node=pipeline_config.num_gpus_per_node)
         # Pin pipeline actor to node-0's placement group so Ray sets
         # CUDA_VISIBLE_DEVICES (needed for platform detection + checkpoint RNG state).
@@ -255,10 +259,10 @@ class PipelineCoordinator(Coordinator):
         self._coord_progress_last_bucket: Optional[int] = None
         # Resolve rlix scheduler handle for forwarding aggregated progress.
         self._rlix_scheduler = get_actor_or_raise(
-            SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE,
+            SCHEDULER_ACTOR_NAME,
+            RLIX_NAMESPACE,
             error_context="PipelineCoordinator requires the central scheduler actor to exist at startup.",
         )
-
 
     def create_pipeline_actor(self, *, pipeline_config: Any) -> Any:
         """Create and return the per-pipeline Ray actor (full-finetune or multi-LoRA).
@@ -277,6 +281,7 @@ class PipelineCoordinator(Coordinator):
                 "Example: 'pipeline_cls: rlix.pipeline.full_finetune_pipeline.RollFullFinetunePipeline'"
             )
         import importlib
+
         module_path, class_name = pipeline_cls_path.rsplit(".", 1)
         try:
             module = importlib.import_module(module_path)
@@ -293,6 +298,7 @@ class PipelineCoordinator(Coordinator):
         pipeline_config = self._inject_pipeline_env_vars(pipeline_config=pipeline_config)
 
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
         self._pipeline_actor = PipelineActor.options(
             name=f"{PIPELINE_ACTOR_NAME_PREFIX}{self._pipeline_id}",
             namespace=self._ray_namespace,
@@ -428,7 +434,7 @@ class PipelineCoordinator(Coordinator):
         # Fire-and-forget: progress is a background signal; same pattern as existing direct reports.
         self._rlix_scheduler.report_progress.remote(aggregated)
 
-    def _inject_pipeline_env_vars(self, *, pipeline_config: Any) -> Any:
+    def _inject_pipeline_env_vars(self, *, pipeline_config: _T) -> _T:
         """Deep copy pipeline_config and inject env vars into the copy.
 
         Returns a modified deep copy to prevent env var leaks when the same config
@@ -483,7 +489,9 @@ class PipelineCoordinator(Coordinator):
           - Adding a per-sync timeout: NCCL collectives are not cancellable; a timeout
             would leave the communicator in a broken state.
         """
-        acquired = self._resize_sync_lock.acquire(timeout=_RESIZE_LOCK_TIMEOUT_S)
+        acquired = self._resize_sync_lock.acquire(
+            timeout=_RESIZE_LOCK_TIMEOUT_S if _RESIZE_LOCK_TIMEOUT_S is not None else -1
+        )
         if not acquired:
             raise RuntimeError(
                 f"sync_lora_weights timed out waiting for _resize_sync_lock after {_RESIZE_LOCK_TIMEOUT_S}s "
@@ -500,14 +508,19 @@ class PipelineCoordinator(Coordinator):
             if self._model_update_service is None:
                 model_update_service_name = f"{self._pipeline_id}_model_update_service"
                 self._model_update_service = get_actor_or_raise(
-                    model_update_service_name, self._ray_namespace,
+                    model_update_service_name,
+                    self._ray_namespace,
                     error_context=f"ModelUpdateService required for pipeline_id={self._pipeline_id!r}.",
                 )
             model_update_service = self._model_update_service
-            ray.get(model_update_service.sync_selected_workers.remote(
-                active_ranks, adapters_to_sync=list(loras_to_sync),
-                verify=self._verify_model_after_sync,
-            ))
+            assert model_update_service is not None
+            ray.get(
+                model_update_service.sync_selected_workers.remote(
+                    active_ranks,
+                    adapters_to_sync=list(loras_to_sync),
+                    verify=self._verify_model_after_sync,
+                )
+            )
         finally:
             self._resize_sync_lock.release()
 
@@ -528,7 +541,9 @@ class PipelineCoordinator(Coordinator):
         """
         validate_resize_params(dp_ranks_to_remove, dp_ranks_to_add)
 
-        acquired = self._resize_sync_lock.acquire(timeout=_RESIZE_LOCK_TIMEOUT_S)
+        acquired = self._resize_sync_lock.acquire(
+            timeout=_RESIZE_LOCK_TIMEOUT_S if _RESIZE_LOCK_TIMEOUT_S is not None else -1
+        )
         if not acquired:
             raise RuntimeError(
                 f"resize_infer timed out waiting for _resize_sync_lock after {_RESIZE_LOCK_TIMEOUT_S}s "

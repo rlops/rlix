@@ -16,19 +16,18 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional
 
-# Identifies whether a pipeline trains a full model or LoRA adapters.
-# Used as a prefix in pipeline_id for trace readability (e.g., "ft_abc123", "lora_abc123").
-PipelineType = Literal["ft", "lora"]
+import ray
 
-from rlix.protocol.validation import validate_pipeline_id
 from rlix.protocol.types import RLIX_NAMESPACE, SCHEDULER_ACTOR_NAME
-from rlix.protocol.validation import RegisterValidationInput, validate_register_pipeline
+from rlix.protocol.validation import RegisterValidationInput, validate_pipeline_id, validate_register_pipeline
 from rlix.scheduler.resource_manager import get_or_create_resource_manager
 from rlix.scheduler.scheduler import scheduler_actor_class
 from rlix.utils.env import parse_env_timeout_s
-from rlix.utils.ray import get_head_node_id
-from rlix.utils.ray import head_node_affinity_strategy
-import ray
+from rlix.utils.ray import get_head_node_id, head_node_affinity_strategy
+
+# Identifies whether a pipeline trains a full model or LoRA adapters.
+# Used as a prefix in pipeline_id for trace readability (e.g., "ft_abc123", "lora_abc123").
+PipelineType = Literal["ft", "lora"]
 
 # Timeouts for orchestrator operations (seconds).  None means "no timeout".
 _RESOURCE_SNAPSHOT_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_RESOURCE_SNAPSHOT_TIMEOUT_S", 10.0)
@@ -79,17 +78,18 @@ def _kill_local_ray() -> None:
     except Exception as e:
         logger.warning("ray.shutdown() failed: %s", e)
 
-def _kill_ray_on_node(node_ip: str):
+
+def _kill_ray_on_node(node_ip: str) -> ray.ObjectRef[None]:
     """Spawn a one-shot remote task on ``node_ip`` that calls ``_kill_local_ray()``."""
 
     @ray.remote(max_retries=0, max_task_retries=0)
-    def _kill_local_ray_task():
+    def _kill_local_ray_task() -> None:
         _kill_local_ray()
 
     return _kill_local_ray_task.options(resources={f"node:{node_ip}": 0.01}).remote()
 
 
-def _force_stop_cluster_workers_first(*, timeout_s: float = _WORKER_STOP_TIMEOUT_S) -> None:
+def _force_stop_cluster_workers_first(*, timeout_s: Optional[float] = _WORKER_STOP_TIMEOUT_S) -> None:
     """Shut down every Ray worker node, then the head node.
 
     Worker nodes are killed first (in parallel via remote tasks) so that
@@ -111,11 +111,12 @@ def _force_stop_cluster_workers_first(*, timeout_s: float = _WORKER_STOP_TIMEOUT
     if worker_tasks:
         ray.wait(worker_tasks, timeout=timeout_s, num_returns=len(worker_tasks))
 
-    time.sleep(_POST_STOP_SETTLE_S)
+    if _POST_STOP_SETTLE_S is not None:
+        time.sleep(_POST_STOP_SETTLE_S)
     _kill_local_ray()
 
 
-def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None):
+def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None) -> Any:
     """Create (or retrieve) the singleton scheduler actor and initialize it.
 
     Idempotent: ``get_if_exists=True`` means concurrent callers converge on
@@ -142,7 +143,11 @@ def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None):
         resource_manager = get_or_create_resource_manager()
         # Admission control / topology gating happens here (orchestrator-owned).
         # Scheduler only seeds its idle_gpus from the resource manager after this is ready.
-        ray.get(resource_manager.snapshot.remote(wait_timeout_s=_RESOURCE_SNAPSHOT_TIMEOUT_S, poll_interval_s=_RESOURCE_SNAPSHOT_POLL_S))
+        ray.get(
+            resource_manager.snapshot.remote(
+                wait_timeout_s=_RESOURCE_SNAPSHOT_TIMEOUT_S, poll_interval_s=_RESOURCE_SNAPSHOT_POLL_S
+            )
+        )
         # Default: infer GPUs-per-node from Ray topology (portable for local smoke tests).
         # If set, this env var pins a stricter topology contract and must match observation.
         required_gpus_per_node_raw = os.environ.get("RLIX_REQUIRED_GPUS_PER_NODE")
@@ -156,16 +161,12 @@ def _ensure_scheduler_singleton(env_vars: Optional[Dict[str, str]] = None):
                     f"Invalid RLIX_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected int"
                 ) from e
             if required_gpus_per_node <= 0:
-                raise RuntimeError(
-                    f"Invalid RLIX_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected > 0"
-                )
+                raise RuntimeError(f"Invalid RLIX_REQUIRED_GPUS_PER_NODE={required_gpus_per_node_raw!r}, expected > 0")
         ray.get(resource_manager.init_topology.remote(required_gpus_per_node=required_gpus_per_node))
         ray.get(scheduler.initialize.remote(resource_manager=resource_manager))
     except Exception as e:
         raise RuntimeError("Failed to initialize Rlix scheduler actor") from e
     return scheduler
-
-
 
 
 class Orchestrator:
@@ -309,7 +310,7 @@ class Orchestrator:
                 return obj.get(key, default)
             return default
 
-        def _list_alive_actors(*, name_filter: Optional[str] = None):
+        def _list_alive_actors(*, name_filter: Optional[str] = None) -> list[Any]:
             filters = [("ray_namespace", "=", ray_namespace)]
             if name_filter is not None:
                 filters.append(("name", "=", name_filter))
@@ -340,24 +341,31 @@ class Orchestrator:
         if kill_lookup_failures or kill_failures:
             logger.warning(
                 "kill_pipeline(namespace=%r) had %d actor lookup failures and %d ray.kill failures for pipeline_id=%r",
-                ray_namespace, kill_lookup_failures, kill_failures, pipeline_id,
+                ray_namespace,
+                kill_lookup_failures,
+                kill_failures,
+                pipeline_id,
             )
 
         # Step 4: Wait for unnamed actors to exit; force-kill via internal APIs as last resort.
-        deadline = time.time() + _UNNAMED_ACTOR_CLEANUP_TIMEOUT_S
+        if _UNNAMED_ACTOR_CLEANUP_TIMEOUT_S is None:
+            deadline = None
+        else:
+            deadline = time.time() + _UNNAMED_ACTOR_CLEANUP_TIMEOUT_S
         while True:
             unnamed_alive = _list_alive_actors(name_filter="")
             if not unnamed_alive:
                 break
-            if time.time() >= deadline:
+            if deadline is not None and time.time() >= deadline:
                 break
-            time.sleep(_POST_STOP_SETTLE_S)
+            if _POST_STOP_SETTLE_S is not None:
+                time.sleep(_POST_STOP_SETTLE_S)
 
         unnamed_alive = _list_alive_actors(name_filter="")
         if unnamed_alive:
             # Nuclear option: use internal Ray APIs to kill by ActorID.
             try:
-                from ray._raylet import ActorID  # type: ignore
+                from ray._raylet import ActorID
             except Exception as e:
                 raise RuntimeError(
                     f"Found {len(unnamed_alive)} unnamed ALIVE actors in namespace {ray_namespace!r} but cannot import ActorID"
@@ -367,7 +375,8 @@ class Orchestrator:
                 "Found %d unnamed ALIVE actors in namespace %r; "
                 "using internal core_worker.get_actor_handle(...) to force kill them. "
                 "These actors should be named (or their handles retained) to avoid relying on Ray internals.",
-                len(unnamed_alive), ray_namespace,
+                len(unnamed_alive),
+                ray_namespace,
             )
             for s in unnamed_alive:
                 actor_id_hex = _attr(s, "actor_id")
@@ -402,9 +411,13 @@ class Orchestrator:
         Idempotent: subsequent calls after the first are no-ops.
         """
         import traceback
+
         logger.info(
             "orchestrator.shutdown called: force=%r reason=%r source=%r\n%s",
-            force, reason, source, "".join(traceback.format_stack()),
+            force,
+            reason,
+            source,
+            "".join(traceback.format_stack()),
         )
         if self._shutdown_started:
             return

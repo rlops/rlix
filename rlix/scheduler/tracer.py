@@ -185,7 +185,9 @@ class SchedulerTracer:
         _, result = self.safe_trace_call(func, *args, **kwargs)
         return result
 
-    def get_or_create_gpu_track(self, gpu_id: int, *, required_gpus_per_node: Optional[int]) -> Optional["NormalTrack"]:
+    def get_or_create_gpu_track(
+        self, gpu_id: int, *, required_gpus_per_node: Optional[int]
+    ) -> Optional["NormalTrack"]:
         """Get existing track or create new one. Returns None on failure."""
         if gpu_id in self._gpu_tracks:
             return self._gpu_tracks[gpu_id]

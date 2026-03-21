@@ -19,10 +19,24 @@ ROLL_RESOURCE_MANAGER_ACTOR_NAME: str = "rlix:roll_resource_manager"
 # Cluster name constants.
 # "reward" is CPU-only: valid in registration configs but never appears in cluster_ids
 # or GPU scheduling.
+ACTOR_TRAIN_CLUSTER_NAME: str = "actor_train"
 GENERATION_CLUSTER_NAME: str = "actor_infer"
+CRITIC_CLUSTER_NAME: str = "critic"
+REFERENCE_CLUSTER_NAME: str = "reference"
 REWARD_CLUSTER_NAME: str = "reward"
-ALL_CLUSTER_NAMES: tuple[str, ...] = ("actor_train", GENERATION_CLUSTER_NAME, "critic", "reference", REWARD_CLUSTER_NAME)
-GPU_CLUSTER_NAMES: tuple[str, ...] = ("actor_train", GENERATION_CLUSTER_NAME, "critic", "reference")
+ALL_CLUSTER_NAMES: tuple[str, ...] = (
+    ACTOR_TRAIN_CLUSTER_NAME,
+    GENERATION_CLUSTER_NAME,
+    CRITIC_CLUSTER_NAME,
+    REFERENCE_CLUSTER_NAME,
+    REWARD_CLUSTER_NAME,
+)
+GPU_CLUSTER_NAMES: tuple[str, ...] = (
+    ACTOR_TRAIN_CLUSTER_NAME,
+    GENERATION_CLUSTER_NAME,
+    CRITIC_CLUSTER_NAME,
+    REFERENCE_CLUSTER_NAME,
+)
 
 
 def get_pipeline_namespace(pipeline_id: str) -> str:

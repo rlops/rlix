@@ -3,6 +3,7 @@
 Defines the data structures used within the scheduler's planning and execution loop:
 request/response types, execution plan operations, and cluster_id parsing.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -10,8 +11,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-from rlix.protocol.validation import validate_pipeline_id
 from rlix.protocol.types import GENERATION_CLUSTER_NAME, GPU_CLUSTER_NAMES, Priority
+from rlix.protocol.validation import validate_pipeline_id
 
 
 @dataclass(slots=True)
@@ -89,6 +90,7 @@ class SchedGuidedAllocationOp:
 @dataclass(slots=True)
 class ExecutionPlan:
     """The complete set of operations for one scheduling cycle."""
+
     sched_guided_shrink_ops: List[SchedGuidedShrinkOp] = field(default_factory=list)
     signal_pending_allocation_ops: List[SignalPendingAllocationOp] = field(default_factory=list)
     sched_guided_allocation_ops: List[SchedGuidedAllocationOp] = field(default_factory=list)
@@ -127,6 +129,7 @@ class PendingPlannedReleaseRequest:
     The caller awaits ``event``; the scheduler sets ``error`` before signaling
     on failure.
     """
+
     cluster_id: str
     dp_ranks_to_remove: List[int]
     event: asyncio.Event
@@ -137,6 +140,7 @@ class PendingPlannedReleaseRequest:
 def is_generation_cluster(cluster_id: str) -> bool:
     """Return True if the cluster is a generation (rollout) cluster."""
     return cluster_id.endswith(f"_{GENERATION_CLUSTER_NAME}")
+
 
 _MAX_CLUSTER_ID_LEN = 256
 _CLUSTER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")

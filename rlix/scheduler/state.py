@@ -13,7 +13,9 @@ class SchedulerState:
     active_allocations: Dict[str, ClusterAllocation] = field(default_factory=dict)  # cluster_id -> allocation
     idle_gpus: Set[int] = field(default_factory=set)
 
-    pending_planned_release_requests: Dict[str, PendingPlannedReleaseRequest] = field(default_factory=dict)  # cluster_id -> request
+    pending_planned_release_requests: Dict[str, PendingPlannedReleaseRequest] = field(
+        default_factory=dict
+    )  # cluster_id -> request
 
     pipeline_registry: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # pipeline_id -> info
 

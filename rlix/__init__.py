@@ -20,6 +20,7 @@ from rlix.client.client import connect as init  # noqa: E402
 def __getattr__(name: str) -> object:
     if name in ("PipelineCoordinator", "RollFullFinetunePipeline", "RollMultiLoraPipeline"):
         from rlix.pipeline import PipelineCoordinator, RollFullFinetunePipeline, RollMultiLoraPipeline
+
         _lazy_exports = {
             "PipelineCoordinator": PipelineCoordinator,
             "RollFullFinetunePipeline": RollFullFinetunePipeline,

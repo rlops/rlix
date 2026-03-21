@@ -49,11 +49,17 @@ python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 
+[[tool.mypy.overrides]]
+module = ["roll.*", "codetiming", "ray.util.timer"]
+ignore_missing_imports = true
+
 [tool.black]
 line-length = 119
 target-version = ["py310"]
 
 [tool.ruff]
 line-length = 119
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 ignore = ["E501"]

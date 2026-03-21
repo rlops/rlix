@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Any
+
+import ray
 
 from rlix.protocol.types import RESOURCE_MANAGER_ACTOR_NAME, RLIX_NAMESPACE
 from rlix.utils.ray import head_node_affinity_strategy
-import ray
 
 # Platform/resource assumption
 # Rlix and ROLL resource keys differ: this module uses Ray's "GPU" resource
@@ -88,7 +90,7 @@ class ResourceManager:
         wait_timeout_s: float = 10.0,
         poll_interval_s: float = 0.2,
         expected_num_gpus: int | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Poll Ray until GPU resources are available and return a cluster snapshot.
 
         Args:
@@ -139,13 +141,14 @@ class ResourceManager:
         return {
             "num_gpus": int(last_num_gpus or 0),
             "alive_nodes": [
-                {"NodeID": n.get("NodeID"), "NodeManagerAddress": n.get("NodeManagerAddress")} for n in (last_alive_nodes or [])
+                {"NodeID": n.get("NodeID"), "NodeManagerAddress": n.get("NodeManagerAddress")}
+                for n in (last_alive_nodes or [])
             ],
             "cluster_resources": dict(last_cluster_resources or {}),
         }
 
 
-def get_or_create_resource_manager(*, name: str = RESOURCE_MANAGER_ACTOR_NAME, namespace: str = RLIX_NAMESPACE):
+def get_or_create_resource_manager(*, name: str = RESOURCE_MANAGER_ACTOR_NAME, namespace: str = RLIX_NAMESPACE) -> Any:
     """Return the singleton ``rlix:resource_manager`` actor, creating it on the head node if needed."""
     strategy = head_node_affinity_strategy(soft=False)
 
@@ -155,7 +158,7 @@ def get_or_create_resource_manager(*, name: str = RESOURCE_MANAGER_ACTOR_NAME, n
 
     # get_if_exists=True: Ray returns the existing actor if already created,
     # avoiding manual race handling for concurrent creation attempts.
-    return _ResourceManagerActor.options(
+    return _ResourceManagerActor.options(  # type: ignore[attr-defined]
         name=name,
         namespace=namespace,
         scheduling_strategy=strategy,

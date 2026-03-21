@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import os
 import time
-
 from collections import deque
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
@@ -25,9 +24,6 @@ import ray
 import torch
 from codetiming import Timer
 from ray.util.timer import _Timer
-
-from rlix.protocol.types import ActionResponse, Priority
-
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import (
     compute_rollout_traj_metrics,
@@ -41,9 +37,6 @@ from roll.pipeline.agentic.utils import (
     dump_rollout_trajectories,
     get_agentic_response_level_mask,
 )
-from rlix.pipeline.full_finetune_pipeline import RollFullFinetunePipeline
-from rlix.pipeline.utils import validate_resize_params
-from rlix.utils.env import parse_env_timeout_s
 from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     agg_loss,
@@ -55,6 +48,11 @@ from roll.utils.functionals import (
 from roll.utils.logging import get_logger
 from roll.utils.lora_routing import normalize_domain
 from roll.utils.train_infer_corrections import apply_train_infer_correction_to_batch
+
+from rlix.pipeline.full_finetune_pipeline import RollFullFinetunePipeline
+from rlix.pipeline.utils import validate_resize_params
+from rlix.protocol.types import ActionResponse, Priority
+from rlix.utils.env import parse_env_timeout_s
 
 logger = get_logger()
 
@@ -297,14 +295,14 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
             )
         logger.info("Created per-LoRA trackers for adapters: %s", adapter_names)
 
-    def val_single(self, lora_name: str, global_step: int, *, skip_dump: bool = False) -> dict:
+    def val_single(self, lora_name: str, global_step: int, *, skip_dump: bool = False) -> dict[str, Any]:
         """Validate a single adapter by running only its matching tag's val scheduler.
 
         Args:
             skip_dump: If True, skip dump_rollout_trajectories to avoid race with
                 concurrent train rollout dump during overlapped execution.
         """
-        metrics: dict = {}
+        metrics: dict[str, Any] = {}
 
         for tag, val_scheduler in self.val_rollout_schedulers.items():
             # Only validate the tag that maps to the given adapter.
@@ -315,14 +313,14 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
         logger.info(f"val_single lora={lora_name} metrics: {metrics}")
         return metrics
 
-    def _val_tag(self, tag: str, val_scheduler: Any, global_step: int, *, skip_dump: bool = False) -> dict:
+    def _val_tag(self, tag: str, val_scheduler: Any, global_step: int, *, skip_dump: bool = False) -> dict[str, Any]:
         """Run validation for a single tag and return prefixed metrics.
 
         Args:
             skip_dump: If True, skip dump_rollout_trajectories to avoid race with
                 concurrent train rollout dump during overlapped execution.
         """
-        metrics: dict = {}
+        metrics: dict[str, Any] = {}
         batch = DataProto(meta_info={"is_offload_states": False, "global_step": global_step})
         eval_batch = ray.get(val_scheduler.get_batch.remote(batch, self._val_batch_size_per_tag[tag]))
 
@@ -390,7 +388,7 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
         any_tick_completed: bool = False
         prev_trained_step: int = 0
         # Tokens-per-second throughput tracker.
-        tps_timer = _Timer(window_size=5)
+        tps_timer = _Timer(window_size=5)  # type: ignore[no-untyped-call]
         # Track submission time per tag for rollout wait_s computation
         # (pattern from agentic_multi_lora_pipeline.py:680-683).
         submitted_at_mono: Dict[str, float] = {}
@@ -524,6 +522,7 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
                         ready_ref = ready[0]
                         ready_tag = next(tag for tag, ref in in_flight if ref == ready_ref)
                     # Compute rollout wait time (pattern from agentic_multi_lora_pipeline.py:680-683).
+                    assert ready_tag is not None
                     wait_s = time.monotonic() - submitted_at_mono.pop(ready_tag)
 
                     with Timer(name="rollout", logger=None) as rollout_timer:
@@ -572,7 +571,9 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
                 # Normal path: fail-fast join — val exceptions propagate.
                 if val_future is not None:
                     val_result = val_future.result()
+                    assert val_submit_time is not None
                     val_elapsed = time.monotonic() - val_submit_time
+                    assert pending_val_info is not None
                     val_result["time/step_val"] = val_elapsed
                     # Log to correct per-lora tracker at correct step (not current tick's metrics).
                     if hasattr(self, "lora_trackers") and pending_val_info["lora"] in self.lora_trackers:
@@ -605,7 +606,7 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
                 # (a partial shrink), so active_dp_ranks stays non-empty through Phase 16.
                 # After actor_train releases, the scheduler calls expand_worker to sync
                 # loras to any workers that were preempted (now idle).
-                allocated_actor_train_gpus = self._request_cluster_gpus(
+                self._request_cluster_gpus(
                     cluster_id=self._actor_train_cluster_id,
                     priority=Priority.OLD_LOG_PROBS,
                     global_step=lora_step[lora_name],
@@ -751,7 +752,7 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
                     actor_train_metrics = DataProto.materialize_concat(data_refs=actor_train_metrics_refs)
                     metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
                 metrics["time/step_train"] = actor_train_timer.last
-                tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
+                tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())  # type: ignore[no-untyped-call]
                 metrics["system/tps"] = tps_timer.mean_throughput
 
                 # (b) Extract trained loras from lora_name; fail fast if missing or unknown.
@@ -841,6 +842,7 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
 
             # Re-kick in-flight get_batch for the consumed tag if lora has more steps.
             if lora_step[lora_name] < max_steps_per_lora:
+                assert ready_tag is not None
                 ref = self.rollout_schedulers[ready_tag].get_batch.remote(
                     DataProto(meta_info={"global_step": lora_step[lora_name]}),
                     self.pipeline_config.rollout_batch_size,
@@ -890,7 +892,7 @@ class RollMultiLoraPipeline(RollFullFinetunePipeline):
             logger.exception("tracker.finish failed")
         logger.info(f"{self._pipeline_id} pipeline run() completed")
 
-    def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
+    def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> ActionResponse:
         """Rlix hook for per-tag scheduler shrink/expand."""
         self._ensure_initialized()
         validate_resize_params(dp_ranks_to_remove, dp_ranks_to_add)

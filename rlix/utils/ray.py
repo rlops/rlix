@@ -1,4 +1,5 @@
 """Ray actor and scheduling utilities for rlix."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -16,13 +17,13 @@ def get_head_node_id() -> str:
     nodes = list_nodes(filters=[("is_head_node", "=", "True")])
     if not nodes:
         raise RuntimeError("Could not identify head node via ray.util.state.list_nodes")
-    node_id = nodes[0].get("node_id")
+    node_id: Any = nodes[0].get("node_id")  # type: ignore[no-untyped-call]
     if not node_id:
         raise RuntimeError(f"Head node record missing node_id: {nodes[0]!r}")
-    return node_id
+    return str(node_id)
 
 
-def head_node_affinity_strategy(*, soft: bool = False):
+def head_node_affinity_strategy(*, soft: bool = False) -> Any:
     """Return a Ray scheduling strategy that pins actor placement to the head node.
 
     Args:
@@ -46,6 +47,4 @@ def get_actor_or_raise(name: str, namespace: str, *, error_context: str) -> Any:
     try:
         return ray.get_actor(name, namespace=namespace)
     except Exception as exc:
-        raise RuntimeError(
-            f"Failed to resolve actor {name!r} in namespace {namespace!r}. {error_context}"
-        ) from exc
+        raise RuntimeError(f"Failed to resolve actor {name!r} in namespace {namespace!r}. {error_context}") from exc

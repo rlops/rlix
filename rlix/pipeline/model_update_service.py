@@ -90,12 +90,7 @@ class ModelUpdateService:
     def _select_global_sender_rank(self) -> int:
         """Return the single global cache owner: pp_rank==0, dp_rank==0, tp_rank==0, cp_rank==0."""
         for rank, info in enumerate(self.src_cluster.worker_rank_info):
-            if (
-                int(info.pp_rank) == 0
-                and int(info.dp_rank) == 0
-                and int(info.tp_rank) == 0
-                and int(info.cp_rank) == 0
-            ):
+            if int(info.pp_rank) == 0 and int(info.dp_rank) == 0 and int(info.tp_rank) == 0 and int(info.cp_rank) == 0:
                 return int(rank)
         raise RuntimeError(
             "No global cache owner found for selective sync "
@@ -108,7 +103,7 @@ class ModelUpdateService:
         sync_id: str,
         src_rank: int,
         tgt_dp_ranks: List[int],
-    ) -> Tuple[dict, str, List[int]]:
+    ) -> Tuple[dict[int, Any], str, List[int]]:
         """Build a communication plan for the single global cache owner.
 
         The plan decides, for every device on every target worker, which transport
@@ -175,9 +170,7 @@ class ModelUpdateService:
                     f"Incomplete device metadata for src_rank={src_rank}: "
                     f"node_rank={device.get('node_rank')}, gpu_rank={device.get('gpu_rank')}"
                 )
-        src_gpu_keys: Set[Tuple[int, int]] = {
-            (int(d["node_rank"]), int(d["gpu_rank"])) for d in src_devices
-        }
+        src_gpu_keys: Set[Tuple[int, int]] = {(int(d["node_rank"]), int(d["gpu_rank"])) for d in src_devices}
 
         # Classify each device of each target worker as IPC or broadcast.
         tgt_devices: List[Dict[str, Any]] = []  # broadcast-only devices (for NCCL group setup)
@@ -233,7 +226,10 @@ class ModelUpdateService:
         return comm_plan, group_name, sorted(tgt_ranks_in_group)
 
     def sync_selected_workers(
-        self, tgt_dp_ranks: List[int], adapters_to_sync: list[str] | None = None, verify: bool = True,
+        self,
+        tgt_dp_ranks: List[int],
+        adapters_to_sync: list[str] | None = None,
+        verify: bool = True,
     ) -> None:
         """Push model weights from the training cluster to specific infer workers.
 
@@ -380,16 +376,14 @@ class ModelUpdateService:
         # The cache owner returns weight_stats (checksums / norms) alongside the sync result.
         # We forward these to each target worker's verify_model to confirm weights landed correctly.
         if verify:
-            sender_stats: dict = {}
+            sender_stats: dict[str, Any] = {}
             for result in sync_results:
                 if isinstance(result, dict) and result.get("weight_stats"):
                     sender_stats = result["weight_stats"]
                     break
             if sender_stats:
                 verify_refs = [
-                    self.tgt_cluster.rank2worker[int(dp_rank)].verify_model.remote(
-                        expected_stats=sender_stats
-                    )
+                    self.tgt_cluster.rank2worker[int(dp_rank)].verify_model.remote(expected_stats=sender_stats)
                     for dp_rank in tgt_dp_ranks
                 ]
                 self._ray_get_with_timeout(
@@ -400,9 +394,7 @@ class ModelUpdateService:
                         f"pipeline_id={self.pipeline_id} sync_id={sync_id} tgt_dp_ranks={tgt_dp_ranks}"
                     ),
                 )
-                logger.info(
-                    f"[ModelUpdateService] verify_model_ok pipeline_id={self.pipeline_id} sync_id={sync_id}"
-                )
+                logger.info(f"[ModelUpdateService] verify_model_ok pipeline_id={self.pipeline_id} sync_id={sync_id}")
 
         logger.info(
             f"[ModelUpdateService] sync_selected_workers_exit pipeline_id={self.pipeline_id} sync_id={sync_id}"

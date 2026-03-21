@@ -1,7 +1,7 @@
 {
   "repo_notes": [
     {
-      "content": "RLix is a Ray-based control plane for concurrent LLM reinforcement learning on shared GPUs. Entry point is rlix.init(create_if_missing=True) in rlix/init.py. Core modules: rlix/orchestrator/, rlix/scheduler/, rlix/pipeline/, rlix/protocol/. ROLL provides the training and inference workers; RLix manages GPU allocation and pipeline lifecycle. Design principles: fail fast, no fault tolerance, no backward compatibility, happy-path only."
+      "content": "RLix is a Ray-based control plane for concurrent LLM reinforcement learning on shared GPUs. It lets multiple RL jobs share GPU capacity so researchers can run more experiments and wait less. ROLL provides the training and inference workers; RLix manages GPU allocation and pipeline lifecycle. Design principles: fail fast, no fault tolerance, no backward compatibility, happy-path only."
     }
   ],
   "pages": [
@@ -10,7 +10,7 @@
       "purpose": "Introduce RLix, explain its purpose as a Ray-based control plane for concurrent LLM RL training with GPU time-sharing, and provide a high-level architectural summary",
       "page_notes": [
         {
-          "content": "RLix is control-plane only; ROLL provides the workers. The core insight: RL pipelines alternate training and rollout, leaving GPUs idle. RLix fills those gaps by running multiple pipelines concurrently with two-level sharing: cross-pipeline elastic resize and within-pipeline multi-LoRA."
+          "content": "RLix is control-plane only; ROLL provides the workers. The core insight: RL pipelines alternate training and rollout, leaving GPUs idle. RLix fills those gaps by running multiple pipelines concurrently with two-level sharing: cross-pipeline elastic resize and within-pipeline multi-LoRA. Tagline: 'Run more RL experiments. Wait less for GPUs.'"
         }
       ]
     },
@@ -20,7 +20,7 @@
       "parent": "Overview",
       "page_notes": [
         {
-          "content": "Three singleton Ray actors (orchestrator, scheduler, resource_manager) plus one coordinator actor per pipeline. See rlix/orchestrator/, rlix/scheduler/, rlix/pipeline/coordinator.py."
+          "content": "Three singleton Ray actors (orchestrator, scheduler, resource_manager) plus one coordinator actor per pipeline. The scheduler is decomposed into three focused modules: core scheduling logic, a gap-ratio planner for generation allocation, and a tracer for Perfetto GPU timelines."
         }
       ]
     },
@@ -30,7 +30,7 @@
       "parent": "Overview",
       "page_notes": [
         {
-          "content": "Key types are in rlix/protocol/types.py: Priority enum (7 tiers, only GENERATION is preemptable), ActionResponse, ProgressReport. Cluster types: actor_train, actor_infer, critic, reference, reward. Only actor_infer clusters are elastically resized."
+          "content": "Priority enum has 7 tiers; only GENERATION is preemptable. Cluster types: actor_train, actor_infer (generation), critic, reference, reward (CPU-only). Cluster name constants and all protocol types are consolidated in the protocol types module. Only actor_infer clusters are elastically resized."
         }
       ]
     },
@@ -39,37 +39,37 @@
       "purpose": "Guide users through initial setup, running their first pipeline, and understanding basic configuration",
       "page_notes": [
         {
-          "content": "See README.md quick-start section and examples/start_multi_pipeline_test.py."
+          "content": "See README.md for a quick-start code snippet showing the six-step workflow: init RLix, allocate pipeline ID, register GPU topology, admit pipeline, create coordinator, create and run pipeline actor."
         }
       ]
     },
     {
       "title": "Installation and Setup",
-      "purpose": "Cover dependencies, Ray cluster setup, environment variables, and initial configuration requirements",
+      "purpose": "Cover dependencies, environment setup, and initial configuration",
       "parent": "Getting Started",
       "page_notes": [
         {
-          "content": "Required deps: tg4perfetto>=0.0.6, protobuf<3.21.0, roll from GitHub. Optional env var RLIX_REQUIRED_GPUS_PER_NODE enforces a strict GPU-per-node topology at init."
+          "content": "setup_env.sh creates the rlix conda environment with Python 3.10, CUDA 12.4, and installs ROLL and RLix. Environment variable RLIX_REQUIRED_GPUS_PER_NODE enforces strict GPU-per-node topology at init."
         }
       ]
     },
     {
       "title": "Quick Start Example",
-      "purpose": "Walk through running start_multi_pipeline_test.py, explain the initialization sequence, and show expected output",
+      "purpose": "Walk through running the example script, explain the initialization sequence, and show expected output",
       "parent": "Getting Started",
       "page_notes": [
         {
-          "content": "See examples/start_multi_pipeline_test.py. Supports single pipeline, two full-finetune pipelines, or full-finetune plus multi-LoRA. Init sequence is in README.md."
+          "content": "The example script supports single pipeline, two full-finetune pipelines, or full-finetune plus multi-LoRA. Pipeline class is resolved from the YAML config via pipeline_cls."
         }
       ]
     },
     {
       "title": "Configuration Basics",
-      "purpose": "Introduce Hydra configuration files, explain cluster_tp_configs and cluster_device_mappings, and show basic pipeline config structure",
+      "purpose": "Introduce YAML configuration files, explain cluster_tp_configs and cluster_device_mappings, and show basic pipeline config structure",
       "parent": "Getting Started",
       "page_notes": [
         {
-          "content": "Config examples in examples/rlix_test/. Required keys: cluster_tp_configs and cluster_device_mappings. Multi-LoRA requires megatron_train strategy and is_lora_optimizer_isolated=true. train_device_mapping must be a subset of infer_device_mapping."
+          "content": "Required config keys: cluster_tp_configs and cluster_device_mappings. Multi-LoRA requires megatron_train strategy and is_lora_optimizer_isolated=true. train_device_mapping must be a subset of infer_device_mapping."
         }
       ]
     },
@@ -78,37 +78,47 @@
       "purpose": "Document the singleton control plane components (Orchestrator, Scheduler, ResourceManager) that manage all pipelines",
       "page_notes": [
         {
-          "content": "Three singleton actors created by rlix.init(). Actor names, the RLIX_NAMESPACE constant, and protocol types (Priority, ActionResponse, ProgressReport) are all defined in rlix/protocol/types.py."
+          "content": "Three singleton actors created by rlix.init(create_if_missing=True). The init entry point aliases through the client module. Actor names and protocol types (Priority, ProgressReport) are defined in the protocol types module."
         }
       ]
     },
     {
       "title": "Orchestrator",
-      "purpose": "Explain Orchestrator's role in pipeline lifecycle management: allocate_pipeline_id, register_pipeline, admit_pipeline, kill_pipeline, shutdown",
+      "purpose": "Explain Orchestrator's role in pipeline lifecycle management: allocate, register, admit, kill, shutdown",
       "parent": "Control Plane",
       "page_notes": [
         {
-          "content": "Source: rlix/orchestrator/orchestrator.py. Owns the four-step pipeline lifecycle: allocate_pipeline_id, register_pipeline (validates topology via rlix/scheduler/validation.py), admit_pipeline (creates coordinator actor), kill_pipeline (tears down coordinator and releases scheduler state)."
+          "content": "Owns the four-step pipeline lifecycle: allocate_pipeline_id, register_pipeline (validates topology via the validation module), admit_pipeline (creates coordinator actor), kill_pipeline (tears down coordinator and releases scheduler state). Uses env-var-configurable timeouts."
         }
       ]
     },
     {
       "title": "Scheduler",
-      "purpose": "Document SchedulerImpl's priority-based GPU allocation, request/release APIs, pending request queuing, and central scheduling loop",
+      "purpose": "Document SchedulerImpl's priority-based GPU allocation, request/release APIs, and central scheduling loop",
       "parent": "Control Plane",
       "page_notes": [
         {
-          "content": "Source: rlix/scheduler/scheduler.py (SchedulerImpl). Core APIs: request_gpus (async generator), notify_ready_to_release (blocks until shrink committed), report_progress. Internal state in rlix/scheduler/state.py; plan types in rlix/scheduler/types.py."
+          "content": "SchedulerImpl is the core scheduling actor. It is decomposed into three modules: the scheduler itself (lifecycle, request management, plan execution), a planner module (stateless gap-ratio generation planning), and a tracer module (Perfetto GPU timeline tracing via composition). Allocation ops use explicit rank-to-GPU dicts. Core APIs: request_gpus, notify_ready_to_release, report_progress."
+        }
+      ]
+    },
+    {
+      "title": "Scheduler Tracer",
+      "purpose": "Document the SchedulerTracer component that records GPU timeline events for Perfetto visualization",
+      "parent": "Control Plane",
+      "page_notes": [
+        {
+          "content": "SchedulerTracer is a separate module composed into SchedulerImpl. It wraps tg4perfetto integration for recording GPU allocation, queue wait, and scheduling events as Perfetto trace slices. Conditionally enabled when tg4perfetto is installed."
         }
       ]
     },
     {
       "title": "Resource Manager",
-      "purpose": "Explain ResourceManager's role in GPU topology validation, cluster resource snapshots, and gpus-per-node enforcement",
+      "purpose": "Explain ResourceManager's role in GPU topology validation and cluster resource snapshots",
       "parent": "Control Plane",
       "page_notes": [
         {
-          "content": "Source: rlix/scheduler/resource_manager.py. Validates GPU topology at startup and provides cluster snapshots. init_topology enforces consistent gpus-per-node across all alive Ray nodes."
+          "content": "Validates GPU topology at startup and provides cluster snapshots. init_topology enforces consistent gpus-per-node across all alive Ray nodes."
         }
       ]
     },
@@ -117,7 +127,7 @@
       "purpose": "Document the PipelineCoordinator actor's role in managing individual pipelines and coordinating with the control plane",
       "page_notes": [
         {
-          "content": "Source: rlix/pipeline/coordinator.py. Protocol defined in rlix/protocol/coordinator.py. Key design: coordinator calls request_gpus and notify_ready_to_release on behalf of the pipeline so ROLL training code is fully decoupled from GPU scheduling (recipe-transparent scheduling). resize_infer and sync_lora_weights are serialized via _resize_sync_lock."
+          "content": "The coordinator calls request_gpus and notify_ready_to_release on behalf of the pipeline, keeping ROLL training code fully decoupled from GPU scheduling (recipe-transparent scheduling). Caches actor handles for performance. resize_infer and sync_lora_weights are serialized via a lock with configurable timeout."
         }
       ]
     },
@@ -127,7 +137,7 @@
       "parent": "Pipeline Coordination",
       "page_notes": [
         {
-          "content": "Selects RollFullFinetunePipeline or RollMultiLoraPipeline based on model_args.adapters. Validates: reward cluster must be CPU-only, sleep_level=2 required, offload_nccl=True required. Injects PIPELINE_ID, RLIX_CONTROL_PLANE, and thread-limiting env vars into ROLL runtime_env. See rlix/pipeline/coordinator.py for the full env var list."
+          "content": "Pipeline class is resolved from the YAML config pipeline_cls field. sleep_level=2 and offload_nccl=True are auto-defaulted when unset. Reward cluster must be CPU-only. Injects pipeline identity and thread-limiting env vars into ROLL runtime_env."
         }
       ]
     },
@@ -136,7 +146,7 @@
       "purpose": "Document the two pipeline implementations: RollFullFinetunePipeline for full finetuning and RollMultiLoraPipeline for multi-LoRA training",
       "page_notes": [
         {
-          "content": "Sources: rlix/pipeline/full_finetune_pipeline.py and rlix/pipeline/multi_lora_pipeline.py. Full-finetune wraps ROLL AgenticPipeline. Multi-LoRA wraps AgenticMultiLoraPipeline and requires megatron_train strategy and isolated optimizers per adapter."
+          "content": "Full-finetune wraps ROLL's agentic pipeline with elastic GPU expand/shrink. Multi-LoRA trains multiple adapters on a shared base model with isolated optimizers per adapter. Both follow the same seven-phase training loop structure."
         }
       ]
     },
@@ -146,7 +156,7 @@
       "parent": "Pipeline Implementations",
       "page_notes": [
         {
-          "content": "Seven Priority tiers map to phases. GENERATION(6) is the only preemptable phase. For multi-LoRA correctness: adapter must be disabled during REF_LOG_PROBS and enabled during OLD_LOG_PROBS. No GAE critic in multi-LoRA mode."
+          "content": "Seven Priority tiers map to phases. GENERATION (priority 6) is the only preemptable phase. For multi-LoRA correctness: adapter must be disabled during REF_LOG_PROBS and enabled during OLD_LOG_PROBS. No GAE critic in multi-LoRA mode."
         }
       ]
     },
@@ -155,17 +165,27 @@
       "purpose": "Explain how RLix achieves GPU time-sharing through priority-based scheduling, elastic workers, and background rebalancing",
       "page_notes": [
         {
-          "content": "Core files: rlix/scheduler/scheduler.py, rlix/scheduler/state.py, rlix/scheduler/types.py. Scheduler rebalances continuously using ProgressReport demand signals. Two-level sharing: cross-pipeline via resize_infer(), within-pipeline multi-LoRA via sync_lora_weights()."
+          "content": "The scheduler rebalances continuously using ProgressReport demand signals. Two-level sharing: cross-pipeline via elastic resize of rollout workers, within-pipeline multi-LoRA via adapter weight sync. Gap-ratio generation planning is handled by a dedicated planner module."
+        }
+      ]
+    },
+    {
+      "title": "Gap-Ratio Planner",
+      "purpose": "Document the gap-ratio algorithm that distributes generation GPU capacity proportionally across pipelines",
+      "parent": "GPU Resource Management",
+      "page_notes": [
+        {
+          "content": "The planner is a set of stateless module functions extracted from the scheduler. It snapshots current DP worker allocation per pipeline, then distributes available GPU capacity proportionally to each pipeline's remaining rollout demand. Produces execution plans consumed by the scheduler's plan-apply loop."
         }
       ]
     },
     {
       "title": "Scheduling Priorities and Allocation",
-      "purpose": "Document the seven priority levels (0-6), which stages are preemptable, and how priority determines GPU allocation strategy (fixed vs gap-ratio)",
+      "purpose": "Document the seven priority levels (0-6), which stages are preemptable, and how priority determines GPU allocation strategy",
       "parent": "GPU Resource Management",
       "page_notes": [
         {
-          "content": "Priority enum in rlix/protocol/types.py (INITIALIZATION=0 through GENERATION=6). Non-GENERATION priorities get fixed device_mapping GPUs. GENERATION uses gap-ratio planning proportional to trajectory demand. ExecutionPlan in rlix/scheduler/types.py encodes the resolved ops."
+          "content": "Non-GENERATION priorities get fixed device_mapping GPUs and preempt generation workers when necessary. GENERATION uses the gap-ratio planner to distribute capacity proportionally to trajectory demand. ExecutionPlan encodes the resolved allocation and shrink ops."
         }
       ]
     },
@@ -175,16 +195,16 @@
       "parent": "GPU Resource Management",
       "page_notes": [
         {
-          "content": "Expand adds DP ranks via ROLL resize_infer. Shrink is two-phase: stop routing, then sleep_level=2 drops model weights from VRAM. sleep_level=2 is required (not sleep_level=1) and is validated in PipelineCoordinator."
+          "content": "Expand adds DP ranks via ROLL resize_infer. Shrink is two-phase: stop routing, then sleep_level=2 drops model weights from VRAM. Inference weights are loaded only while a worker is active and released when the worker shrinks."
         }
       ]
     },
     {
       "title": "Model Synchronization",
-      "purpose": "Document the selective weight sync mechanism for pushing trained weights to inference workers",
+      "purpose": "Document the weight sync mechanism for pushing trained weights to inference workers",
       "page_notes": [
         {
-          "content": "Only active when RLIX_CONTROL_PLANE env var is set. After each training tick, ROLL builds a versioned CPU bucket cache and replays it to vLLM workers via IPC (colocated) or NCCL broadcast (remote). Triggered from rlix side by coordinator sync_lora_weights()."
+          "content": "After each training tick, ROLL builds a versioned CPU bucket cache and replays it to vLLM workers via IPC (colocated) or NCCL broadcast (remote). The model update service handles timeout parsing and lazy port allocation. Triggered from the coordinator."
         }
       ]
     }

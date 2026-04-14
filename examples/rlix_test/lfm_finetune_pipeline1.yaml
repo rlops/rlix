@@ -109,7 +109,7 @@ actor_train:
   infer_batch_size: 1
 
 actor_infer:
-  offload_nccl: ${offload_nccl}
+  offload_nccl: true
   model_args:
     disable_gradient_checkpointing: true
     dtype: bf16

@@ -43,6 +43,7 @@ system_envs:
   RAY_num_server_call_thread: "4"
   TORCHINDUCTOR_COMPILE_THREADS: "1"
   TORCHINDUCTOR_MAX_AUTOTUNE: "0"
+  TORCHDYNAMO_DISABLE: "1"  # Disable torch.compile; vLLM V1 otherwise stalls for 20+ min compiling sm_120
 
 checkpoint_config:
   type: file_system

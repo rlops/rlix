@@ -282,24 +282,31 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
 
                 # Build and promote the initial base-model cache (-1/-1) before offload.
                 # Under sleep_level=2 this cache must stay active so expand can rehydrate infer workers.
+                # Megatron-only: DeepSpeed strategies do not implement bucket cache / checkpoint promotion.
                 init_checkpoint_version = -1
                 self.actor_train.load_states(blocking=True)
-                ray.get(
-                    [
-                        w.build_latest_bucket_cache.remote(
-                            checkpoint_version=int(init_checkpoint_version),
-                        )
-                        for w in self.actor_train.workers
-                    ]
-                )
-                ray.get(
-                    [
-                        w.promote_active_checkpoint.remote(
-                            checkpoint_version=int(init_checkpoint_version),
-                        )
-                        for w in self.actor_train.workers
-                    ]
-                )
+                try:
+                    ray.get(
+                        [
+                            w.build_latest_bucket_cache.remote(
+                                checkpoint_version=int(init_checkpoint_version),
+                            )
+                            for w in self.actor_train.workers
+                        ]
+                    )
+                    ray.get(
+                        [
+                            w.promote_active_checkpoint.remote(
+                                checkpoint_version=int(init_checkpoint_version),
+                            )
+                            for w in self.actor_train.workers
+                        ]
+                    )
+                except RuntimeError as e:
+                    if "does not support" in str(e):
+                        logger.info("[init][%s] skipping bucket cache/checkpoint promotion: %s", self._pipeline_id, e)
+                    else:
+                        raise
 
                 # Offload training-side clusters before initializing actor_infer (avoid transient OOM).
                 logger.info("[init][%s] offloading actor_train before actor_infer init", self._pipeline_id)

@@ -134,7 +134,7 @@ actor_infer:
       max_num_seqs: 2
       enforce_eager: true
       sleep_level: 2
-  device_mapping: "[0, 1, 2, 3, ]"
+  device_mapping: "[2, 3, ]"
 
 reference:
   offload_nccl: ${offload_nccl}

@@ -24,6 +24,10 @@ render_save_dir: /tmp/roll_output/ft_pipeline1/render
 system_envs:
   USE_MODELSCOPE: "0"
   NCCL_SHM_DISABLE: "1"
+  TORCH_NCCL_ENABLE_MONITORING: '0'
+  TORCH_NCCL_RETHROW_CUDA_ERRORS: '0'
+  TORCH_NCCL_BLOCKING_WAIT: '1'
+  VLLM_USE_FLASHINFER_SAMPLER: '0'  # FlashInfer JIT fails on sm_120a (RTX 5090)
   RAY_PROFILING: "1"
   RAY_DEDUP_LOGS: "0"
   RAY_TMPDIR: "${oc.env:RAY_TMPDIR,/tmp}"
@@ -47,7 +51,7 @@ checkpoint_config:
 
 num_gpus_per_node: 2
 model_download_type: HUGGINGFACE_HUB
-offload_nccl: true 
+offload_nccl: false 
 max_steps: 3
 model_update_buffer_size_mb: 100  # Limit broadcast bucket to 100 MB to avoid OOM with co-located infer workers
 model_update_transport: cpu_serialize  # CPU byte serialization; avoids pidfd_getfd error in restricted containers
@@ -78,7 +82,7 @@ reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
 actor_train:
   offload_nccl: ${offload_nccl}
   model_args:
-    attn_implementation: fa2
+    attn_implementation: sdpa
     disable_gradient_checkpointing: false
     dtype: bf16
     model_type: ~
@@ -146,7 +150,7 @@ actor_infer:
 reference:
   offload_nccl: ${offload_nccl}
   model_args:
-    attn_implementation: fa2
+    attn_implementation: sdpa
     disable_gradient_checkpointing: true
     dtype: bf16
     model_type: ~

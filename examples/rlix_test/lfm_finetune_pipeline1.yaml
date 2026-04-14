@@ -1,0 +1,187 @@
+defaults:
+  - ../config/traj_envs@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+pipeline_cls: rlix.pipeline.full_finetune_pipeline.RollFullFinetunePipeline
+
+exp_name: "lfm_pipeline1_sokoban_grpo"
+seed: 42
+logging_dir: ./output/lfm_pipeline1/logs
+output_dir: ./output/lfm_pipeline1
+render_save_dir: /tmp/roll_output/lfm_pipeline1/render
+
+system_envs:
+  USE_MODELSCOPE: "0"
+  NCCL_SHM_DISABLE: "1"
+  TORCH_NCCL_ENABLE_MONITORING: '0'
+  TORCH_NCCL_RETHROW_CUDA_ERRORS: '0'
+  TORCH_NCCL_BLOCKING_WAIT: '1'
+  VLLM_USE_FLASHINFER_SAMPLER: '0'  # FlashInfer JIT fails on sm_120a (RTX 5090)
+  DS_BUILD_OPS: '0'  # DeepSpeed fused_adam JIT fails on sm_120a (RTX 5090)
+  RAY_PROFILING: "1"
+  RAY_DEDUP_LOGS: "0"
+  RAY_TMPDIR: "${oc.env:RAY_TMPDIR,/tmp}"
+  ROLL_TIMEOUT_SCALE: "0.1"
+  ROLL_GPU_REQUEST_TIMEOUT_S: "120"
+  ROLL_NOTIFY_READY_TIMEOUT_S: "300"
+  ROLL_VERIFY_OFFLOAD_GPU_MEMORY: "1"
+  ROLL_SELECTIVE_MODEL_UPDATE_PG_TIMEOUT_S: '150'
+  ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S: '180'
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  RAY_num_server_call_thread: "4"
+  TORCHINDUCTOR_COMPILE_THREADS: "1"
+  TORCHINDUCTOR_MAX_AUTOTUNE: "0"
+
+checkpoint_config:
+  type: file_system
+  output_dir: /tmp/roll_output/lfm_pipeline1/checkpoints
+
+num_gpus_per_node: 2
+model_download_type: HUGGINGFACE_HUB
+offload_nccl: false
+max_steps: 3
+model_update_buffer_size_mb: 100
+model_update_transport: cpu_serialize
+verify_model_after_sync: false  # fsdp2 weight format differs from vllm; skip verification
+save_steps: 10000
+logging_steps: 1
+eval_steps: 20
+resume_from_checkpoint: false
+
+async_generation_ratio: 1
+
+rollout_batch_size: 4
+val_batch_size: 4
+sequence_length: 1024
+max_actions_per_traj: 5
+
+advantage_clip: 0.2
+ppo_epochs: 1
+adv_estimator: "grpo"
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+max_grad_norm: 1.0
+
+pretrain: LiquidAI/LFM2.5-350M
+reward_pretrain: LiquidAI/LFM2.5-350M
+
+actor_train:
+  offload_nccl: ${offload_nccl}
+  model_args:
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 2
+    warmup_steps: 1
+    lr_scheduler_type: cosine
+  data_args:
+    template: native
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config:
+      train_micro_batch_size_per_gpu: auto
+      bf16:
+        enabled: true
+      zero_optimization:
+        stage: 2
+        allgather_partitions: true
+        allgather_bucket_size: 1.0e+9
+        overlap_comm: true
+        reduce_scatter: true
+        reduce_bucket_size: 5.0e+8
+        contiguous_gradients: true
+  use_dynamic_batching_in_train: false
+  device_mapping: "[0, 1, ]"
+  infer_batch_size: 1
+
+actor_infer:
+  offload_nccl: ${offload_nccl}
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: 64
+    top_p: 1
+    top_k: 3
+    num_beams: 1
+    temperature: 0.0
+    num_return_sequences: 1
+  data_args:
+    template: native
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      VLLM_USE_V1: 1
+      gpu_memory_utilization: 0.5
+      block_size: 16
+      load_format: auto
+      tensor_parallel_size: 1
+      max_num_batched_tokens: 1024
+      max_num_seqs: 2
+      enforce_eager: true
+      sleep_level: 2
+  device_mapping: "[0, 1, 2, 3, ]"
+
+reference:
+  offload_nccl: ${offload_nccl}
+  model_args:
+    disable_gradient_checkpointing: true
+    dtype: bf16
+    model_type: ~
+  data_args:
+    template: native
+  strategy_args:
+    strategy_name: deepspeed_infer
+    strategy_config:
+      train_micro_batch_size_per_gpu: auto
+      bf16:
+        enabled: true
+      zero_optimization:
+        stage: 3
+        overlap_comm: true
+        contiguous_gradients: true
+        sub_group_size: 1.0e+9
+        reduce_bucket_size: auto
+        stage3_prefetch_bucket_size: auto
+        stage3_param_persistence_threshold: auto
+        stage3_max_live_parameters: 1.0e+9
+        stage3_max_reuse_distance: 1.0e+9
+        stage3_gather_16bit_weights_on_model_save: true
+  device_mapping: "[0, 1, ]"
+  infer_batch_size: 1
+
+reward_normalization:
+  grouping: traj_group_id
+  method: mean_std
+
+train_env_manager:
+  format_penalty: -0.15
+  max_env_num_per_worker: 4
+  num_env_groups: 2
+  group_size: 2
+  tags: [SimpleSokoban]
+  num_groups_partition: [2]
+
+val_env_manager:
+  max_env_num_per_worker: 4
+  num_env_groups: 2
+  group_size: 2
+  tags: [SimpleSokoban]
+  num_groups_partition: [2]
+
+max_tokens_per_step: 64
+
+custom_envs:
+  SimpleSokoban:
+    ${custom_env.SimpleSokoban}

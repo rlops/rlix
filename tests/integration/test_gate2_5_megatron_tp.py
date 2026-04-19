@@ -36,6 +36,11 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+# Force NCCL socket transport immediately — skip P2P/SHM probe phase.
+# On PCIe-only hardware (no NVLink), probe hangs can exceed the 600 s default timeout.
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("NCCL_SHM_DISABLE", "1")
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -354,10 +359,9 @@ def destroy_megatron() -> None:
 def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend="nccl",
-        device_id=torch.device(f"cuda:{local_rank}"),
-    )
+    # No device_id → lazy NCCL init (one communicator at a time, avoids simultaneous
+    # world+TP init that can exhaust the 600 s timeout on socket-only transport).
+    dist.init_process_group(backend="nccl")
     world_size = dist.get_world_size()
     log0(f"world_size={world_size}, GPU={torch.cuda.get_device_name(local_rank)}")
 
@@ -366,11 +370,12 @@ def main() -> None:
         dist.destroy_process_group()
         return
 
-    # Full-world gloo group (warmup for NCCL + weight broadcast transport)
+    # Gloo group for weight broadcasts and barriers.
+    # All dist.barrier() calls use this group so NCCL is not invoked for barriers;
+    # NCCL is used only for the TP all_reduce inside the model forward pass.
     gloo_world = dist.new_group(ranks=list(range(world_size)), backend="gloo")
 
     # Megatron init: creates TP groups [0,1] and [2,3].
-    # This also warms up NCCL via internal group creation.
     log0("Initializing Megatron TP=2...")
     init_megatron()
     log0("Megatron initialized.")
@@ -378,7 +383,7 @@ def main() -> None:
     # Build model on ALL ranks (each rank gets its own TP shard)
     log0("Building MegatronTPMLP...")
     model = MegatronTPMLP().to(f"cuda:{local_rank}")
-    dist.barrier()
+    dist.barrier(group=gloo_world)
     log0(f"Model ready — each rank holds shard of {sum(p.numel() for p in model.parameters()):,} params")
 
     for step in range(1, N_STEPS + 1):
@@ -388,7 +393,7 @@ def main() -> None:
         # ----- Train on training ranks (no DP all-reduce → inference group diverges) -----
         log0("  [1] train step on training ranks only...")
         train_step(model, local_rank, step)
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Capture pre-sync state for divergence check on inference ranks -----
         pre_sync_cache: Optional[CPUBucketCache] = None
@@ -417,7 +422,7 @@ def main() -> None:
         if local_rank in TRAIN_RANKS:
             log(f"  [4] destroy_model_parallel (rank {local_rank})...")
         destroy_megatron()
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Inference isolation verification -----
         if local_rank in INFER_RANKS:
@@ -456,7 +461,7 @@ def main() -> None:
         cache1 = cache if local_rank == 1 else None
         received_from_1 = broadcast_shard(cache1, src_rank=1, gloo_group=gloo_world)
 
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Verify bit-exact on inference ranks -----
         log0("  [6] verify bit-exact hash match on inference ranks...")
@@ -465,7 +470,7 @@ def main() -> None:
             verify_shard(received_from_0, label="0", step=step, my_rank=local_rank)
         if local_rank == 3:
             verify_shard(received_from_1, label="1", step=step, my_rank=local_rank)
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Check inference had different weights BEFORE sync (divergence) -----
         log0("  [7] verify inference weights diverged from training before sync...")
@@ -491,7 +496,7 @@ def main() -> None:
             else:
                 log(f"  PASS step {step}: {different}/{len(received_from_1)} params diverged "
                     f"from rank1 before sync (rank 3)")
-        dist.barrier()
+        dist.barrier(group=gloo_world)
 
         # ----- Rebuild Megatron process groups -----
         log0("  [8] rebuild Megatron TP groups for next step...")
@@ -513,7 +518,7 @@ def main() -> None:
                     sd[name].copy_(t.view_as(sd[name]).to(f"cuda:{local_rank}"))
             model.load_state_dict(sd)
 
-        dist.barrier()
+        dist.barrier(group=gloo_world)
         log0(f"STEP {step} COMPLETE")
 
     log0("\n" + "=" * 60)

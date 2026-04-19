@@ -207,16 +207,14 @@ def selective_sync(
     gloo_group: dist.ProcessGroup,
 ) -> Dict[str, torch.Tensor]:
     """
-    Broadcast all dirty buckets from rank 0 to all ranks.
+    Broadcast all dirty buckets from rank 0 to all ranks via gloo (CPU).
 
-    Broadcasts #1 and #2 (small metadata) use NCCL on GPU.
-    Broadcast #3 (large weight data, ~1.2 GB) uses gloo on CPU to avoid
-    NCCL timeout on SYS-topology PCIe where P2P and SHM are unavailable.
+    All 3 broadcasts use gloo to avoid NCCL on SYS-topology PCIe hardware
+    where P2P and SHM are unavailable — NCCL hangs on first collective init.
 
     Inference ranks (2, 3) collect received weights; rank 1 discards.
     """
     received: Dict[str, torch.Tensor] = {}
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     MAX_PARAMS = 400  # upper bound on parameter count
     ROW = 216          # 200 name bytes + 16 hash chars per param
@@ -230,18 +228,17 @@ def selective_sync(
         n_elems = [t.numel() for t in cpu_tensors]
         elem_hashes = [tensor_hash(t) for t in cpu_tensors]
 
-        # Broadcast #1: fixed-size header
-        # n_elems encoded as (hi, lo) float32 pairs split at 2^20 so each part < 2^24
-        # (float32 exact for integers up to 2^24; Qwen embed 136M needs 2-part encoding)
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32, device="cuda")
+        # Broadcast #1: fixed-size header — float32 CPU (gloo)
+        # n_elems encoded as (hi, lo) split at 2^20 so each part < 2^24 (exact in float32)
+        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32)
         header[0] = float(n)
         for i, ne in enumerate(n_elems):
-            header[1 + 2 * i] = float(ne >> 20)        # hi: fits in <2^24 for ≤4B params
-            header[2 + 2 * i] = float(ne & 0xFFFFF)    # lo: 20-bit, always < 2^20
-        dist.broadcast(header, src=SENDER_RANK)
+            header[1 + 2 * i] = float(ne >> 20)
+            header[2 + 2 * i] = float(ne & 0xFFFFF)
+        dist.broadcast(header, src=SENDER_RANK, group=gloo_group)
 
-        # Broadcast #2: fixed MAX_PARAMS × ROW name/hash matrix
-        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16, device="cuda")
+        # Broadcast #2: name/hash matrix — bfloat16 CPU (gloo)
+        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16)
         for i, (name, h) in enumerate(zip(names, elem_hashes)):
             nb = name.encode()
             row_start = i * ROW
@@ -249,39 +246,35 @@ def selective_sync(
                 meta_mat[row_start + j] = float(b)
             for j, c in enumerate(h):
                 meta_mat[row_start + 200 + j] = float(ord(c))
-        dist.broadcast(meta_mat, src=SENDER_RANK)
+        dist.broadcast(meta_mat, src=SENDER_RANK, group=gloo_group)
 
-        # Broadcast #3: all tensors concatenated — gloo (CPU) to avoid NCCL
-        # SYS-topology timeout on large transfers without P2P/SHM
-        flat_cpu = torch.cat([t.view(-1) for t in cpu_tensors], dim=0)  # stays CPU
+        # Broadcast #3: flat weight data — bfloat16 CPU (gloo)
+        flat_cpu = torch.cat([t.view(-1) for t in cpu_tensors], dim=0)
         dist.broadcast(flat_cpu, src=SENDER_RANK, group=gloo_group)
 
     else:
-        # Receive #1: fixed-size header (float32 hi/lo split at 2^20)
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32, device="cuda")
-        dist.broadcast(header, src=SENDER_RANK)
+        # Receive #1: header
+        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32)
+        dist.broadcast(header, src=SENDER_RANK, group=gloo_group)
         n = int(header[0].item())
-        n_elems = []
-        for i in range(n):
-            hi = int(header[1 + 2 * i].item())
-            lo = int(header[2 + 2 * i].item())
-            n_elems.append((hi << 20) | lo)
+        n_elems = [(int(header[1 + 2 * i].item()) << 20) | int(header[2 + 2 * i].item())
+                   for i in range(n)]
 
-        # Receive #2: fixed name/hash matrix
-        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16, device="cuda")
-        dist.broadcast(meta_mat, src=SENDER_RANK)
+        # Receive #2: name/hash matrix
+        meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16)
+        dist.broadcast(meta_mat, src=SENDER_RANK, group=gloo_group)
         names: list[str] = []
         exp_hashes: list[str] = []
         for i in range(n):
-            row = meta_mat[i * ROW: i * ROW + ROW].cpu()
+            row = meta_mat[i * ROW: i * ROW + ROW]
             name_len = next((j for j in range(200) if row[j] == 0), 200)
             raw = row[:name_len].to(torch.int32).numpy().tolist()
             names.append(bytes(raw).decode())
             exp_hashes.append("".join(chr(int(row[200 + j].item())) for j in range(16)))
 
-        # Receive #3: flat concatenated data tensor via gloo (CPU)
+        # Receive #3: flat weight data
         total_elems = sum(n_elems)
-        flat_cpu = torch.zeros(total_elems, dtype=torch.bfloat16)  # CPU
+        flat_cpu = torch.zeros(total_elems, dtype=torch.bfloat16)
         dist.broadcast(flat_cpu, src=SENDER_RANK, group=gloo_group)
 
         if R() in INFER_RANKS:
@@ -290,7 +283,7 @@ def selective_sync(
                 received[name] = (flat_cpu[offset: offset + ne].clone(), eh)
                 offset += ne
 
-    dist.barrier(device_ids=[local_rank])
+    dist.barrier(group=gloo_group)
     return received
 
 
@@ -334,13 +327,12 @@ def verify_transmission(
 def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    # device_id required in PyTorch 2.5+ for NCCL barrier to not hang
-    dist.init_process_group(
-        backend="nccl",
-        device_id=torch.device(f"cuda:{local_rank}"),
-    )
-    # Gloo group for large CPU tensor broadcast (NCCL times out on SYS-topology PCIe)
-    gloo_group = dist.new_group(ranks=list(range(dist.get_world_size())), backend="gloo")
+    # Use gloo as default backend — this test's only collectives are barriers and
+    # gloo broadcasts.  NCCL with device_id triggers eager multi-communicator init
+    # that hangs on PCIe-only hardware (no P2P/SHM, socket fallback takes >10 min).
+    dist.init_process_group(backend="gloo")
+    # Alias for existing call sites — same as default group since backend is gloo.
+    gloo_group = None
 
     world_size = dist.get_world_size()
     log0(f"world_size={world_size}, GPU={torch.cuda.get_device_name(local_rank)}")
@@ -380,9 +372,8 @@ def main() -> None:
         dist.barrier()
 
         # 5. Selective sync: rank 0 → ranks 2,3
-        log0("  [5] selective sync via dynamic NCCL group...")
+        log0("  [5] selective sync via gloo...")
         received = selective_sync(cache, step, gloo_group)
-        dist.barrier()
 
         # 6. Bit-exact hash verification
         log0("  [6] verifying bit-exact transmission...")

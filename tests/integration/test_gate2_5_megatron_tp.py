@@ -167,6 +167,8 @@ def build_cpu_cache(model: Optional[nn.Module]) -> Optional[CPUBucketCache]:
     cache = CPUBucketCache()
     with torch.no_grad():
         for name, tensor in model.state_dict().items():
+            if tensor is None:   # Megatron TP layers store None for disabled biases
+                continue
             cache.store(name, shard_id=R(), tensor=tensor.cpu().contiguous())
     log(f"  cache built: {len(cache.get_dirty_buckets())} buckets")
     return cache

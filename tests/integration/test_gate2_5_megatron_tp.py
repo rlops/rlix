@@ -121,12 +121,12 @@ class MegatronTPMLP(nn.Module):
         self.fc1 = ColumnParallelLinear(
             hidden, ffn, config=config,
             init_method=nn.init.xavier_normal_,
-            bias=False, gather_output=False,
+            bias=False, gather_output=False, skip_bias_add=False,
         )
         self.fc2 = RowParallelLinear(
             ffn, hidden, config=config,
             init_method=nn.init.xavier_normal_,
-            bias=False, input_is_parallel=True,
+            bias=False, input_is_parallel=True, skip_bias_add=False,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

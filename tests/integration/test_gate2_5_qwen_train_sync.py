@@ -206,63 +206,77 @@ def selective_sync(
     Inference ranks (2, 3) collect and return received weights.
     Training rank 1 participates but discards received data.
 
-    Note: We use the world group (not a sub-group) because NCCL sub-group
-    creation across SYS-topology GPUs (different PCIe root complexes) hangs
-    when P2P is disabled. The world group was already initialized and works.
-    This still validates the full CPU-bucket-cache → GPU-broadcast pipeline.
+    Protocol: all tensors use bfloat16 (avoids NCCL int64/uint8 bugs on
+    PCIe-SYS topology with P2P disabled). World group used (not sub-group)
+    because NCCL new_group([0,2,3]) hangs on SYS-topology GPUs with P2P off.
     """
     received: Dict[str, torch.Tensor] = {}
 
     if R() == SENDER_RANK and cache is not None:
         buckets = cache.get_dirty_buckets()
 
-        # Broadcast bucket count to all
-        count_t = torch.tensor([len(buckets)], device="cuda")
+        # Broadcast bucket count as bfloat16 scalar (count < 65504, exact)
+        count_t = torch.tensor([float(len(buckets))], dtype=torch.bfloat16, device="cuda")
         dist.broadcast(count_t, src=SENDER_RANK)
 
         for bucket in buckets:
-            # Stage CPU tensor to GPU
-            gpu_t = bucket.tensor.cuda()
+            # Stage CPU tensor to GPU as bfloat16
+            gpu_t = bucket.tensor.to(device="cuda", dtype=torch.bfloat16).contiguous()
+            n_elem = gpu_t.numel()
 
-            # Broadcast metadata: [name_len, *shape] padded to 202 int64
+            # Encode n_elem as 4 base-256 bytes (each 0-255, exact in bfloat16)
+            b3 = (n_elem >> 24) & 0xFF
+            b2 = (n_elem >> 16) & 0xFF
+            b1 = (n_elem >> 8) & 0xFF
+            b0 = n_elem & 0xFF
+
+            # Hash chars are ASCII 48-102, all < 128, exact in bfloat16
             name_bytes = bucket.param_name.encode()
-            padded = torch.zeros(202, dtype=torch.int64, device="cuda")
-            padded[0] = len(name_bytes)
-            for i, v in enumerate(gpu_t.shape):
-                padded[1 + i] = v
-            dist.broadcast(padded, src=SENDER_RANK)
+            h = tensor_hash(gpu_t.cpu())  # 16-char hex hash
+            hash_floats = [float(ord(c)) for c in h]
 
-            # Broadcast name bytes padded to 200 uint8
-            name_t = torch.frombuffer(bytearray(name_bytes), dtype=torch.uint8).cuda()
-            name_buf = torch.zeros(200, dtype=torch.uint8, device="cuda")
-            name_buf[:len(name_t)] = name_t
+            # meta: [name_len, b3, b2, b1, b0, hash×16] = 21 bfloat16 values
+            meta = torch.tensor(
+                [float(len(name_bytes)), float(b3), float(b2), float(b1), float(b0)]
+                + hash_floats,
+                dtype=torch.bfloat16, device="cuda",
+            )
+            dist.broadcast(meta, src=SENDER_RANK)
+
+            # Name bytes: each < 128, exact in bfloat16
+            name_buf = torch.zeros(200, dtype=torch.bfloat16, device="cuda")
+            for i, b in enumerate(name_bytes):
+                name_buf[i] = float(b)
             dist.broadcast(name_buf, src=SENDER_RANK)
 
-            # Broadcast tensor data
-            dist.broadcast(gpu_t.contiguous(), src=SENDER_RANK)
+            # Tensor data
+            dist.broadcast(gpu_t, src=SENDER_RANK)
 
     else:
         # Receive bucket count
-        count_t = torch.zeros(1, dtype=torch.int64, device="cuda")
+        count_t = torch.zeros(1, dtype=torch.bfloat16, device="cuda")
         dist.broadcast(count_t, src=SENDER_RANK)
         n_buckets = int(count_t.item())
 
         for _ in range(n_buckets):
-            padded = torch.zeros(202, dtype=torch.int64, device="cuda")
-            dist.broadcast(padded, src=SENDER_RANK)
-            name_len = int(padded[0].item())
-            n_elements = int(padded[1].item())  # shape[0] for 1D tensors
+            meta = torch.zeros(21, dtype=torch.bfloat16, device="cuda")
+            dist.broadcast(meta, src=SENDER_RANK)
+            name_len = int(meta[0].item())
+            # Decode n_elements from base-256 bytes
+            b3, b2, b1, b0 = (int(meta[i].item()) for i in range(1, 5))
+            n_elements = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+            expected_hash = "".join(chr(int(meta[i].item())) for i in range(5, 21))
 
-            name_buf = torch.zeros(200, dtype=torch.uint8, device="cuda")
+            name_buf = torch.zeros(200, dtype=torch.bfloat16, device="cuda")
             dist.broadcast(name_buf, src=SENDER_RANK)
-            param_name = name_buf[:name_len].cpu().numpy().tobytes().decode()
+            raw_bytes = name_buf[:name_len].cpu().to(torch.int32).numpy().tolist()
+            param_name = bytes(raw_bytes).decode()
 
             buf = torch.zeros(n_elements, dtype=torch.bfloat16, device="cuda")
             dist.broadcast(buf, src=SENDER_RANK)
 
-            # Only inference ranks keep the data
             if R() in INFER_RANKS:
-                received[param_name] = buf
+                received[param_name] = (buf, expected_hash)
 
     dist.barrier(device_ids=[int(os.environ.get("LOCAL_RANK", 0))])
     return received
@@ -274,27 +288,19 @@ def selective_sync(
 
 def verify_transmission(
     snapshot: Dict[str, str],
-    received: Dict[str, torch.Tensor],
+    received: Dict,
     step: int,
 ) -> None:
     """
-    rank 0 sends hashes to rank 2; rank 2 computes hashes of received tensors
-    and compares.
+    Inference ranks verify each received tensor matches the expected hash
+    embedded in the protocol metadata during selective_sync.
     """
-    # Rank 0 broadcasts snapshot hashes as a list of (name, hash) strings
-    obj = [list(snapshot.items())]
-    dist.broadcast_object_list(obj, src=SENDER_RANK)
-    expected_hashes = dict(obj[0])
-
     if R() not in INFER_RANKS:
         return
 
     mismatches: list[str] = []
-    for name, expected_hash in expected_hashes.items():
-        if name not in received:
-            mismatches.append(f"{name}: not received")
-            continue
-        actual_hash = tensor_hash(received[name])
+    for name, (received_t, expected_hash) in received.items():
+        actual_hash = tensor_hash(received_t)
         if actual_hash != expected_hash:
             mismatches.append(
                 f"{name}: hash {actual_hash!r} != expected {expected_hash!r}"
@@ -306,7 +312,7 @@ def verify_transmission(
             log(f"    {m}")
         sys.exit(1)
     else:
-        log(f"  PASS step {step}: all {len(expected_hashes)} weights verified bit-exact (rank {R()})")
+        log(f"  PASS step {step}: all {len(received)} weights verified bit-exact (rank {R()})")
 
 
 # ---------------------------------------------------------------------------

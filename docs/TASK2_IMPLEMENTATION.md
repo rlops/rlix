@@ -162,7 +162,29 @@ framework-agnostic.
 **Lesson:** Any class that may need unit testing without Ray should use direct
 method calls.  Keep Ray `.remote()` calls at the pipeline orchestration boundary.
 
-### 3. Do NOT call `destroy_model_parallel()` between train steps
+### 3. GPU integration test bugs (found during Vast.ai run)
+
+**Bug A — `CPUBucketCache.store()` signature mismatch**
+
+Initial test called `cache.store((name, 0), tensor)` (positional tuple key + data). Actual signature is `store(param_name, *, shard_id, tensor)`.
+
+Fix: `cache.store(name, shard_id=0, tensor=t)`
+
+**Bug B — tied weights missing from cache (`lm_head.weight` in Qwen)**
+
+`named_parameters()` deduplicates tied weights — `lm_head.weight` is the same tensor as `model.embed_tokens.weight` and only appears once. But `state_dict()` includes both keys. Since the bucket cache needs to reconstruct the full state dict on the inference side, it must store all keys including tied ones.
+
+Fix: use `model.state_dict().items()` instead of `model.named_parameters()` when populating the cache.
+
+**Impact:** If `get_cpu_weight_shards()` in the NeMo worker uses `named_parameters()`, it will miss tied weights. Must use `state_dict()` (or HF export which handles ties explicitly).
+
+**Bug C — `BucketUpdateRequest.sync_id` is `str` not `int`**
+
+Test passed `sync_id=1` (int). Actual type annotation is `str`.
+
+Fix: `sync_id="1"`
+
+### 4. Do NOT call `destroy_model_parallel()` between train steps
 
 **Trap:** It might seem sensible to call `mpu.destroy_model_parallel()` (or
 `torch.distributed.destroy_process_group()`) after training to "free GPU memory"

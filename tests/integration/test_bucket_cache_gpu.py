@@ -27,16 +27,28 @@ import pytest
 import torch
 
 # ---------------------------------------------------------------------------
-# Ensure repo root is on sys.path so rlix imports work without install
+# Import pipeline modules directly by file path to avoid pulling in the full
+# rlix package (which requires ray, codetiming, and other heavy deps).
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT))
+PIPELINE_DIR = REPO_ROOT / "rlix" / "pipeline"
 
-from rlix.pipeline.bucket_cache import CPUBucketCache, Bucket
-from rlix.pipeline.bucket_receiver import (
-    BucketUpdateRequest,
-    apply_bucket_update,
-)
+import importlib.util as _ilu
+
+def _load(name: str, file: Path):
+    spec = _ilu.spec_from_file_location(name, file)
+    mod = _ilu.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+_bucket_cache_mod = _load("rlix.pipeline.bucket_cache", PIPELINE_DIR / "bucket_cache.py")
+_bucket_receiver_mod = _load("rlix.pipeline.bucket_receiver", PIPELINE_DIR / "bucket_receiver.py")
+
+CPUBucketCache = _bucket_cache_mod.CPUBucketCache
+Bucket = _bucket_cache_mod.Bucket
+BucketUpdateRequest = _bucket_receiver_mod.BucketUpdateRequest
+apply_bucket_update = _bucket_receiver_mod.apply_bucket_update
 
 # ---------------------------------------------------------------------------
 # Skip entire module if no CUDA GPU available

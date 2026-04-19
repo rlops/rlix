@@ -200,11 +200,14 @@ def measure_memory_release(model: nn.Module, rank: int) -> None:
 def selective_sync(
     cache: Optional[CPUBucketCache],
     step: int,
+    gloo_group: dist.ProcessGroup,
 ) -> Dict[str, torch.Tensor]:
     """
-    Broadcast all dirty buckets from rank 0 to all ranks via world group.
-    Uses 3 NCCL broadcasts total (metadata header, names, concatenated data)
-    to avoid per-bucket overhead that causes hangs on SYS-topology PCIe.
+    Broadcast all dirty buckets from rank 0 to all ranks.
+
+    Broadcasts #1 and #2 (small metadata) use NCCL on GPU.
+    Broadcast #3 (large weight data, ~1.2 GB) uses gloo on CPU to avoid
+    NCCL timeout on SYS-topology PCIe where P2P and SHM are unavailable.
 
     Inference ranks (2, 3) collect received weights; rank 1 discards.
     """
@@ -243,9 +246,10 @@ def selective_sync(
                 meta_mat[row_start + 200 + j] = float(ord(c))
         dist.broadcast(meta_mat, src=SENDER_RANK)
 
-        # Broadcast #3: all tensors concatenated as one large bfloat16 tensor
-        flat = torch.cat([t.view(-1) for t in cpu_tensors], dim=0).cuda()
-        dist.broadcast(flat, src=SENDER_RANK)
+        # Broadcast #3: all tensors concatenated — gloo (CPU) to avoid NCCL
+        # SYS-topology timeout on large transfers without P2P/SHM
+        flat_cpu = torch.cat([t.view(-1) for t in cpu_tensors], dim=0)  # stays CPU
+        dist.broadcast(flat_cpu, src=SENDER_RANK, group=gloo_group)
 
     else:
         # Receive #1: fixed-size header
@@ -270,15 +274,15 @@ def selective_sync(
             names.append(bytes(raw).decode())
             exp_hashes.append("".join(chr(int(row[200 + j].item())) for j in range(16)))
 
-        # Receive #3: flat concatenated data tensor
+        # Receive #3: flat concatenated data tensor via gloo (CPU)
         total_elems = sum(n_elems)
-        flat = torch.zeros(total_elems, dtype=torch.bfloat16, device="cuda")
-        dist.broadcast(flat, src=SENDER_RANK)
+        flat_cpu = torch.zeros(total_elems, dtype=torch.bfloat16)  # CPU
+        dist.broadcast(flat_cpu, src=SENDER_RANK, group=gloo_group)
 
         if R() in INFER_RANKS:
             offset = 0
             for name, ne, eh in zip(names, n_elems, exp_hashes):
-                received[name] = (flat[offset: offset + ne].clone(), eh)
+                received[name] = (flat_cpu[offset: offset + ne].clone(), eh)
                 offset += ne
 
     dist.barrier(device_ids=[local_rank])
@@ -330,6 +334,8 @@ def main() -> None:
         backend="nccl",
         device_id=torch.device(f"cuda:{local_rank}"),
     )
+    # Gloo group for large CPU tensor broadcast (NCCL times out on SYS-topology PCIe)
+    gloo_group = dist.new_group(ranks=list(range(dist.get_world_size())), backend="gloo")
 
     world_size = dist.get_world_size()
     log0(f"world_size={world_size}, GPU={torch.cuda.get_device_name(local_rank)}")
@@ -370,7 +376,7 @@ def main() -> None:
 
         # 5. Selective sync: rank 0 → ranks 2,3
         log0("  [5] selective sync via dynamic NCCL group...")
-        received = selective_sync(cache, step)
+        received = selective_sync(cache, step, gloo_group)
         dist.barrier()
 
         # 6. Bit-exact hash verification

@@ -161,3 +161,28 @@ framework-agnostic.
 
 **Lesson:** Any class that may need unit testing without Ray should use direct
 method calls.  Keep Ray `.remote()` calls at the pipeline orchestration boundary.
+
+### 3. Do NOT call `destroy_model_parallel()` between train steps
+
+**Trap:** It might seem sensible to call `mpu.destroy_model_parallel()` (or
+`torch.distributed.destroy_process_group()`) after training to "free GPU memory"
+before handing the GPU to inference.
+
+**Why it's wrong:** `destroy_model_parallel()` only tears down NCCL process groups —
+it does **not** free tensor memory.  More critically, the time-sharing design
+keeps the Megatron worker process alive across steps (it just sleeps while
+inference runs).  Destroying the process group means the next `train_step` has
+no communication backend → immediate crash.
+
+**How time-sharing actually frees the GPU:**
+The Megatron worker calls `_build_latest_bucket_cache` (copies weights to CPU),
+then signals vLLM to wake up.  vLLM reuses the same physical GPU via IPC or
+NCCL weight injection.  No process restart, no destroy — just sleep/wake.
+
+To free GPU memory legitimately between train and infer, use:
+```python
+torch.cuda.empty_cache()   # flush PyTorch allocator cache
+# (only after del model if you're truly done with training)
+```
+But in normal time-sharing, this isn't needed either — the GPU is shared in time,
+not released.

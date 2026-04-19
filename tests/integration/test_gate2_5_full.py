@@ -327,6 +327,10 @@ def main() -> None:
         dist.destroy_process_group()
         return
 
+    # Warm up NCCL before creating subgroups — required on PyTorch 2.5+ so that
+    # the internal NCCL all_reduce used by new_group doesn't hang on first use
+    dist.barrier(device_ids=[local_rank])
+
     # Create per-pipeline gloo groups (ALL ranks must call new_group even if not members)
     gloo_a = dist.new_group(ranks=[PIPELINE_A_RANK] + INFER_RANKS, backend="gloo")
     gloo_b = dist.new_group(ranks=[PIPELINE_B_RANK] + INFER_RANKS, backend="gloo")

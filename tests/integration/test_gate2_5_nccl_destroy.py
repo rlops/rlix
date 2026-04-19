@@ -17,6 +17,7 @@ Any FAIL or exception causes exit 1.
 from __future__ import annotations
 
 import os
+import resource
 import sys
 import time
 from pathlib import Path
@@ -178,11 +179,14 @@ def test_cycle_stability(tp_size: int = 2) -> None:
             f"cycle {cycle+1}: allreduce correct"
         )
 
-        # Offload first, then destroy (matches production sequence)
+        # Offload first, then destroy (matches production sequence).
+        # Brief sleep lets the OS reclaim NCCL sockets so we don't exhaust
+        # file descriptors across repeated cycles on socket-only transport.
         dummy = dummy.cpu()
         del dummy
         destroy_megatron()
         torch.cuda.empty_cache()
+        time.sleep(0.5)
         dist.barrier()
 
         after_mb = gpu_allocated_mb()
@@ -240,6 +244,15 @@ def test_stale_group_raises(tp_size: int = 2) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Raise the file-descriptor limit: NCCL socket fallback (P2P+SHM disabled) opens
+    # many sockets per communicator; repeated destroy/re-init cycles exhaust the default
+    # limit (1024) by cycle 3.
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, hard), hard))
+    except (ValueError, resource.error):
+        pass  # best effort
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
 

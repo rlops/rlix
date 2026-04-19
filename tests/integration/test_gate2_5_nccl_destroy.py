@@ -241,7 +241,11 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
 
-    dist.init_process_group(backend="nccl")
+    # device_id required in PyTorch 2.5+ for NCCL barrier to not hang
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
     world_size = dist.get_world_size()
 
     log(f"world_size={world_size}, torch={torch.__version__}, "

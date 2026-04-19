@@ -322,7 +322,11 @@ def verify_transmission(
 def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    # device_id required in PyTorch 2.5+ for NCCL barrier to not hang
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+    )
 
     world_size = dist.get_world_size()
     log0(f"world_size={world_size}, GPU={torch.cuda.get_device_name(local_rank)}")

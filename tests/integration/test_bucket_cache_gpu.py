@@ -21,7 +21,7 @@ from __future__ import annotations
 import gc
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import pytest
 import torch
@@ -46,7 +46,6 @@ _bucket_cache_mod = _load("rlix.pipeline.bucket_cache", PIPELINE_DIR / "bucket_c
 _bucket_receiver_mod = _load("rlix.pipeline.bucket_receiver", PIPELINE_DIR / "bucket_receiver.py")
 
 CPUBucketCache = _bucket_cache_mod.CPUBucketCache
-Bucket = _bucket_cache_mod.Bucket
 BucketUpdateRequest = _bucket_receiver_mod.BucketUpdateRequest
 apply_bucket_update = _bucket_receiver_mod.apply_bucket_update
 
@@ -96,7 +95,7 @@ def _model_to_cpu_cache(model: torch.nn.Module) -> CPUBucketCache:
     cache = CPUBucketCache()
     with torch.no_grad():
         for name, param in model.named_parameters():
-            cache.store((name, 0), param.detach().cpu().contiguous())
+            cache.store(name, shard_id=0, tensor=param.detach().cpu().contiguous())
     return cache
 
 
@@ -145,10 +144,10 @@ class TestGPUMemoryRelease:
         before_mb = _gpu_allocated_mb()
 
         # iterating the cache must not re-allocate GPU memory
-        dirty = cache.get_dirty_buckets()
-        for (name, shard_id), tensor in dirty.items():
-            assert tensor.device.type == "cpu", (
-                f"Cache stored GPU tensor for {name!r}: device={tensor.device}"
+        dirty = cache.get_dirty_buckets()  # List[Bucket]
+        for bucket in dirty:
+            assert bucket.tensor.device.type == "cpu", (
+                f"Cache stored GPU tensor for {bucket.param_name!r}: device={bucket.tensor.device}"
             )
 
         after_mb = _gpu_allocated_mb()
@@ -172,17 +171,16 @@ class TestWeightCorrectnessInCache:
         model, original_cpu = _load_tiny_model()
         cache = _model_to_cpu_cache(model)
 
-        dirty = cache.get_dirty_buckets()
+        dirty = cache.get_dirty_buckets()  # List[Bucket]
         assert len(dirty) > 0, "Cache is empty — nothing was stored"
 
+        cached_by_name = {b.param_name: b.tensor for b in dirty}
         mismatches: list[str] = []
         for name, original_tensor in original_cpu.items():
-            key = (name, 0)
-            if key not in dirty:
+            if name not in cached_by_name:
                 mismatches.append(f"{name}: missing from cache")
                 continue
-
-            cached = dirty[key]
+            cached = cached_by_name[name]
             if cached.shape != original_tensor.shape:
                 mismatches.append(
                     f"{name}: shape {cached.shape} != {original_tensor.shape}"
@@ -209,9 +207,9 @@ class TestWeightCorrectnessInCache:
         cache = _model_to_cpu_cache(model)
 
         wrong_dtype: list[str] = []
-        for (name, _), tensor in cache.get_dirty_buckets().items():
-            if tensor.dtype != torch.bfloat16:
-                wrong_dtype.append(f"{name}: {tensor.dtype}")
+        for bucket in cache.get_dirty_buckets():
+            if bucket.tensor.dtype != torch.bfloat16:
+                wrong_dtype.append(f"{bucket.param_name}: {bucket.tensor.dtype}")
 
         assert not wrong_dtype, (
             "Some tensors were upcast from bfloat16:\n" + "\n".join(wrong_dtype[:5])
@@ -245,13 +243,8 @@ class TestBucketReceiverPush:
         # target = zero-initialised inference model (simulated)
         target_sd = self._make_zero_state_dict(original_cpu)
 
-        # build BucketUpdateRequest from dirty cache
-        dirty = cache.get_dirty_buckets()
-        buckets: list[Bucket] = [
-            Bucket(param_name=name, shard_id=shard_id, data=tensor)
-            for (name, shard_id), tensor in dirty.items()
-        ]
-        request = BucketUpdateRequest(sync_id=1, buckets=buckets)
+        # build BucketUpdateRequest from dirty cache (get_dirty_buckets returns List[Bucket])
+        request = BucketUpdateRequest(sync_id="1", buckets=cache.get_dirty_buckets())
 
         result = apply_bucket_update(target_sd, request)
         assert result.ok, f"apply_bucket_update failed: {result.errors}"
@@ -280,12 +273,7 @@ class TestBucketReceiverPush:
         cache = _model_to_cpu_cache(model)
         target_sd = self._make_zero_state_dict(original_cpu)
 
-        dirty = cache.get_dirty_buckets()
-        buckets = [
-            Bucket(param_name=n, shard_id=s, data=t)
-            for (n, s), t in dirty.items()
-        ]
-        apply_bucket_update(target_sd, BucketUpdateRequest(sync_id=2, buckets=buckets))
+        apply_bucket_update(target_sd, BucketUpdateRequest(sync_id="2", buckets=cache.get_dirty_buckets()))
 
         shape_errors: list[str] = []
         for name, original_tensor in original_cpu.items():
@@ -311,12 +299,7 @@ class TestBucketReceiverPush:
             for name, tensor in original_cpu.items()
         }
 
-        dirty = cache.get_dirty_buckets()
-        buckets = [
-            Bucket(param_name=n, shard_id=s, data=t)
-            for (n, s), t in dirty.items()
-        ]
-        result = apply_bucket_update(target_sd, BucketUpdateRequest(sync_id=3, buckets=buckets))
+        result = apply_bucket_update(target_sd, BucketUpdateRequest(sync_id="3", buckets=cache.get_dirty_buckets()))
         assert result.ok, f"apply_bucket_update to GPU target failed: {result.errors}"
 
         mismatches: list[str] = []
@@ -375,13 +358,8 @@ class TestFullRoundTrip:
         }
 
         # Step 4: push dirty cache to inference worker
-        dirty = cache.get_dirty_buckets()
-        buckets = [
-            Bucket(param_name=n, shard_id=s, data=t)
-            for (n, s), t in dirty.items()
-        ]
         result = apply_bucket_update(
-            infer_sd, BucketUpdateRequest(sync_id=99, buckets=buckets)
+            infer_sd, BucketUpdateRequest(sync_id="99", buckets=cache.get_dirty_buckets())
         )
         assert result.ok, f"Weight push failed: {result.errors}"
 

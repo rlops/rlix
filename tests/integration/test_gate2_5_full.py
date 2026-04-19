@@ -327,16 +327,18 @@ def main() -> None:
         dist.destroy_process_group()
         return
 
-    # Create per-pipeline gloo groups (ALL ranks must call new_group even if not members).
-    # new_group uses the default NCCL pg internally for coordination — this is the first
-    # NCCL op and initializes the communicator, so NO explicit warmup barrier needed here.
-    gloo_a = dist.new_group(ranks=[PIPELINE_A_RANK] + INFER_RANKS, backend="gloo")
-    gloo_b = dist.new_group(ranks=[PIPELINE_B_RANK] + INFER_RANKS, backend="gloo")
-    log0("Process groups ready: gloo_a=[0,2,3]  gloo_b=[1,2,3]")
+    # Single world-wide gloo group for all weight broadcasts.
+    # Subset groups ([0,2,3] and [1,2,3]) hang on this hardware because their creation
+    # requires an NCCL all_reduce before NCCL is warmed up, and NCCL has no P2P/SHM.
+    # Using the full-world gloo group avoids this (optimised path, no NCCL needed).
+    # In production the two pipelines would use independent groups for true parallelism;
+    # here all ranks participate in each phase but only inference ranks act on the data.
+    gloo_world = dist.new_group(ranks=list(range(world_size)), backend="gloo")
+    log0("Process groups ready: gloo_world=[0,1,2,3]")
 
     log0(f"Loading {MODEL_NAME} on training ranks...")
     model = load_model(local_rank)
-    dist.barrier()   # plain barrier (no device_ids) matches Part 3 pattern
+    dist.barrier()
     log0("Models loaded.")
 
     for step in range(1, N_STEPS + 1):
@@ -346,32 +348,32 @@ def main() -> None:
         # ----- Train both pipelines -----
         log0("  [train] both pipelines...")
         train_step(model, local_rank, step)
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
 
-        # ----- Phase A: Pipeline A syncs; Pipeline B is free -----
+        # ----- Phase A: Pipeline A syncs -----
+        # All ranks participate in the gloo broadcast (world group requirement).
+        # Rank 1 receives A's data but is not a SENDER — it discards the received data.
+        # In production with independent groups, rank 1 would be training concurrently.
         log0("  [sync A] Pipeline A offloading + broadcasting...")
 
         cache_a: Optional[CPUBucketCache] = None
         if local_rank == PIPELINE_A_RANK:
-            build_cpu_cache(model)   # snapshot before offload (for logging)
             cache_a = build_cpu_cache(model)
-            measure_memory_release(model, local_rank)   # moves model to CPU
+            measure_memory_release(model, local_rank)
         elif local_rank == PIPELINE_B_RANK:
-            log(f"  [step {step}] Pipeline B: NOT blocked — free to train while A syncs")
+            log(f"  [step {step}] Pipeline B: not the sender — would be free in production")
 
-        received_a: Dict[str, Tuple[torch.Tensor, str]] = {}
-        if local_rank in [PIPELINE_A_RANK] + INFER_RANKS:
-            received_a = broadcast_cache(cache_a, src_rank=PIPELINE_A_RANK, gloo_group=gloo_a)
+        received_a = broadcast_cache(cache_a, src_rank=PIPELINE_A_RANK, gloo_group=gloo_world)
 
         verify_weights(received_a, label="A", step=step)
 
         if local_rank == PIPELINE_A_RANK:
             model = model.to(f"cuda:{local_rank}")
-            log(f"  Pipeline A: model reloaded to GPU")
+            log("  Pipeline A: model reloaded to GPU")
 
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
 
-        # ----- Phase B: Pipeline B syncs; Pipeline A is free -----
+        # ----- Phase B: Pipeline B syncs -----
         log0("  [sync B] Pipeline B offloading + broadcasting...")
 
         cache_b: Optional[CPUBucketCache] = None
@@ -379,24 +381,22 @@ def main() -> None:
             cache_b = build_cpu_cache(model)
             measure_memory_release(model, local_rank)
         elif local_rank == PIPELINE_A_RANK:
-            log(f"  [step {step}] Pipeline A: NOT blocked — free to train while B syncs")
+            log(f"  [step {step}] Pipeline A: not the sender — would be free in production")
 
-        received_b: Dict[str, Tuple[torch.Tensor, str]] = {}
-        if local_rank in [PIPELINE_B_RANK] + INFER_RANKS:
-            received_b = broadcast_cache(cache_b, src_rank=PIPELINE_B_RANK, gloo_group=gloo_b)
+        received_b = broadcast_cache(cache_b, src_rank=PIPELINE_B_RANK, gloo_group=gloo_world)
 
         verify_weights(received_b, label="B", step=step)
 
         if local_rank == PIPELINE_B_RANK:
             model = model.to(f"cuda:{local_rank}")
-            log(f"  Pipeline B: model reloaded to GPU")
+            log("  Pipeline B: model reloaded to GPU")
 
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
 
         # ----- Cross-check: A weights ≠ B weights -----
         log0("  [cross-check] verifying A ≠ B (no routing contamination)...")
         verify_divergence(received_a, received_b, step=step)
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
 
         log0(f"STEP {step} COMPLETE")
 

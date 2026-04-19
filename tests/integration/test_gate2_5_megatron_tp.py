@@ -395,6 +395,17 @@ def main() -> None:
         if local_rank in INFER_RANKS:
             pre_sync_cache = build_cpu_cache(model)
 
+        # ----- Inference isolation snapshot: before training ranks offload -----
+        # Snapshots VRAM and weight hashes on inference ranks.
+        # After training ranks call model.cpu() + empty_cache(), we verify these are unchanged.
+        infer_vram_before_offload = 0.0
+        infer_hashes_before_offload: dict = {}
+        if local_rank in INFER_RANKS:
+            infer_vram_before_offload = gpu_mb()
+            infer_hashes_before_offload = {
+                n: tensor_hash(p.data) for n, p in model.named_parameters()
+            }
+
         # ----- Training ranks: offload + destroy_model_parallel -----
         cache: Optional[CPUBucketCache] = None
         if local_rank in TRAIN_RANKS:
@@ -407,6 +418,32 @@ def main() -> None:
             log(f"  [4] destroy_model_parallel (rank {local_rank})...")
         destroy_megatron()
         dist.barrier()
+
+        # ----- Inference isolation verification -----
+        if local_rank in INFER_RANKS:
+            infer_vram_after_offload = gpu_mb()
+            delta = abs(infer_vram_after_offload - infer_vram_before_offload)
+            if delta > 10.0:
+                log(f"FAIL: inference VRAM changed during training offload+destroy: "
+                    f"{infer_vram_before_offload:.1f} → {infer_vram_after_offload:.1f} MB "
+                    f"(delta={delta:.1f})")
+                sys.exit(1)
+            log(f"PASS: inference VRAM isolated during training offload "
+                f"({infer_vram_before_offload:.1f} → {infer_vram_after_offload:.1f} MB, "
+                f"delta={delta:.1f})")
+            infer_hashes_after_offload = {
+                n: tensor_hash(p.data) for n, p in model.named_parameters()
+            }
+            corrupted = [
+                n for n in infer_hashes_before_offload
+                if infer_hashes_after_offload.get(n) != infer_hashes_before_offload[n]
+            ]
+            if corrupted:
+                log(f"FAIL: inference weights corrupted by training's empty_cache: "
+                    f"{len(corrupted)}/{len(infer_hashes_before_offload)} params changed")
+                sys.exit(1)
+            log(f"PASS: inference weights intact during training offload "
+                f"({len(infer_hashes_before_offload)} params verified unchanged)")
 
         # ----- Sync: each training rank broadcasts its shard to ALL ranks -----
         # Phase rank0: rank 0's shard (fc1 col 0..ffn/2-1, fc2 row 0..ffn/2-1) → all

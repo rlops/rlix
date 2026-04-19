@@ -350,10 +350,19 @@ def main() -> None:
         train_step(model, local_rank, step)
         dist.barrier()
 
+        # ----- Phase A isolation snapshots -----
+        # Snapshot B's VRAM and weight hashes BEFORE A offloads.
+        # After the broadcast, we verify A's empty_cache had no effect on B.
+        a_hashes_pre_offload: dict = {}
+        b_vram_before_a = 0.0
+        b_hashes_before_a: dict = {}
+        if local_rank == PIPELINE_A_RANK and model is not None:
+            a_hashes_pre_offload = {n: tensor_hash(p.data) for n, p in model.named_parameters()}
+        if local_rank == PIPELINE_B_RANK and model is not None:
+            b_vram_before_a = gpu_mb()
+            b_hashes_before_a = {n: tensor_hash(p.data) for n, p in model.named_parameters()}
+
         # ----- Phase A: Pipeline A syncs -----
-        # All ranks participate in the gloo broadcast (world group requirement).
-        # Rank 1 receives A's data but is not a SENDER — it discards the received data.
-        # In production with independent groups, rank 1 would be training concurrently.
         log0("  [sync A] Pipeline A offloading + broadcasting...")
 
         cache_a: Optional[CPUBucketCache] = None
@@ -364,14 +373,59 @@ def main() -> None:
             log(f"  [step {step}] Pipeline B: not the sender — would be free in production")
 
         received_a = broadcast_cache(cache_a, src_rank=PIPELINE_A_RANK, gloo_group=gloo_world)
-
         verify_weights(received_a, label="A", step=step)
+
+        # ----- Phase A isolation verification: B must be unaffected -----
+        if local_rank == PIPELINE_B_RANK and model is not None:
+            b_vram_after_a = gpu_mb()
+            delta = abs(b_vram_after_a - b_vram_before_a)
+            if delta > 10.0:
+                log(f"FAIL: Pipeline B VRAM changed during A's empty_cache: "
+                    f"{b_vram_before_a:.1f} → {b_vram_after_a:.1f} MB (delta={delta:.1f})")
+                dist.barrier()
+                sys.exit(1)
+            log(f"PASS: Pipeline B VRAM isolated during A offload "
+                f"({b_vram_before_a:.1f} → {b_vram_after_a:.1f} MB, delta={delta:.1f})")
+            b_hashes_after_a = {n: tensor_hash(p.data) for n, p in model.named_parameters()}
+            corrupted = [n for n in b_hashes_before_a if b_hashes_after_a.get(n) != b_hashes_before_a[n]]
+            if corrupted:
+                log(f"FAIL: Pipeline B weights corrupted by A's empty_cache: "
+                    f"{len(corrupted)}/{len(b_hashes_before_a)} params changed")
+                dist.barrier()
+                sys.exit(1)
+            log(f"PASS: Pipeline B weights intact after A offload "
+                f"({len(b_hashes_before_a)} params verified unchanged)")
 
         if local_rank == PIPELINE_A_RANK:
             model = model.to(f"cuda:{local_rank}")
             log("  Pipeline A: model reloaded to GPU")
 
         dist.barrier()
+
+        # ----- Phase A round-trip verification: A's weights survived CPU offload -----
+        if local_rank == PIPELINE_A_RANK and model is not None and a_hashes_pre_offload:
+            reloaded_hashes = {n: tensor_hash(p.data) for n, p in model.named_parameters()}
+            drift = [n for n in a_hashes_pre_offload if reloaded_hashes.get(n) != a_hashes_pre_offload[n]]
+            if drift:
+                log(f"FAIL: Pipeline A weights changed after CPU round-trip: "
+                    f"{len(drift)}/{len(a_hashes_pre_offload)} params differ")
+                dist.barrier()
+                sys.exit(1)
+            log(f"PASS: Pipeline A weights bit-exact after CPU round-trip "
+                f"({len(a_hashes_pre_offload)} params)")
+
+        dist.barrier()
+
+        # ----- Phase B isolation snapshots -----
+        # Snapshot A's VRAM and weight hashes (model just reloaded) BEFORE B offloads.
+        a_vram_before_b = 0.0
+        a_hashes_before_b: dict = {}
+        b_hashes_pre_offload: dict = {}
+        if local_rank == PIPELINE_A_RANK and model is not None:
+            a_vram_before_b = gpu_mb()
+            a_hashes_before_b = {n: tensor_hash(p.data) for n, p in model.named_parameters()}
+        if local_rank == PIPELINE_B_RANK and model is not None:
+            b_hashes_pre_offload = {n: tensor_hash(p.data) for n, p in model.named_parameters()}
 
         # ----- Phase B: Pipeline B syncs -----
         log0("  [sync B] Pipeline B offloading + broadcasting...")
@@ -384,12 +438,46 @@ def main() -> None:
             log(f"  [step {step}] Pipeline A: not the sender — would be free in production")
 
         received_b = broadcast_cache(cache_b, src_rank=PIPELINE_B_RANK, gloo_group=gloo_world)
-
         verify_weights(received_b, label="B", step=step)
+
+        # ----- Phase B isolation verification: A must be unaffected -----
+        if local_rank == PIPELINE_A_RANK and model is not None:
+            a_vram_after_b = gpu_mb()
+            delta = abs(a_vram_after_b - a_vram_before_b)
+            if delta > 10.0:
+                log(f"FAIL: Pipeline A VRAM changed during B's empty_cache: "
+                    f"{a_vram_before_b:.1f} → {a_vram_after_b:.1f} MB (delta={delta:.1f})")
+                dist.barrier()
+                sys.exit(1)
+            log(f"PASS: Pipeline A VRAM isolated during B offload "
+                f"({a_vram_before_b:.1f} → {a_vram_after_b:.1f} MB, delta={delta:.1f})")
+            a_hashes_after_b = {n: tensor_hash(p.data) for n, p in model.named_parameters()}
+            corrupted = [n for n in a_hashes_before_b if a_hashes_after_b.get(n) != a_hashes_before_b[n]]
+            if corrupted:
+                log(f"FAIL: Pipeline A weights corrupted by B's empty_cache: "
+                    f"{len(corrupted)}/{len(a_hashes_before_b)} params changed")
+                dist.barrier()
+                sys.exit(1)
+            log(f"PASS: Pipeline A weights intact after B offload "
+                f"({len(a_hashes_before_b)} params verified unchanged)")
 
         if local_rank == PIPELINE_B_RANK:
             model = model.to(f"cuda:{local_rank}")
             log("  Pipeline B: model reloaded to GPU")
+
+        dist.barrier()
+
+        # ----- Phase B round-trip verification: B's weights survived CPU offload -----
+        if local_rank == PIPELINE_B_RANK and model is not None and b_hashes_pre_offload:
+            reloaded_hashes = {n: tensor_hash(p.data) for n, p in model.named_parameters()}
+            drift = [n for n in b_hashes_pre_offload if reloaded_hashes.get(n) != b_hashes_pre_offload[n]]
+            if drift:
+                log(f"FAIL: Pipeline B weights changed after CPU round-trip: "
+                    f"{len(drift)}/{len(b_hashes_pre_offload)} params differ")
+                dist.barrier()
+                sys.exit(1)
+            log(f"PASS: Pipeline B weights bit-exact after CPU round-trip "
+                f"({len(b_hashes_pre_offload)} params)")
 
         dist.barrier()
 

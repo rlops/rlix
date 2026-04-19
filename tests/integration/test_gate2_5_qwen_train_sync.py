@@ -226,13 +226,14 @@ def selective_sync(
         n_elems = [t.numel() for t in cpu_tensors]
         elem_hashes = [tensor_hash(t) for t in cpu_tensors]
 
-        # Broadcast #1: fixed-size header [n_buckets, hi_0, lo_0, hi_1, lo_1, ...]
-        # Each n_elem encoded as (hi << 16 | lo), hi/lo in [0, 65535] — exact bfloat16
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.bfloat16, device="cuda")
+        # Broadcast #1: fixed-size header
+        # n_elems encoded as (hi, lo) float32 pairs split at 2^20 so each part < 2^24
+        # (float32 exact for integers up to 2^24; Qwen embed 136M needs 2-part encoding)
+        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32, device="cuda")
         header[0] = float(n)
         for i, ne in enumerate(n_elems):
-            header[1 + 2 * i] = float(ne >> 16)
-            header[2 + 2 * i] = float(ne & 0xFFFF)
+            header[1 + 2 * i] = float(ne >> 20)        # hi: fits in <2^24 for ≤4B params
+            header[2 + 2 * i] = float(ne & 0xFFFFF)    # lo: 20-bit, always < 2^20
         dist.broadcast(header, src=SENDER_RANK)
 
         # Broadcast #2: fixed MAX_PARAMS × ROW name/hash matrix
@@ -252,15 +253,15 @@ def selective_sync(
         dist.broadcast(flat_cpu, src=SENDER_RANK, group=gloo_group)
 
     else:
-        # Receive #1: fixed-size header
-        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.bfloat16, device="cuda")
+        # Receive #1: fixed-size header (float32 hi/lo split at 2^20)
+        header = torch.zeros(1 + 2 * MAX_PARAMS, dtype=torch.float32, device="cuda")
         dist.broadcast(header, src=SENDER_RANK)
         n = int(header[0].item())
         n_elems = []
         for i in range(n):
             hi = int(header[1 + 2 * i].item())
             lo = int(header[2 + 2 * i].item())
-            n_elems.append((hi << 16) | lo)
+            n_elems.append((hi << 20) | lo)
 
         # Receive #2: fixed name/hash matrix
         meta_mat = torch.zeros(MAX_PARAMS * ROW, dtype=torch.bfloat16, device="cuda")

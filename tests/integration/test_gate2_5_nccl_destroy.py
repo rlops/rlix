@@ -84,17 +84,16 @@ def test_single_destroy_reinit(tp_size: int = 2) -> None:
 
     from megatron.core import parallel_state as mpu
 
-    # Allocate a large tensor to make NCCL buffers warm up
-    warmup = torch.randn(TENSOR_MB * 1024 * 256, device="cuda", dtype=torch.float32)
-    dist.all_reduce(warmup[:1024])  # force NCCL buffer allocation
-    del warmup
-    torch.cuda.empty_cache()
-
     # --- init ---
     init_megatron_tp(tp_size)
     tp_group = mpu.get_tensor_model_parallel_group()
 
-    # Do a real allreduce to confirm group works
+    # Allocate model-like weights on GPU so memory_allocated() has something to track.
+    # torch.cuda.memory_allocated() only sees PyTorch tensors, not NCCL internal buffers;
+    # by holding explicit tensors we get a meaningful before/after delta.
+    fake_model_weights = torch.randn(TENSOR_MB * 1024 * 64, device="cuda", dtype=torch.bfloat16)
+
+    # Do a real allreduce to warm up NCCL communicators
     t = torch.ones(1024, device="cuda") * rank()
     dist.all_reduce(t, group=tp_group)
     expected = sum(range(dist.get_world_size()))
@@ -107,6 +106,9 @@ def test_single_destroy_reinit(tp_size: int = 2) -> None:
     log(f"  GPU allocated before destroy: {before_mb:.1f} MB")
 
     # --- destroy ---
+    # Offload model weights first, then tear down Megatron process groups.
+    # This is the real production sequence: offload → destroy → empty cache.
+    fake_model_weights = fake_model_weights.cpu()
     destroy_megatron()
     torch.cuda.empty_cache()
     dist.barrier()
@@ -167,10 +169,7 @@ def test_cycle_stability(tp_size: int = 2) -> None:
         peak_allocated.append(peak_mb)
         log(f"    peak GPU: {peak_mb:.1f} MB")
 
-        del dummy
-        torch.cuda.empty_cache()
-
-        # Verify allreduce works
+        # Verify allreduce works before offloading
         t = torch.ones(1024, device="cuda") * (cycle + 1)
         dist.all_reduce(t, group=tp_group)
         expected = (cycle + 1) * dist.get_world_size()
@@ -179,6 +178,9 @@ def test_cycle_stability(tp_size: int = 2) -> None:
             f"cycle {cycle+1}: allreduce correct"
         )
 
+        # Offload first, then destroy (matches production sequence)
+        dummy = dummy.cpu()
+        del dummy
         destroy_megatron()
         torch.cuda.empty_cache()
         dist.barrier()

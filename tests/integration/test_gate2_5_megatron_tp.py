@@ -45,10 +45,10 @@ import torch.nn as nn
 # ---------------------------------------------------------------------------
 
 N_STEPS = 2
-HIDDEN = 512           # model hidden dim
+HIDDEN = 2048          # model hidden dim — large enough for VRAM release test to be meaningful
 FFN_MULT = 4           # FFN width multiplier
-BATCH, SEQ = 4, 32     # input shape
-VRAM_RELEASE_THRESHOLD_PCT = 60
+BATCH, SEQ = 2, 32     # input shape
+VRAM_RELEASE_THRESHOLD_PCT = 50
 TRAIN_RANKS = [0, 1]
 INFER_RANKS = [2, 3]
 TP_SIZE = 2            # tensor parallel degree

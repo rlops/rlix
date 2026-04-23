@@ -60,11 +60,15 @@ def _load(monkeypatch: pytest.MonkeyPatch):
 
 
 class _FakeWorker:
-    """Synchronous fake for a ROLL training worker Ray actor."""
+    """Synchronous fake for a NeMo RL training worker Ray actor."""
 
     def __init__(self, *, fail_on_version: int | None = None):
         self.promoted_versions: list[int] = []
+        self.built_versions: list[int] = []
         self._fail_on = fail_on_version
+
+    def build_latest_bucket_cache(self, version: int) -> None:
+        self.built_versions.append(version)
 
     def promote_active_checkpoint(self, version: int) -> None:
         if self._fail_on is not None and version == self._fail_on:

@@ -175,7 +175,7 @@ def build_cpu_cache(model: Optional[nn.Module]) -> Optional[CPUBucketCache]:
             if tensor is None:   # Megatron TP layers store None for disabled biases
                 continue
             cache.store(name, shard_id=R(), tensor=tensor.cpu().contiguous())
-    log(f"  cache built: {len(cache.get_dirty_buckets())} buckets")
+    log(f"  cache built: {cache.size()} buckets")
     return cache
 
 
@@ -213,7 +213,7 @@ def broadcast_shard(
     received: Dict[str, Tuple[torch.Tensor, str]] = {}
 
     if R() == src_rank:
-        buckets = cache.get_dirty_buckets()
+        buckets = list(cache.get_all_buckets().values())
         n = len(buckets)
         cpu_tensors = [b.tensor.to(dtype=torch.float32).contiguous() for b in buckets]
         names = [b.param_name for b in buckets]
@@ -475,7 +475,7 @@ def main() -> None:
         # ----- Check inference had different weights BEFORE sync (divergence) -----
         log0("  [7] verify inference weights diverged from training before sync...")
         if local_rank == 2 and pre_sync_cache is not None:
-            pre = {b.param_name: b.tensor.float() for b in pre_sync_cache.get_dirty_buckets()}
+            pre = {b.param_name: b.tensor.float() for b in list(pre_sync_cache.get_all_buckets().values())}
             different = sum(
                 1 for name, (t, _) in received_from_0.items()
                 if name in pre and tensor_hash(t) != tensor_hash(pre[name])
@@ -486,7 +486,7 @@ def main() -> None:
                 log(f"  PASS step {step}: {different}/{len(received_from_0)} params diverged "
                     f"from rank0 before sync (rank 2)")
         if local_rank == 3 and pre_sync_cache is not None:
-            pre = {b.param_name: b.tensor.float() for b in pre_sync_cache.get_dirty_buckets()}
+            pre = {b.param_name: b.tensor.float() for b in list(pre_sync_cache.get_all_buckets().values())}
             different = sum(
                 1 for name, (t, _) in received_from_1.items()
                 if name in pre and tensor_hash(t) != tensor_hash(pre[name])

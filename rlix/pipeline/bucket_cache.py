@@ -1,40 +1,51 @@
-"""CPU-resident bucket cache for PP collective gather and selective weight sync.
+"""CPU-resident bucket cache for PP collective gather and weight sync.
 
-Each "bucket" is a single named parameter shard (``param_name``, ``shard_id``).
-``shard_id`` corresponds to a Pipeline-Parallel (PP) rank so that all PP ranks
-can push their layer slices into the single cache owner before a broadcast sync.
+Each ``BucketRecord`` packs multiple named parameters into a single contiguous
+uint8 CPU tensor (512-byte aligned offsets).  This format is shared between
+the IPC path (cpu_serialize ZMQ multipart) and the NCCL broadcast path
+(packed_broadcast_producer/consumer).
+
+Two-pointer versioning mirrors ROLL ``megatron_strategy.py:1049–1065``:
+- ``build_latest(version, buckets)`` — store a new version (not yet active).
+- ``promote(version)`` — atomically make it active; GC old versions.
+- ``get_active_buckets()`` — read active version (caller holds ``_cache_lock``).
 
 Thread-safety:
-    All public methods acquire ``_lock`` before mutating state.  The lock is a
-    plain ``threading.Lock``; Ray actor re-entrancy is not assumed.
+    All public methods acquire ``_cache_lock``.  ``selective_sync_active_cache``
+    holds the lock for the entire per-bucket transport loop (prevents a
+    concurrent ``promote`` / ``build_latest`` from racing the sender read).
 
 Typical lifecycle::
 
-    cache = CPUBucketCache()
+    cache = VersionedBucketCache()
 
-    # --- PP gather phase (all PP workers push to pp_rank==0 owner) ---
-    for pp_rank, (name, tensor) in enumerate(model_state):
-        cache.store(name, shard_id=pp_rank, tensor=tensor)
+    # --- init (base model) ---
+    cache.build_latest(-1, pack_model_weights(base_model))
+    cache.promote(-1)
 
-    # --- Selective sync: only push dirty buckets to infer workers ---
-    dirty = cache.get_dirty_buckets()
-    send(dirty)                        # transport layer
-    cache.mark_synced([(b.param_name, b.shard_id) for b in dirty])
+    # --- post train-step ---
+    cache.build_latest(step, pack_model_weights(new_model))
+    cache.promote(step)
 
-    # --- On next checkpoint, mark everything dirty again ---
-    cache.mark_all_dirty()
+    # --- sync ---
+    with cache._cache_lock:
+        buckets = cache.get_active_buckets()
+        for b in buckets:
+            transport(b)
 """
 
 from __future__ import annotations
 
+import io
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 try:
     import torch
     _Tensor = torch.Tensor
-except ImportError:  # pragma: no cover — allow import without torch installed
+    _HAS_TORCH = True
+except ImportError:  # pragma: no cover
     import types as _types
     _torch_stub = _types.ModuleType("torch")
 
@@ -43,154 +54,265 @@ except ImportError:  # pragma: no cover — allow import without torch installed
 
     _torch_stub.Tensor = _Tensor  # type: ignore[attr-defined]
     torch = _torch_stub  # type: ignore[assignment]
+    _HAS_TORCH = False
 
 
-# Public key type: (param_name, shard_id)
-BucketKey = Tuple[str, int]
+# 512-byte alignment matches NeMo RL ``policy/utils.py:calculate_aligned_size``
+_ALIGNMENT = 512
+
+
+def _aligned_offset(offset: int, alignment: int = _ALIGNMENT) -> int:
+    """Round *offset* up to the next multiple of *alignment*."""
+    return (offset + alignment - 1) // alignment * alignment
 
 
 @dataclass
-class Bucket:
-    """Single cached weight shard.
+class BucketRecord:
+    """Single packed weight buffer containing one or more named parameters.
+
+    All parameters are flattened, cast to uint8, and concatenated into a
+    single contiguous CPU tensor with 512-byte-aligned boundaries between
+    them.  This layout is directly usable as a ``cpu_serialize`` payload for
+    the ZMQ IPC path and as a broadcast buffer for the NCCL path.
 
     Attributes:
-        param_name: Full dotted parameter name (e.g. ``"model.layers.0.weight"``).
-        shard_id:   PP-rank index that owns this slice (0 for non-PP models).
-        tensor:     CPU clone of the weight tensor at the time of the last
-                    ``store()`` call.
-        dirty:      ``True`` if this bucket has been written since the last
-                    successful sync.  Reset to ``False`` by ``mark_synced()``.
+        param_names: HF param names packed in this buffer, in order.
+        shapes:      Per-param original shapes (used to split after receive).
+        dtypes:      Per-param original dtypes (used to cast after receive).
+        offsets:     Byte offsets into ``cpu_uint8_bucket`` for each param
+                     (length == len(param_names)).
+        used_bytes:  Total bytes actually written (bucket may be over-allocated).
+        cpu_uint8_bucket: Contiguous uint8 CPU tensor holding all params.
     """
 
-    param_name: str
-    shard_id: int
-    tensor: _Tensor
-    dirty: bool = True
-
-    def __repr__(self) -> str:  # pragma: no cover
-        shape = getattr(self.tensor, "shape", "?")
-        return (
-            f"Bucket(param_name={self.param_name!r}, shard_id={self.shard_id}, "
-            f"shape={shape}, dirty={self.dirty})"
-        )
+    param_names: List[str]
+    shapes: List  # List[torch.Size]
+    dtypes: List  # List[torch.dtype]
+    offsets: List[int]
+    used_bytes: int
+    cpu_uint8_bucket: _Tensor
 
 
-class CPUBucketCache:
-    """Thread-safe CPU-memory cache for model weight buckets.
+def _bucket_named_tensors(
+    named_tensors: List[Tuple[str, _Tensor]],
+) -> BucketRecord:
+    """Pack a list of ``(name, tensor)`` pairs into a single ``BucketRecord``.
 
-    The cache is keyed by ``(param_name, shard_id)``.  Tensors are stored as
-    CPU clones so the training GPU remains free for the next forward/backward
-    pass while the sync is in flight.
+    Each tensor is flattened and viewed as uint8, then concatenated with
+    512-byte alignment padding between params (mirrors ROLL's
+    ``send_recv_utils.py:214`` ``serialize_named_weights`` and NeMo RL's
+    ``calculate_aligned_size``).
 
     Args:
-        bucket_size_bytes: Reserved for future chunked-bucket support.  Currently
-            unused; each ``store()`` call maps one parameter shard to one bucket.
+        named_tensors: Non-empty list of ``(param_name, cpu_tensor)`` pairs.
+            Tensors must already be on CPU.
+
+    Returns:
+        A ``BucketRecord`` with all params packed into
+        ``cpu_uint8_bucket``.
+
+    Raises:
+        ValueError: If *named_tensors* is empty.
+    """
+    if not named_tensors:
+        raise ValueError("named_tensors must be non-empty")
+
+    param_names: List[str] = []
+    shapes = []
+    dtypes = []
+    uint8_views: List[_Tensor] = []
+    offsets: List[int] = []
+    current_offset = 0
+
+    for name, tensor in named_tensors:
+        shape = tensor.shape
+        dtype = tensor.dtype
+        # Flatten + view as uint8 (same as ROLL send_recv_utils.py:214)
+        uint8_view = tensor.detach().cpu().contiguous().flatten().view(torch.uint8)
+        nbytes = uint8_view.numel()
+
+        offsets.append(current_offset)
+        param_names.append(name)
+        shapes.append(shape)
+        dtypes.append(dtype)
+        uint8_views.append(uint8_view)
+
+        aligned = _aligned_offset(current_offset + nbytes)
+        current_offset = aligned
+
+    used_bytes = sum(t.numel() for t in uint8_views)
+    # Total allocated size includes alignment padding
+    total_bytes = current_offset
+
+    # Allocate contiguous buffer and copy each param into its aligned slot
+    bucket_buf = torch.zeros(total_bytes, dtype=torch.uint8)
+    for i, uint8_view in enumerate(uint8_views):
+        start = offsets[i]
+        nbytes = uint8_view.numel()
+        bucket_buf[start : start + nbytes].copy_(uint8_view)
+
+    return BucketRecord(
+        param_names=param_names,
+        shapes=shapes,
+        dtypes=dtypes,
+        offsets=offsets,
+        used_bytes=used_bytes,
+        cpu_uint8_bucket=bucket_buf,
+    )
+
+
+def unpack_bucket_record(
+    record: BucketRecord,
+) -> List[Tuple[str, _Tensor]]:
+    """Unpack a ``BucketRecord`` into a list of ``(name, tensor)`` pairs.
+
+    Inverse of ``_bucket_named_tensors``.  Used on the receiver side
+    (``update_parameter_in_bucket``) to reconstruct per-param tensors.
+
+    Args:
+        record: Packed bucket as produced by ``_bucket_named_tensors``.
+
+    Returns:
+        List of ``(param_name, tensor)`` in original order and dtype.
+    """
+    result: List[Tuple[str, _Tensor]] = []
+    buf = record.cpu_uint8_bucket
+    for name, shape, dtype, offset in zip(
+        record.param_names, record.shapes, record.dtypes, record.offsets
+    ):
+        num_elements = 1
+        for s in shape:
+            num_elements *= s
+        # Use torch.empty to get element size — never slice a uint8 buffer and view
+        # as a wider dtype (e.g. 1 uint8 byte cannot be viewed as float32 in real torch).
+        element_bytes = torch.empty(0, dtype=dtype).element_size()
+        nbytes = num_elements * element_bytes
+        flat = buf[offset : offset + nbytes].view(dtype)
+        tensor = flat.reshape(shape)
+        result.append((name, tensor))
+    return result
+
+
+class VersionedBucketCache:
+    """Thread-safe two-pointer CPU bucket cache with version tracking.
+
+    Mirrors ROLL ``megatron_strategy.py:1049–1065``:
+    - ``_latest_cached``: version just built (may not be active yet).
+    - ``_active_cached``: version safe to read for sync.
+
+    Only the cache owner (pp_rank==0, dp_rank==0, tp_rank==0, cp_rank==0)
+    ever stores buckets.  Non-owner workers hold an empty cache and return
+    immediately from ``build_latest`` / ``promote``.
+
+    GC invariant:
+        After each ``promote(v)`` call, all versions except
+        ``_latest_cached`` and ``_active_cached`` are deleted from
+        ``_cache_map``.  This keeps peak memory bounded to ≤ 2×model.
     """
 
-    def __init__(self, *, bucket_size_bytes: int = 256 * 1024 * 1024) -> None:
-        self._bucket_size_bytes = bucket_size_bytes
-        self._buckets: Dict[BucketKey, Bucket] = {}
-        self._lock = threading.Lock()
+    def __init__(self) -> None:
+        self._cache_map: Dict[int, List[BucketRecord]] = {}
+        self._latest_cached: Optional[int] = None
+        self._active_cached: Optional[int] = None
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------
-    # Write operations
+    # Write operations (called from training worker)
     # ------------------------------------------------------------------
 
-    def store(self, param_name: str, *, shard_id: int, tensor: _Tensor) -> None:
-        """Insert or overwrite the bucket for ``(param_name, shard_id)``.
+    def build_latest(self, version: int, buckets: List[BucketRecord]) -> None:
+        """Store *buckets* as the 'latest' version.
 
-        The tensor is cloned to CPU memory so the caller may immediately
-        reuse or free the source buffer.  The resulting bucket is always
-        marked ``dirty=True``.
+        Does **not** make this version active.  The pipeline calls
+        ``promote(version)`` separately after confirming the training step
+        has fully completed.
 
         Args:
-            param_name: Dotted parameter name, e.g. ``"transformer.h.0.weight"``.
-            shard_id:   PP rank index (use ``0`` for non-PP models).
-            tensor:     Source tensor (any device).  A CPU clone is stored.
+            version: Checkpoint version (step number, or ``-1`` for base model).
+            buckets: List of ``BucketRecord`` packed by ``_bucket_named_tensors``.
         """
-        cpu_tensor = tensor.cpu().clone()
-        key: BucketKey = (param_name, shard_id)
-        with self._lock:
-            self._buckets[key] = Bucket(
-                param_name=param_name,
-                shard_id=shard_id,
-                tensor=cpu_tensor,
-                dirty=True,
+        with self._cache_lock:
+            self._cache_map[version] = list(buckets)
+            self._latest_cached = version
+            self._gc_unlocked()
+
+    def promote(self, version: int) -> None:
+        """Switch the active pointer to *version*.
+
+        After this call, ``get_active_buckets()`` returns the buckets for
+        *version*.  Old versions (except ``_latest_cached``) are GC'd.
+
+        Args:
+            version: Must match a version passed to a prior ``build_latest``
+                call.  Raises ``KeyError`` if *version* was never built.
+        """
+        with self._cache_lock:
+            if version not in self._cache_map:
+                raise KeyError(
+                    f"VersionedBucketCache.promote: version {version} not found "
+                    f"(built versions: {sorted(self._cache_map)})"
+                )
+            self._active_cached = version
+            self._gc_unlocked()
+
+    def get_active_buckets(self) -> List[BucketRecord]:
+        """Return the buckets for the currently active version.
+
+        Must be called with ``_cache_lock`` held (caller is responsible).
+        Raises ``RuntimeError`` if ``promote()`` has never been called.
+        """
+        if self._active_cached is None:
+            raise RuntimeError(
+                "VersionedBucketCache: promote() has never been called. "
+                "Call build_latest() + promote() before reading active buckets."
             )
-
-    def mark_synced(self, keys: List[BucketKey]) -> None:
-        """Mark the given buckets as clean (successfully synced to infer workers).
-
-        Keys that are not present in the cache are silently ignored.
-
-        Args:
-            keys: Sequence of ``(param_name, shard_id)`` tuples to clear.
-        """
-        with self._lock:
-            for key in keys:
-                bucket = self._buckets.get(key)
-                if bucket is not None:
-                    bucket.dirty = False
-
-    def mark_all_dirty(self) -> None:
-        """Mark every bucket dirty (e.g. after a new training checkpoint is loaded)."""
-        with self._lock:
-            for bucket in self._buckets.values():
-                bucket.dirty = True
-
-    def mark_all_synced(self) -> None:
-        """Mark every bucket clean (bulk sync completed)."""
-        with self._lock:
-            for bucket in self._buckets.values():
-                bucket.dirty = False
-
-    def evict(self, param_name: str, *, shard_id: int) -> None:
-        """Remove a single bucket.  No-op if the key is not present."""
-        key: BucketKey = (param_name, shard_id)
-        with self._lock:
-            self._buckets.pop(key, None)
-
-    def evict_param(self, param_name: str) -> None:
-        """Remove all shards of *param_name* from the cache."""
-        with self._lock:
-            keys_to_remove = [k for k in self._buckets if k[0] == param_name]
-            for k in keys_to_remove:
-                del self._buckets[k]
-
-    def clear(self) -> None:
-        """Remove all buckets from the cache."""
-        with self._lock:
-            self._buckets.clear()
+        return self._cache_map[self._active_cached]
 
     # ------------------------------------------------------------------
-    # Read operations
+    # Read helpers
     # ------------------------------------------------------------------
 
-    def get_dirty_buckets(self) -> List[Bucket]:
-        """Return a snapshot list of all dirty buckets.
+    @property
+    def cache_ready_step(self) -> Optional[int]:
+        """The currently active version, or ``None`` if never promoted."""
+        with self._cache_lock:
+            return self._active_cached
 
-        The returned list is a snapshot; subsequent ``store()`` or
-        ``mark_synced()`` calls do not affect already-returned ``Bucket``
-        objects.
+    @property
+    def latest_version(self) -> Optional[int]:
+        """The most recently built version, or ``None`` if never built."""
+        with self._cache_lock:
+            return self._latest_cached
+
+    def is_version_built(self, version: int) -> bool:
+        """Return ``True`` if *version* has been built but not necessarily promoted."""
+        with self._cache_lock:
+            return version in self._cache_map
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _gc_unlocked(self) -> None:
+        """Delete all versions except ``_latest_cached`` and ``_active_cached``.
+
+        Called while holding ``_cache_lock`` — do NOT re-acquire.
         """
-        with self._lock:
-            return [b for b in self._buckets.values() if b.dirty]
-
-    def get_all_buckets(self) -> Dict[BucketKey, Bucket]:
-        """Return a shallow copy of the full bucket map (dirty and clean)."""
-        with self._lock:
-            return dict(self._buckets)
-
-    def size(self) -> int:
-        """Return the total number of buckets currently held."""
-        with self._lock:
-            return len(self._buckets)
+        keep = {v for v in (self._latest_cached, self._active_cached) if v is not None}
+        stale = [v for v in self._cache_map if v not in keep]
+        for v in stale:
+            del self._cache_map[v]
 
     # ------------------------------------------------------------------
     # Repr
     # ------------------------------------------------------------------
 
     def __repr__(self) -> str:  # pragma: no cover
-        with self._lock:
-            dirty = sum(1 for b in self._buckets.values() if b.dirty)
-            return f"CPUBucketCache(total={len(self._buckets)}, dirty={dirty})"
+        with self._cache_lock:
+            versions = sorted(self._cache_map)
+            return (
+                f"VersionedBucketCache("
+                f"active={self._active_cached}, "
+                f"latest={self._latest_cached}, "
+                f"versions={versions})"
+            )

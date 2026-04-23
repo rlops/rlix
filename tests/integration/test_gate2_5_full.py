@@ -153,7 +153,7 @@ def build_cpu_cache(model: Optional[nn.Module]) -> Optional[CPUBucketCache]:
     with torch.no_grad():
         for name, tensor in model.state_dict().items():
             cache.store(name, shard_id=0, tensor=tensor.cpu().contiguous())
-    log(f"  cache built: {len(cache.get_dirty_buckets())} buckets")
+    log(f"  cache built: {cache.size()} buckets")
     return cache
 
 
@@ -183,7 +183,7 @@ def broadcast_cache(
     gloo_group: dist.ProcessGroup,
 ) -> Dict[str, Tuple[torch.Tensor, str]]:
     """
-    Broadcast all dirty buckets from src_rank to every rank in gloo_group.
+    Broadcast all buckets from src_rank to every rank in gloo_group.
     Uses 3 CPU (gloo) broadcasts:
       #1  float32 header  — n_buckets + elem-counts encoded as (hi>>20, lo&FFFFF)
       #2  bfloat16 matrix — param names + per-bucket hashes
@@ -196,7 +196,7 @@ def broadcast_cache(
 
     if R() == src_rank:
         assert cache is not None
-        buckets = cache.get_dirty_buckets()
+        buckets = list(cache.get_all_buckets().values())
         n = len(buckets)
         cpu_tensors = [b.tensor.to(dtype=torch.bfloat16).contiguous() for b in buckets]
         names = [b.param_name for b in buckets]

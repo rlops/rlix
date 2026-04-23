@@ -93,6 +93,10 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         self._reference_cluster_id = f"{self._pipeline_id}_{REFERENCE_CLUSTER_NAME}"
         # Lazily resolved and cached on first use by _get_coordinator_handle().
         self._coordinator_handle: Any = None
+        # Lifecycle tracker for ROLL's CPU bucket cache (Feature 4).
+        self._lifecycle: Any = None  # BucketCacheLifecycle, set during initialize_pipeline
+        # Version of the last committed base-model checkpoint (= _lifecycle.cache_ready_step).
+        self._current_weight_version: Optional[int] = None
 
     def _get_coordinator_handle(self) -> Any:
         """Resolve and cache the per-pipeline PipelineCoordinator actor handle.
@@ -436,6 +440,22 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
             ray.get(self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
             ray.get(self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
 
+            # Feature 4: create lifecycle tracker and promote initial base-model cache (version=-1).
+            from rlix.pipeline.bucket_cache_lifecycle import BucketCacheLifecycle
+
+            self._lifecycle = BucketCacheLifecycle(
+                pipeline_id=self._pipeline_id,
+                workers=list(self.actor_train.workers),
+            )
+            ray.get(
+                [
+                    worker.promote_active_checkpoint.remote(BucketCacheLifecycle._BASE_VERSION)
+                    for worker in self.actor_train.workers
+                ]
+            )
+            self._lifecycle.promote_base()
+            self._current_weight_version = self._lifecycle.cache_ready_step
+
             self._initialized = True
             return ActionResponse(success=True)
 
@@ -459,6 +479,8 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         """Pipeline-local expand helper.
 
         Train scheduler does weight load + routing; val scheduler does routing-only.
+        After expand, publishes _current_weight_version so newly-woken workers are
+        consistent with active workers (same cache_ready_step, no version bump).
         """
         if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
             raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
@@ -466,6 +488,10 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
             # Train: load model states + routing update.
             result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=False))
             ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
+            # Publish current weight version for the newly-woken workers.
+            # Version is the same cache_ready_step (expand does not train, no version bump).
+            if self._lifecycle is not None:
+                self._current_weight_version = self._lifecycle.cache_ready_step
             return cast(Dict[str, Any], result)
 
     def _ensure_initialized(self) -> None:
@@ -691,29 +717,14 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                         train_batch_size=self.pipeline_config.rollout_batch_size,
                         include_val=bool(eval_this_step),
                     )
-                    # Release actor_train from the previous step only if it was a non-warmup step
-                    # (which leaves actor_train allocated with ACTOR_TRAINING). Warmup steps release
-                    # all train clusters in Phase 15, so there is nothing to release — use plain request.
-                    prev_step_had_actor_train = global_step > 0 and (
-                        self.pipeline_config.adv_estimator != "gae"
-                        or self.pipeline_config.critic_warmup <= (global_step - 1)
+                    # actor_train GPUs are released immediately at end of each training step (Feature 4/5/6),
+                    # so there is never a deferred release to perform here — always use plain request.
+                    allocated_actor_infer_gpus = self._request_cluster_gpus(
+                        cluster_id=self._actor_infer_cluster_id,
+                        priority=Priority.GENERATION,
+                        global_step=global_step,
+                        step_target_estimate=generation_step_target_estimate,
                     )
-                    if prev_step_had_actor_train:
-                        allocated_actor_infer_gpus = self._notify_release_then_request_cluster_gpus(
-                            release_cluster_id=self._actor_train_cluster_id,
-                            release_global_step=global_step - 1,
-                            request_cluster_id=self._actor_infer_cluster_id,
-                            request_priority=Priority.GENERATION,
-                            request_global_step=global_step,
-                            request_step_target_estimate=generation_step_target_estimate,
-                        )
-                    else:
-                        allocated_actor_infer_gpus = self._request_cluster_gpus(
-                            cluster_id=self._actor_infer_cluster_id,
-                            priority=Priority.GENERATION,
-                            global_step=global_step,
-                            step_target_estimate=generation_step_target_estimate,
-                        )
                     assert len(allocated_actor_infer_gpus) > 0
                     is_partial_allocation = len(allocated_actor_infer_gpus) < len(expected_gpus)
                     logger.info(
@@ -1009,7 +1020,7 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                             metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
                         metrics["time/train_step"] = actor_train_timer.last
 
-                        # Promote trained weights so expand_sampler can rehydrate infer workers on the next step.
+                        # Feature 4: promote trained weights and track version.
                         # Megatron-only: DeepSpeed strategies do not implement promote_active_checkpoint.
                         checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
                         try:
@@ -1019,17 +1030,30 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                                     for worker in self.actor_train.workers
                                 ]
                             )
+                            assert self._lifecycle is not None
+                            self._lifecycle.promote(checkpoint_version)
                         except RuntimeError as e:
                             if "does not support" in str(e):
                                 logger.info("[train][%s] skipping promote_active_checkpoint: %s", self._pipeline_id, e)
                             else:
                                 raise
 
-                        if self.pipeline_config.is_actor_infer_colocated:
-                            self.actor_train.offload_states(blocking=True)
+                        # Offload training weights to CPU before syncing to active infer workers.
+                        self.actor_train.offload_states(blocking=True)
 
-                        # actor_train (ACTOR_TRAINING) remains allocated; released at next step's Phase 4.5.
-                        last_train_cluster_allocated = self._actor_train_cluster_id
+                        # Feature 5/6: sync base weights to all currently-active infer dp ranks.
+                        coordinator = self._get_coordinator_handle()
+                        ray.get(coordinator.sync_base_weights_to_active.remote())
+
+                        # Publish version after sync completes so expand_sampler sees a consistent state.
+                        self._current_weight_version = self._lifecycle.cache_ready_step
+
+                        # Release actor_train GPUs immediately (not deferred to next step).
+                        self._notify_release_cluster_gpus(
+                            cluster_id=self._actor_train_cluster_id,
+                            global_step=global_step,
+                        )
+                        last_train_cluster_allocated = None
                     else:
                         # Warmup: Phase 15 released actor_train → critic, then critic was released above.
                         # No train cluster remains allocated.

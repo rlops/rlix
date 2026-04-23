@@ -1,287 +1,414 @@
-"""Unit tests for CPUBucketCache — CPU-resident bucket cache for PP gather + selective sync.
+"""Unit tests for BucketRecord, VersionedBucketCache, and _bucket_named_tensors.
 
-Tests are fully self-contained: no Ray, no ROLL, no CUDA required.
-The module under test only depends on the stdlib and (optionally) torch,
-which is stubbed if unavailable.
+Uses REAL torch when installed (e.g. on Vast GPU instances), which is the
+only way to correctly validate data integrity through pack/unpack round-trips.
+
+When torch is not available (e.g. CI without GPU deps), torch-dependent tests
+are skipped via pytest.importorskip, and structural/threading tests still run.
 """
 from __future__ import annotations
 
-import sys
 import threading
-import types
+from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Torch stub — allows tests to run without a GPU environment
+# Real torch — mandatory for data-integrity tests
 # ---------------------------------------------------------------------------
 
+torch = pytest.importorskip("torch", reason="real torch required for bucket_cache tests")
 
-def _make_torch_stub() -> types.ModuleType:
-    torch_stub = types.ModuleType("torch")
+import importlib.util  # noqa: E402
+import sys  # noqa: E402
 
-    class _Tensor:
-        def __init__(self, data: list | Any, *, dtype=None):
-            self._data = list(data) if not isinstance(data, _Tensor) else data._data
-            self.dtype = dtype
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_BUCKET_CACHE_PATH = REPO_ROOT / "rlix" / "pipeline" / "bucket_cache.py"
 
-        def cpu(self):
-            return self
+# Import bucket_cache.py directly by file path to bypass rlix/pipeline/__init__.py,
+# which eagerly imports full_finetune_pipeline (requires codetiming, roll, etc.)
+_spec = importlib.util.spec_from_file_location("rlix.pipeline.bucket_cache", _BUCKET_CACHE_PATH)
+_mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+sys.modules["rlix.pipeline.bucket_cache"] = _mod
+_spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 
-        def clone(self):
-            return _Tensor(self._data[:], dtype=self.dtype)
-
-        def __eq__(self, other):  # type: ignore[override]
-            if isinstance(other, _Tensor):
-                return self._data == other._data
-            return NotImplemented
-
-        def __repr__(self):
-            return f"_Tensor({self._data})"
-
-    torch_stub.Tensor = _Tensor  # type: ignore[attr-defined]
-
-    def _tensor(data, *, dtype=None):
-        return _Tensor(data, dtype=dtype)
-
-    torch_stub.tensor = _tensor  # type: ignore[attr-defined]
-    return torch_stub
+BucketRecord = _mod.BucketRecord
+VersionedBucketCache = _mod.VersionedBucketCache
+_aligned_offset = _mod._aligned_offset
+_bucket_named_tensors = _mod._bucket_named_tensors
+unpack_bucket_record = _mod.unpack_bucket_record
 
 
 # ---------------------------------------------------------------------------
-# Import helper — loads CPUBucketCache with stubbed deps
+# Helpers
 # ---------------------------------------------------------------------------
 
-_BUCKET_CACHE_MODULE = "rlix.pipeline.bucket_cache"
+def _t(*values, dtype=None) -> torch.Tensor:
+    """Create a CPU float32 (or specified dtype) tensor from values."""
+    return torch.tensor(list(values), dtype=dtype or torch.float32)
 
 
-def _load_bucket_cache(monkeypatch: pytest.MonkeyPatch):
-    """Load rlix.pipeline.bucket_cache with all heavy deps stubbed."""
-    # Remove prior imports so each test gets a fresh module state.
-    for key in list(sys.modules):
-        if key.startswith("rlix"):
-            monkeypatch.delitem(sys.modules, key, raising=False)
-
-    if "torch" not in sys.modules:
-        monkeypatch.setitem(sys.modules, "torch", _make_torch_stub())
-
-    import importlib
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parents[1]
-    rlix_root = repo_root / "rlix"
-
-    # Minimal package stubs so importlib can resolve rlix.pipeline.bucket_cache
-    for pkg in ("rlix", "rlix.pipeline"):
-        mod = types.ModuleType(pkg)
-        mod.__path__ = [str(rlix_root / pkg.replace("rlix.", "").replace(".", "/"))]  # type: ignore[attr-defined]
-        monkeypatch.setitem(sys.modules, pkg, mod)
-
-    import sys as _sys
-    _sys.path.insert(0, str(repo_root))
-
-    return importlib.import_module(_BUCKET_CACHE_MODULE)
+def _assert_tensors_equal(a: torch.Tensor, b: torch.Tensor, msg: str = "") -> None:
+    """Assert two tensors have identical dtype, shape, and values."""
+    assert a.dtype == b.dtype, f"{msg} dtype mismatch: {a.dtype} vs {b.dtype}"
+    assert a.shape == b.shape, f"{msg} shape mismatch: {a.shape} vs {b.shape}"
+    assert torch.allclose(a.float(), b.float()), f"{msg} value mismatch:\n{a}\nvs\n{b}"
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# _aligned_offset
+# ---------------------------------------------------------------------------
+
+
+def test_aligned_offset_zero():
+    assert _aligned_offset(0) == 0
+
+
+def test_aligned_offset_boundary():
+    assert _aligned_offset(512) == 512
+
+
+def test_aligned_offset_one_over():
+    assert _aligned_offset(513) == 1024
+
+
+def test_aligned_offset_arbitrary():
+    assert _aligned_offset(1) == 512
+    assert _aligned_offset(511) == 512
+    assert _aligned_offset(1023) == 1024
+    assert _aligned_offset(1024) == 1024
+    assert _aligned_offset(1025) == 1536
+
+
+# ---------------------------------------------------------------------------
+# _bucket_named_tensors — structure
+# ---------------------------------------------------------------------------
+
+
+def test_bucket_named_tensors_single_structure():
+    t = _t(1.0, 2.0, 3.0, 4.0)
+    record = _bucket_named_tensors([("w", t)])
+    assert record.param_names == ["w"]
+    assert len(record.shapes) == 1
+    assert len(record.dtypes) == 1
+    assert record.offsets == [0]
+    assert record.used_bytes == t.numel() * t.element_size()
+    assert record.cpu_uint8_bucket.numel() >= record.used_bytes
+    assert record.cpu_uint8_bucket.dtype == torch.uint8
+
+
+def test_bucket_named_tensors_empty_raises():
+    with pytest.raises(ValueError, match="non-empty"):
+        _bucket_named_tensors([])
+
+
+def test_bucket_named_tensors_second_param_aligned():
+    """Second param must start at 512-byte-aligned offset regardless of first param size."""
+    t1 = _t(*[1.0] * 10)  # 10 × 4 = 40 bytes → first aligned boundary is 512
+    t2 = _t(*[2.0] * 5)
+    record = _bucket_named_tensors([("a", t1), ("b", t2)])
+    assert record.offsets[0] == 0
+    assert record.offsets[1] == 512
+
+
+def test_bucket_named_tensors_used_bytes_excludes_padding():
+    """used_bytes = raw element bytes only, without alignment padding."""
+    t = _t(1.0, 2.0)  # 2 × 4 = 8 bytes
+    record = _bucket_named_tensors([("w", t)])
+    assert record.used_bytes == 8
+    # But total buffer is at least 512 (one aligned slot)
+    assert record.cpu_uint8_bucket.numel() >= 512
+
+
+def test_bucket_named_tensors_multi_field_count():
+    t1 = _t(1.0, 2.0)
+    t2 = _t(3.0, 4.0, 5.0)
+    t3 = _t(6.0)
+    record = _bucket_named_tensors([("a", t1), ("b", t2), ("c", t3)])
+    assert record.param_names == ["a", "b", "c"]
+    assert len(record.offsets) == 3
+    assert len(record.shapes) == 3
+    assert len(record.dtypes) == 3
+
+
+# ---------------------------------------------------------------------------
+# _bucket_named_tensors + unpack_bucket_record — DATA INTEGRITY round-trip
+# ---------------------------------------------------------------------------
+# These tests verify that actual float values survive the pack → unpack cycle.
+# This is the critical check the stub-based tests cannot provide.
+
+
+def test_round_trip_single_float32():
+    original = _t(1.5, -2.7, 3.14, 0.0)
+    record = _bucket_named_tensors([("layer.weight", original)])
+    unpacked = unpack_bucket_record(record)
+    assert len(unpacked) == 1
+    name, recovered = unpacked[0]
+    assert name == "layer.weight"
+    _assert_tensors_equal(recovered, original, msg="float32 round-trip")
+
+
+def test_round_trip_multi_params():
+    a = _t(1.0, 2.0, 3.0)
+    b = _t(-1.0, -2.0)
+    c = _t(100.0, 200.0, 300.0, 400.0)
+    record = _bucket_named_tensors([("a", a), ("b", b), ("c", c)])
+    unpacked = unpack_bucket_record(record)
+    assert [n for n, _ in unpacked] == ["a", "b", "c"]
+    _assert_tensors_equal(unpacked[0][1], a, msg="param a")
+    _assert_tensors_equal(unpacked[1][1], b, msg="param b")
+    _assert_tensors_equal(unpacked[2][1], c, msg="param c")
+
+
+def test_round_trip_preserves_negative_values():
+    t = _t(-999.5, -0.001, -1e6)
+    record = _bucket_named_tensors([("w", t)])
+    name, recovered = unpack_bucket_record(record)[0]
+    _assert_tensors_equal(recovered, t, msg="negative values")
+
+
+def test_round_trip_preserves_zero():
+    t = torch.zeros(8, dtype=torch.float32)
+    record = _bucket_named_tensors([("w", t)])
+    _, recovered = unpack_bucket_record(record)[0]
+    _assert_tensors_equal(recovered, t, msg="all-zeros")
+
+
+def test_round_trip_2d_shape():
+    """Shape must be preserved through pack/unpack."""
+    original = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])  # (2, 3)
+    record = _bucket_named_tensors([("mat", original)])
+    _, recovered = unpack_bucket_record(record)[0]
+    assert recovered.shape == original.shape, f"shape mismatch: {recovered.shape}"
+    _assert_tensors_equal(recovered, original, msg="2D shape")
+
+
+def test_round_trip_float16():
+    """float16 tensors must survive byte reinterpretation correctly."""
+    original = _t(1.0, 2.0, 3.0, 4.0, dtype=torch.float16)
+    record = _bucket_named_tensors([("w", original)])
+    _, recovered = unpack_bucket_record(record)[0]
+    assert recovered.dtype == torch.float16
+    _assert_tensors_equal(recovered, original, msg="float16 round-trip")
+
+
+def test_round_trip_large_param():
+    """Large tensor (>512 bytes) must not corrupt data across the alignment boundary."""
+    original = torch.arange(256, dtype=torch.float32)  # 256 × 4 = 1024 bytes
+    record = _bucket_named_tensors([("big", original)])
+    _, recovered = unpack_bucket_record(record)[0]
+    _assert_tensors_equal(recovered, original, msg="large param")
+
+
+def test_round_trip_mixed_dtypes():
+    """float32 and float16 params in the same bucket must both recover correctly."""
+    a = _t(1.0, 2.0, dtype=torch.float32)
+    b = _t(3.0, 4.0, dtype=torch.float16)
+    record = _bucket_named_tensors([("a", a), ("b", b)])
+    unpacked = {n: t for n, t in unpack_bucket_record(record)}
+    _assert_tensors_equal(unpacked["a"], a, msg="float32 in mixed")
+    _assert_tensors_equal(unpacked["b"], b, msg="float16 in mixed")
+
+
+def test_round_trip_many_small_params():
+    """Many small params (each << 512 bytes) must all recover correctly."""
+    originals = {f"w{i}": _t(float(i)) for i in range(20)}
+    record = _bucket_named_tensors(list(originals.items()))
+    unpacked = {n: t for n, t in unpack_bucket_record(record)}
+    for name, original in originals.items():
+        _assert_tensors_equal(unpacked[name], original, msg=f"param {name}")
+
+
+# ---------------------------------------------------------------------------
+# _bucket_named_tensors — buffer is CPU uint8, contiguous
+# ---------------------------------------------------------------------------
+
+
+def test_bucket_buffer_is_cpu():
+    t = _t(1.0)
+    record = _bucket_named_tensors([("w", t)])
+    assert record.cpu_uint8_bucket.device.type == "cpu"
+
+
+def test_bucket_buffer_is_contiguous():
+    t = _t(1.0, 2.0, 3.0)
+    record = _bucket_named_tensors([("w", t)])
+    assert record.cpu_uint8_bucket.is_contiguous()
+
+
+def test_bucket_buffer_dtype_is_uint8():
+    t = _t(1.0)
+    record = _bucket_named_tensors([("w", t)])
+    assert record.cpu_uint8_bucket.dtype == torch.uint8
+
+
+# ---------------------------------------------------------------------------
+# unpack_bucket_record — element_size via torch.empty (not buf slice)
+# ---------------------------------------------------------------------------
+
+
+def test_unpack_element_size_does_not_read_buf_slice():
+    """Verify unpack works even when offset+1 < dtype.itemsize (float32 needs 4 bytes).
+
+    Previously buggy: buf[offset:offset+1].view(float32) would raise RuntimeError
+    in real torch because 1 uint8 byte cannot be reinterpreted as float32.
+    """
+    t = _t(42.0)  # 1-element float32 = 4 bytes; offset=0, buf[0:1] has 1 byte
+    record = _bucket_named_tensors([("w", t)])
+    # This must not raise RuntimeError
+    unpacked = unpack_bucket_record(record)
+    _, recovered = unpacked[0]
+    _assert_tensors_equal(recovered, t, msg="single element float32 unpack")
+
+
+# ---------------------------------------------------------------------------
+# VersionedBucketCache — two-pointer versioning
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture()
-def mod(monkeypatch):
-    return _load_bucket_cache(monkeypatch)
+def cache():
+    return VersionedBucketCache()
 
 
 @pytest.fixture()
-def cache(mod):
-    return mod.CPUBucketCache()
+def sample_buckets():
+    t = _t(1.0, 2.0, 3.0, 4.0)
+    return [_bucket_named_tensors([("w", t)])]
 
 
-@pytest.fixture()
-def tensor(mod):
-    """Return a factory for test tensors."""
-    import sys as _sys
-    torch = _sys.modules["torch"]
-
-    def _make(data):
-        return torch.tensor(data)
-
-    return _make
+def test_cache_ready_step_none_before_promote(cache):
+    assert cache.cache_ready_step is None
 
 
-# ---------------------------------------------------------------------------
-# Construction
-# ---------------------------------------------------------------------------
+def test_latest_version_none_before_build(cache):
+    assert cache.latest_version is None
 
 
-def test_new_cache_is_empty(cache):
-    assert cache.size() == 0
+def test_build_latest_sets_latest_not_active(cache, sample_buckets):
+    cache.build_latest(0, sample_buckets)
+    assert cache.latest_version == 0
+    assert cache.cache_ready_step is None  # active not set yet
 
 
-def test_get_all_buckets_empty(cache):
-    assert cache.get_all_buckets() == {}
+def test_promote_sets_active(cache, sample_buckets):
+    cache.build_latest(0, sample_buckets)
+    cache.promote(0)
+    assert cache.cache_ready_step == 0
 
 
-def test_get_dirty_buckets_empty(cache):
-    assert cache.get_dirty_buckets() == []
+def test_get_active_buckets_raises_before_promote(cache, sample_buckets):
+    cache.build_latest(0, sample_buckets)
+    with pytest.raises(RuntimeError, match="promote"):
+        with cache._cache_lock:
+            cache.get_active_buckets()
 
 
-# ---------------------------------------------------------------------------
-# store()
-# ---------------------------------------------------------------------------
+def test_promote_unknown_version_raises(cache):
+    with pytest.raises(KeyError):
+        cache.promote(99)
 
 
-def test_store_single_bucket(cache, tensor):
-    t = tensor([1.0, 2.0])
-    cache.store("weight.A", shard_id=0, tensor=t)
-    assert cache.size() == 1
-
-
-def test_store_marks_dirty_by_default(cache, tensor):
-    cache.store("weight.A", shard_id=0, tensor=tensor([1.0]))
-    dirty = cache.get_dirty_buckets()
-    assert len(dirty) == 1
-    assert dirty[0].param_name == "weight.A"
-    assert dirty[0].shard_id == 0
-    assert dirty[0].dirty is True
-
-
-def test_store_multiple_shards(cache, tensor):
-    """PP gather: multiple shard_ids for the same param_name are stored independently."""
-    cache.store("layer.weight", shard_id=0, tensor=tensor([1.0]))
-    cache.store("layer.weight", shard_id=1, tensor=tensor([2.0]))
-    cache.store("layer.weight", shard_id=2, tensor=tensor([3.0]))
-    assert cache.size() == 3
-    dirty = cache.get_dirty_buckets()
-    assert len(dirty) == 3
-
-
-def test_store_overwrites_existing(cache, tensor):
-    t1 = tensor([1.0])
-    t2 = tensor([99.0])
-    cache.store("w", shard_id=0, tensor=t1)
-    cache.store("w", shard_id=0, tensor=t2)
-    # Size unchanged (overwrite, not append)
-    assert cache.size() == 1
-    b = cache.get_all_buckets()[("w", 0)]
-    assert b.tensor == t2
-
-
-def test_store_clones_tensor(cache, tensor, mod):
-    """Stored tensor must be a CPU clone independent of the original."""
-    t = tensor([5.0, 6.0])
-    cache.store("w", shard_id=0, tensor=t)
-    b = cache.get_all_buckets()[("w", 0)]
-    # The stored tensor must be a distinct object.
-    assert b.tensor is not t
-
-
-def test_store_different_params(cache, tensor):
-    cache.store("a.weight", shard_id=0, tensor=tensor([1.0]))
-    cache.store("b.weight", shard_id=0, tensor=tensor([2.0]))
-    assert cache.size() == 2
-    keys = set(cache.get_all_buckets().keys())
-    assert keys == {("a.weight", 0), ("b.weight", 0)}
+def test_base_version_minus_one(cache, sample_buckets):
+    cache.build_latest(-1, sample_buckets)
+    cache.promote(-1)
+    assert cache.cache_ready_step == -1
 
 
 # ---------------------------------------------------------------------------
-# mark_synced()
+# GC invariant — only latest + active kept
 # ---------------------------------------------------------------------------
 
 
-def test_mark_synced_clears_dirty(cache, tensor):
-    cache.store("w", shard_id=0, tensor=tensor([1.0]))
-    cache.mark_synced([("w", 0)])
-    assert cache.get_dirty_buckets() == []
+def test_gc_keeps_only_latest_and_active(cache):
+    def _make(val):
+        return [_bucket_named_tensors([("w", _t(float(val)))])]
+
+    for step in range(5):
+        cache.build_latest(step, _make(step))
+        cache.promote(step)
+
+    with cache._cache_lock:
+        # After promote(4): active=4, latest=4 → only 4 kept
+        assert set(cache._cache_map.keys()) == {4}
 
 
-def test_mark_synced_partial(cache, tensor):
-    """mark_synced on a subset leaves other buckets dirty."""
-    cache.store("a", shard_id=0, tensor=tensor([1.0]))
-    cache.store("b", shard_id=0, tensor=tensor([2.0]))
-    cache.mark_synced([("a", 0)])
-    dirty = cache.get_dirty_buckets()
-    assert len(dirty) == 1
-    assert dirty[0].param_name == "b"
+def test_gc_keeps_latest_and_active_when_different(cache):
+    def _make(val):
+        return [_bucket_named_tensors([("w", _t(float(val)))])]
 
-
-def test_mark_synced_missing_key_is_noop(cache, tensor):
-    """Calling mark_synced with a key not in cache must not raise."""
-    cache.store("w", shard_id=0, tensor=tensor([1.0]))
-    cache.mark_synced([("nonexistent", 99)])  # must not raise
-    assert len(cache.get_dirty_buckets()) == 1
-
-
-def test_store_after_sync_marks_dirty_again(cache, tensor):
-    cache.store("w", shard_id=0, tensor=tensor([1.0]))
-    cache.mark_synced([("w", 0)])
-    cache.store("w", shard_id=0, tensor=tensor([2.0]))
-    dirty = cache.get_dirty_buckets()
-    assert len(dirty) == 1
-    assert dirty[0].dirty is True
+    cache.build_latest(0, _make(0))
+    cache.promote(0)
+    cache.build_latest(1, _make(1))
+    # Not promoted yet — active=0, latest=1
+    with cache._cache_lock:
+        assert set(cache._cache_map.keys()) == {0, 1}
 
 
 # ---------------------------------------------------------------------------
-# mark_all_dirty() / mark_all_synced()
+# Active buckets contain the correct data after promote
 # ---------------------------------------------------------------------------
 
 
-def test_mark_all_dirty_resets_clean_buckets(cache, tensor):
-    cache.store("a", shard_id=0, tensor=tensor([1.0]))
-    cache.store("b", shard_id=0, tensor=tensor([2.0]))
-    cache.mark_synced([("a", 0), ("b", 0)])
-    assert cache.get_dirty_buckets() == []
-    cache.mark_all_dirty()
-    assert len(cache.get_dirty_buckets()) == 2
+def test_get_active_buckets_returns_correct_version_data(cache):
+    """The data returned by get_active_buckets() must match what was built for that version."""
+    v0_data = _t(10.0, 20.0)
+    v1_data = _t(30.0, 40.0)
+
+    cache.build_latest(0, [_bucket_named_tensors([("w", v0_data)])])
+    cache.promote(0)
+    cache.build_latest(1, [_bucket_named_tensors([("w", v1_data)])])
+    cache.promote(1)
+
+    with cache._cache_lock:
+        buckets = cache.get_active_buckets()
+
+    assert len(buckets) == 1
+    _, recovered = unpack_bucket_record(buckets[0])[0]
+    _assert_tensors_equal(recovered, v1_data, msg="active buckets after promote(1)")
 
 
-def test_mark_all_synced_clears_all(cache, tensor):
-    cache.store("a", shard_id=0, tensor=tensor([1.0]))
-    cache.store("b", shard_id=0, tensor=tensor([2.0]))
-    cache.mark_all_synced()
-    assert cache.get_dirty_buckets() == []
+def test_get_active_buckets_does_not_return_stale_version(cache):
+    """After promote(1), active data must be v1, not v0."""
+    v0_data = _t(1.0, 2.0)
+    v1_data = _t(99.0, 88.0)
+
+    cache.build_latest(0, [_bucket_named_tensors([("w", v0_data)])])
+    cache.promote(0)
+    cache.build_latest(1, [_bucket_named_tensors([("w", v1_data)])])
+    cache.promote(1)
+
+    with cache._cache_lock:
+        buckets = cache.get_active_buckets()
+
+    _, recovered = unpack_bucket_record(buckets[0])[0]
+    # Must NOT match v0 data
+    assert not torch.allclose(recovered.float(), v0_data.float()), (
+        "get_active_buckets returned stale v0 data after promote(1)"
+    )
+    _assert_tensors_equal(recovered, v1_data, msg="active must be v1")
 
 
 # ---------------------------------------------------------------------------
-# evict()
+# Version tracking across multiple steps
 # ---------------------------------------------------------------------------
 
 
-def test_evict_removes_bucket(cache, tensor):
-    cache.store("w", shard_id=0, tensor=tensor([1.0]))
-    cache.evict("w", shard_id=0)
-    assert cache.size() == 0
-    assert ("w", 0) not in cache.get_all_buckets()
+def test_sequential_step_promotion(cache):
+    for step in range(5):
+        t = _t(float(step))
+        cache.build_latest(step, [_bucket_named_tensors([("w", t)])])
+        cache.promote(step)
+        assert cache.cache_ready_step == step
 
 
-def test_evict_missing_key_is_noop(cache):
-    cache.evict("nonexistent", shard_id=0)  # must not raise
-
-
-def test_evict_param_removes_all_shards(cache, tensor):
-    """evict_param() removes every shard of a given param_name."""
-    for i in range(4):
-        cache.store("layer.w", shard_id=i, tensor=tensor([float(i)]))
-    assert cache.size() == 4
-    cache.evict_param("layer.w")
-    assert cache.size() == 0
-
-
-# ---------------------------------------------------------------------------
-# clear()
-# ---------------------------------------------------------------------------
-
-
-def test_clear_empties_cache(cache, tensor):
-    cache.store("w", shard_id=0, tensor=tensor([1.0]))
-    cache.store("x", shard_id=0, tensor=tensor([2.0]))
-    cache.clear()
-    assert cache.size() == 0
-    assert cache.get_all_buckets() == {}
-    assert cache.get_dirty_buckets() == []
+def test_is_version_built(cache, sample_buckets):
+    assert not cache.is_version_built(0)
+    cache.build_latest(0, sample_buckets)
+    assert cache.is_version_built(0)
+    cache.promote(0)
+    assert cache.is_version_built(0)
 
 
 # ---------------------------------------------------------------------------
@@ -289,66 +416,20 @@ def test_clear_empties_cache(cache, tensor):
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_stores_are_safe(cache, tensor):
-    """Multiple threads writing distinct keys must not corrupt the cache."""
-    n_threads = 8
-    n_params_per_thread = 50
+def test_concurrent_build_latest_safe(cache):
     errors: list[Exception] = []
 
-    def _writer(thread_id: int):
+    def _writer(version: int):
         try:
-            for i in range(n_params_per_thread):
-                cache.store(f"thread{thread_id}.w{i}", shard_id=0, tensor=tensor([float(i)]))
-        except Exception as exc:  # pragma: no cover
+            t = _t(float(version))
+            cache.build_latest(version, [_bucket_named_tensors([("w", t)])])
+        except Exception as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=_writer, args=(t,)) for t in range(n_threads)]
+    threads = [threading.Thread(target=_writer, args=(i,)) for i in range(16)]
     for th in threads:
         th.start()
     for th in threads:
         th.join()
 
     assert errors == [], f"Thread errors: {errors}"
-    assert cache.size() == n_threads * n_params_per_thread
-
-
-def test_concurrent_store_and_mark_synced(cache, tensor):
-    """Store + mark_synced concurrently must not raise or lose data."""
-    cache.store("w", shard_id=0, tensor=tensor([1.0]))
-    errors: list[Exception] = []
-
-    def _syncer():
-        try:
-            for _ in range(100):
-                cache.mark_synced([("w", 0)])
-        except Exception as exc:  # pragma: no cover
-            errors.append(exc)
-
-    def _storer():
-        try:
-            for i in range(100):
-                cache.store("w", shard_id=0, tensor=tensor([float(i)]))
-        except Exception as exc:  # pragma: no cover
-            errors.append(exc)
-
-    t1 = threading.Thread(target=_syncer)
-    t2 = threading.Thread(target=_storer)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
-
-    assert errors == []
-
-
-# ---------------------------------------------------------------------------
-# Bucket dataclass properties
-# ---------------------------------------------------------------------------
-
-
-def test_bucket_repr_is_informative(cache, tensor):
-    cache.store("layer.0.weight", shard_id=2, tensor=tensor([1.0]))
-    b = cache.get_all_buckets()[("layer.0.weight", 2)]
-    r = repr(b)
-    assert "layer.0.weight" in r
-    assert "2" in r

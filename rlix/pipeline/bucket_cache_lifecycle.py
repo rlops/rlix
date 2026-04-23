@@ -150,12 +150,24 @@ class BucketCacheLifecycle:
         )
 
     def promote_base(self) -> None:
-        """Convenience wrapper: promote the initial base-model cache (version=-1).
+        """Build and promote the initial base-model cache (version=-1).
 
-        Called once during pipeline initialisation after
-        ``build_latest_bucket_cache(-1)`` has been called on all workers.
+        Called once during pipeline initialisation.  This method first calls
+        ``build_latest_bucket_cache(-1)`` on all training workers so that the
+        PP collective gather completes, then promotes version -1 to active.
+        Equivalent to the init sequence in NeMo RL megatron_policy_worker:
+            ray.get([w.build_latest_bucket_cache.remote(-1) for w in workers])
+            ray.get([w.promote_active_checkpoint.remote(-1) for w in workers])
         """
-        self.promote(self._base_version)
+        version = self._base_version
+        logger.info(
+            "[BucketCacheLifecycle] promote_base_build pipeline_id=%s version=%d",
+            self.pipeline_id, version,
+        )
+        for worker in self._workers:
+            worker.build_latest_bucket_cache(version)
+
+        self.promote(version)
 
     def is_ready(self) -> bool:
         """Return ``True`` if at least one cache version has been promoted."""

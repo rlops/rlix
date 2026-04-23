@@ -17,7 +17,7 @@ Four modules were ported/created:
 |------|--------|---------|
 | `rlix/pipeline/bucket_cache.py` | ported from nemo-integration | Thread-safe in-process cache keyed by `(param_name, shard_id)` |
 | `rlix/pipeline/bucket_receiver.py` | ported | PP-shard merging + state-dict patching on inference workers |
-| `rlix/pipeline/model_update_service_cached.py` | ported | Orchestrates populate-from-PP + dirty-sync-to-inference |
+| `rlix/pipeline/model_update_service_cached.py` | ported | Orchestrates populate-from-PP + sync-to-inference |
 | `rlix/pipeline/bucket_cache_lifecycle.py` | **new** | Wraps ROLL's `promote_active_checkpoint` with version tracking |
 
 ## Architecture
@@ -35,9 +35,8 @@ scheduler (before expand)
   └─ lifecycle.is_ready_for_version(v)  → True/False
 
 ModelUpdateServiceCached.sync_from_cache(tgt_dp_ranks)
-  ├─ get dirty buckets from CPUBucketCache
-  ├─ send BucketUpdateRequest to each inference worker
-  └─ mark buckets clean after ACK
+  ├─ get all buckets from CPUBucketCache
+  └─ send BucketUpdateRequest to each inference worker
 ```
 
 ## Module Details
@@ -46,10 +45,8 @@ ModelUpdateServiceCached.sync_from_cache(tgt_dp_ranks)
 
 Thread-safe dict keyed by `(param_name: str, shard_id: int)`.
 
-- `store(key, data)` — marks key dirty
-- `get_dirty_buckets()` — returns `{key: data}` for all dirty entries
-- `mark_synced(keys)` / `mark_all_synced()` — clears dirty flags
-- `mark_all_dirty()` — re-marks everything dirty (used after populate)
+- `store(key, data)` — stores tensor to CPU
+- `get_all_buckets()` — returns `{key: Bucket}` for all entries
 - `evict(key)` / `evict_param(param_name)` / `clear()` — memory management
 
 `shard_id` maps to PP rank so that multi-rank PP gathers can be stored as
@@ -69,10 +66,9 @@ separate shards and reassembled on the receiver side.
 
 Owns a `CPUBucketCache`.
 
-- `populate_cache_from_workers(workers)` — calls `get_pp_weight_shards(pp_rank)` on
-  each worker, stores with `shard_id=pp_rank`, then `mark_all_dirty()`
-- `sync_from_cache(tgt_workers)` — sends dirty buckets as `BucketUpdateRequest`,
-  marks clean on success
+- `populate_cache_from_workers(workers)` — clears cache, then calls `get_pp_weight_shards(pp_rank)` on
+  each worker, stores with `shard_id=pp_rank`
+- `sync_from_cache(tgt_workers)` — sends all cached buckets as `BucketUpdateRequest`
 
 ### BucketCacheLifecycle (`bucket_cache_lifecycle.py`)
 

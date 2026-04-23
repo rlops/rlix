@@ -113,7 +113,7 @@ def run_cycle(
         cache = CPUBucketCache()
         for name, tensor in weights.items():
             cache.store(name, shard_id=0, tensor=tensor.contiguous())
-        buckets = cache.get_dirty_buckets()
+        buckets = list(cache.get_all_buckets().values())
 
         for bucket in buckets:
             gpu_t = bucket.tensor.cuda().contiguous()

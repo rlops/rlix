@@ -169,7 +169,7 @@ def build_cpu_cache(model: nn.Module) -> Optional[CPUBucketCache]:
     with torch.no_grad():
         for name, tensor in model.state_dict().items():
             cache.store(name, shard_id=0, tensor=tensor.cpu().contiguous())
-    log0(f"  cache built: {len(cache.get_dirty_buckets())} buckets")
+    log0(f"  cache built: {cache.size()} buckets")
     return cache
 
 
@@ -207,7 +207,7 @@ def selective_sync(
     gloo_group: dist.ProcessGroup,
 ) -> Dict[str, torch.Tensor]:
     """
-    Broadcast all dirty buckets from rank 0 to all ranks via gloo (CPU).
+    Broadcast all buckets from rank 0 to all ranks via gloo (CPU).
 
     All 3 broadcasts use gloo to avoid NCCL on SYS-topology PCIe hardware
     where P2P and SHM are unavailable — NCCL hangs on first collective init.
@@ -220,7 +220,7 @@ def selective_sync(
     ROW = 216          # 200 name bytes + 16 hash chars per param
 
     if R() == SENDER_RANK and cache is not None:
-        buckets = cache.get_dirty_buckets()
+        buckets = list(cache.get_all_buckets().values())
         n = len(buckets)
 
         cpu_tensors = [b.tensor.to(dtype=torch.bfloat16).contiguous() for b in buckets]

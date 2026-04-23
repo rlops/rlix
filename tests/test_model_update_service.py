@@ -334,3 +334,82 @@ def test_sync_selected_workers_invalid_rank_raises(monkeypatch):
 
     with pytest.raises(ValueError, match="Invalid tgt_dp_ranks"):
         svc.sync_selected_workers([99])  # rank 99 doesn't exist in world_size=1
+
+
+# ---------------------------------------------------------------------------
+# sync_selected_workers — finalize_weight_update is called after sync
+# ---------------------------------------------------------------------------
+
+
+def test_sync_selected_workers_calls_finalize_weight_update(monkeypatch):
+    """finalize_weight_update must be called on each target dp_rank after sync."""
+    mod, ray_stub = _load_mus(monkeypatch)
+
+    finalize_called_ranks = []
+
+    class FakeWorkerWithFinalize(MagicMock):
+        def __init__(self, dp_rank, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._dp_rank = dp_rank
+            # Setup remote attribute for finalize_weight_update
+            self.finalize_weight_update = MagicMock()
+            self.finalize_weight_update.remote = MagicMock(
+                side_effect=lambda: finalize_called_ranks.append(self._dp_rank)
+            )
+            self.selective_sync_active_cache = MagicMock()
+            self.selective_sync_active_cache.remote = MagicMock(return_value=MagicMock())
+            self.setup_collective_group = MagicMock()
+            self.setup_collective_group.remote = MagicMock(return_value=MagicMock())
+            self.get_node_ip = MagicMock()
+            self.get_node_ip.remote = MagicMock(return_value=MagicMock())
+            self.get_free_port = MagicMock()
+            self.get_free_port.remote = MagicMock(return_value=MagicMock())
+
+    src_worker = FakeWorkerWithFinalize(dp_rank=0)
+    src_worker.selective_sync_active_cache.remote.return_value = MagicMock()
+    tgt_worker0 = FakeWorkerWithFinalize(dp_rank=0)
+    tgt_worker1 = FakeWorkerWithFinalize(dp_rank=1)
+
+    src_rank_info = FakeWorkerRankInfo(pp_rank=0, dp_rank=0, tp_rank=0, cp_rank=0)
+    src_cluster = FakeCluster(
+        [src_worker],
+        [src_rank_info],
+        {0: [{"node_rank": 0, "gpu_rank": 0, "rank": 0}]},
+    )
+    tgt_cluster = FakeCluster(
+        [tgt_worker0, tgt_worker1],
+        [FakeWorkerRankInfo(), FakeWorkerRankInfo()],
+        {
+            0: [{"node_rank": 0, "gpu_rank": 1, "rank": 0}],
+            1: [{"node_rank": 0, "gpu_rank": 2, "rank": 1}],
+        },
+        world_size=2,
+    )
+
+    svc = mod.ModelUpdateService.__new__(mod.ModelUpdateService)
+    svc.pipeline_id = "test_finalize"
+    svc.src_cluster = src_cluster
+    svc.tgt_cluster = tgt_cluster
+    svc._sync_nonce = "fin"
+    svc._master_addr_by_src_rank = {}
+    svc._timeout_s = None
+    svc._pg_timeout_s = None
+    svc._get_master_addr = MagicMock(return_value="127.0.0.1")
+    svc._build_comm_plan_for_sender = MagicMock(
+        return_value=(
+            {0: {"master_addr": "127.0.0.1", "master_port": 12345, "ipc_targets": [], "broadcast_tgt_local_ranks": []}},
+            "group_fin",
+            [],  # no broadcast ranks — IPC only, skip setup_collective_group
+        )
+    )
+    svc._release_master_port_claim = MagicMock()
+
+    import ray as _ray
+    _ray.get = MagicMock(return_value=[None])
+
+    svc.sync_selected_workers([0, 1], verify=False)
+
+    # finalize_weight_update.remote() must have been invoked for both target ranks
+    assert sorted(finalize_called_ranks) == [0, 1], (
+        f"Expected finalize on ranks [0, 1], got {finalize_called_ranks}"
+    )

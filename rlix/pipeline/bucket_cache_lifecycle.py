@@ -186,6 +186,25 @@ class BucketCacheLifecycle:
                 return False
             return int(self._cache_ready_step) >= int(version)  # type: ignore[arg-type]
 
+    def mark_promoted(self, version: int) -> None:
+        """Record *version* as active without calling any workers.
+
+        Use this when the pipeline layer has already performed build and promote
+        via ``ray.get([w.build_latest_bucket_cache.remote(v) ...])`` and
+        ``ray.get([w.promote_active_checkpoint.remote(v) ...])`` directly,
+        and only needs the lifecycle tracker to reflect the new version.
+
+        Args:
+            version: Checkpoint version that was already built and promoted externally.
+        """
+        version = int(version)
+        with self._lock:
+            self._cache_ready_step = version
+        logger.info(
+            "[BucketCacheLifecycle] mark_promoted pipeline_id=%s version=%d",
+            self.pipeline_id, version,
+        )
+
     def reset(self) -> None:
         """Reset version tracking (e.g. after a pipeline restart).
 

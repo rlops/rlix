@@ -1,7 +1,7 @@
 """Gate 2.5 — Part 2: Selective sync via dynamic NCCL group.
 
 Validates the CPU-cache → dynamic-NCCL-group → target-rank weight transfer
-that ModelUpdateServiceCached uses during expand.
+that ModelUpdateService uses during expand.
 
 Design (2 GPUs):
   - rank 0 = training worker / cache owner (sender)
@@ -12,11 +12,11 @@ need to broadcast Python objects over NCCL (which is unreliable for
 control-plane messages).
 
 Flow per cycle:
-  1. rank 0 builds CPUBucketCache from in-memory weights.
+  1. rank 0 packs weights into a BucketRecord (Feature 4 CPU bucket cache).
   2. rank 1 has a zeroed "inference" state dict on GPU.
   3. A dynamic NCCL group is created for [0, 1].
-  4. rank 0 stages each bucket CPU→GPU and broadcasts it.
-  5. rank 1 receives each tensor and writes it to its state dict.
+  4. rank 0 stages the packed uint8 bucket CPU→GPU and broadcasts it.
+  5. rank 1 receives the buffer, unpacks per-param tensors, writes to infer_sd.
   6. Dynamic group is destroyed.
   7. rank 1 verifies bit-exact match vs. the known ground-truth weights.
   8. Repeat N_SYNC_CYCLES times to test group create/destroy stability.
@@ -58,7 +58,8 @@ def _load_mod(name, file):
 
 _pd = REPO_ROOT / "rlix" / "pipeline"
 _bc_mod = _load_mod("rlix.pipeline.bucket_cache", _pd / "bucket_cache.py")
-CPUBucketCache = _bc_mod.CPUBucketCache
+_bucket_named_tensors = _bc_mod._bucket_named_tensors
+unpack_bucket_record = _bc_mod.unpack_bucket_record
 
 SENDER = 0
 RECEIVER = 1
@@ -100,9 +101,11 @@ def run_cycle(
     weights: Dict[str, torch.Tensor],
     infer_sd: Dict[str, torch.Tensor],
 ) -> None:
-    """
-    rank 0: build cache, create group, broadcast each bucket CPU→GPU.
-    rank 1: create group, receive each broadcast, write to infer_sd.
+    """Feature 4: pack weights into BucketRecord, broadcast via dynamic NCCL group.
+
+    rank 0: pack all weights into one BucketRecord (CPU uint8 buffer),
+            stage buffer CPU→GPU, broadcast packed buffer.
+    rank 1: receive packed buffer, unpack per-param tensors, write to infer_sd.
     All ranks in world must call new_group.
     """
     # Both ranks call new_group — required even if not in the group.
@@ -110,20 +113,62 @@ def run_cycle(
     dynamic_group = dist.new_group(ranks=[SENDER, RECEIVER], backend="nccl")
 
     if R() == SENDER:
-        cache = CPUBucketCache()
-        for name, tensor in weights.items():
-            cache.store(name, shard_id=0, tensor=tensor.contiguous())
-        buckets = list(cache.get_all_buckets().values())
+        # Feature 4: pack all params into a single BucketRecord (CPU uint8 buffer).
+        named_tensors = [(name, tensor.cpu().contiguous()) for name, tensor in weights.items()]
+        record = _bucket_named_tensors(named_tensors)
 
-        for bucket in buckets:
-            gpu_t = bucket.tensor.cuda().contiguous()
-            dist.broadcast(gpu_t, src=SENDER, group=dynamic_group)
+        # Stage CPU→GPU and broadcast the packed buffer.
+        gpu_buf = record.cpu_uint8_bucket.cuda().contiguous()
+        # Broadcast buffer size first so receiver can allocate correctly.
+        size_tensor = torch.tensor([gpu_buf.numel()], dtype=torch.int64, device="cuda")
+        dist.broadcast(size_tensor, src=SENDER, group=dynamic_group)
+        dist.broadcast(gpu_buf, src=SENDER, group=dynamic_group)
+
+        # Broadcast metadata (param_names, shapes, dtypes, offsets) via CPU barrier.
+        # Both ranks know PARAM_NAMES/shapes/dtypes from the deterministic seed,
+        # so we use that shared knowledge to skip Python-object NCCL broadcast.
 
     elif R() == RECEIVER:
-        for name in PARAM_NAMES:
-            buf = torch.zeros(TENSOR_ELEMENTS, dtype=torch.bfloat16, device="cuda")
-            dist.broadcast(buf, src=SENDER, group=dynamic_group)
-            infer_sd[name].copy_(buf)
+        # Receive the packed buffer size.
+        size_tensor = torch.zeros(1, dtype=torch.int64, device="cuda")
+        dist.broadcast(size_tensor, src=SENDER, group=dynamic_group)
+        buf_size = int(size_tensor.item())
+
+        # Allocate and receive the packed uint8 buffer.
+        gpu_buf = torch.zeros(buf_size, dtype=torch.uint8, device="cuda")
+        dist.broadcast(gpu_buf, src=SENDER, group=dynamic_group)
+
+        # Reconstruct a BucketRecord from the received buffer using known metadata.
+        # In production this metadata travels via IPC/ZMQ; here we use the deterministic seed.
+        # Build metadata to match what sender packed (weights are deterministic — same on both ranks).
+        param_names_list = list(weights.keys())
+        shapes_list = [weights[n].shape for n in param_names_list]
+        dtypes_list = [weights[n].dtype for n in param_names_list]
+        # Recompute offsets (same logic as _bucket_named_tensors).
+        offsets_list: List[int] = []
+        current = 0
+        for n in param_names_list:
+            offsets_list.append(current)
+            ne = 1
+            for s in weights[n].shape:
+                ne *= s
+            nbytes = ne * torch.empty(0, dtype=weights[n].dtype).element_size()
+            aligned = (current + nbytes + 511) // 512 * 512
+            current = aligned
+
+        BucketRecord = _bc_mod.BucketRecord
+        record = BucketRecord(
+            param_names=param_names_list,
+            shapes=shapes_list,
+            dtypes=dtypes_list,
+            offsets=offsets_list,
+            used_bytes=buf_size,
+            cpu_uint8_bucket=gpu_buf.cpu(),
+        )
+        unpacked = unpack_bucket_record(record)
+        for name, tensor in unpacked:
+            if name in infer_sd:
+                infer_sd[name].copy_(tensor.to(infer_sd[name].device))
 
     dist.destroy_process_group(dynamic_group)
     dist.barrier()

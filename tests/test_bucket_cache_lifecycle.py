@@ -284,6 +284,35 @@ def test_concurrent_is_ready_for_version_safe(lifecycle):
 # ---------------------------------------------------------------------------
 
 
+def test_mark_promoted_updates_version_without_calling_workers(mod):
+    """mark_promoted() records the version but does NOT call any worker methods."""
+    worker = _FakeWorker()
+    lc = mod.BucketCacheLifecycle(pipeline_id="pipe-mark", workers=[worker])
+
+    assert lc.cache_ready_step is None
+
+    lc.mark_promoted(-1)
+
+    assert lc.cache_ready_step == -1
+    assert lc.is_ready_for_version(-1) is True
+    # Worker should NOT have been called — the pipeline layer handles real promotion
+    assert worker.promoted_versions == []
+
+
+def test_mark_promoted_then_promote_continues_tracking(mod):
+    """mark_promoted() for init then promote() for training steps work together."""
+    workers = [_FakeWorker()]
+    lc = mod.BucketCacheLifecycle(pipeline_id="pipe-seq", workers=workers)
+
+    lc.mark_promoted(-1)
+    assert lc.cache_ready_step == -1
+
+    lc.promote(1)
+    assert lc.cache_ready_step == 1
+    # Only the promote() call goes to workers, not mark_promoted()
+    assert workers[0].promoted_versions == [1]
+
+
 def test_full_lifecycle_roundtrip(mod):
     """Simulate pipeline init + 3 train steps + expand readiness check."""
     workers = [_FakeWorker(), _FakeWorker()]

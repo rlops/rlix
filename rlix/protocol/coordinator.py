@@ -51,3 +51,13 @@ class Coordinator(ABC):
             loras_to_sync: List of LoRA names to sync.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def sync_base_weights_to_active(self) -> None:
+        """Push trained base model weights to all currently-awake infer workers.
+
+        Called after train_step + promote + offload, before releasing actor_train GPUs.
+        Syncs full base model (no LoRA adapters) to active infer dp ranks.
+        Skipped if all infer workers are sleeping (they receive weights via expand on wake).
+        """
+        raise NotImplementedError

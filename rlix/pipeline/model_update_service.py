@@ -372,7 +372,27 @@ class ModelUpdateService:
         # NCCL groups are destroyed inside selective_sync_active_cache (owner side) before returning.
         # ray.get(sync_refs) above confirms teardown is complete.
 
-        # --- Phase 3: Post-sync verification ---
+        # --- Phase 3: Worker-side finalization ---
+        # Feature 6 (spec: nemorl-port-plan.md:488-490, 504-509, 624-632):
+        # After all buckets land, each target worker must run finalize_weight_update()
+        # to complete post-loading processing (FP8 KV cache etc.).
+        finalize_refs = [
+            self.tgt_cluster.rank2worker[int(dp_rank)].finalize_weight_update.remote()
+            for dp_rank in tgt_dp_ranks
+        ]
+        self._ray_get_with_timeout(
+            finalize_refs,
+            timeout_s=self._timeout_s,
+            desc=(
+                "[ModelUpdateService] finalize_weight_update "
+                f"pipeline_id={self.pipeline_id} sync_id={sync_id} tgt_dp_ranks={tgt_dp_ranks}"
+            ),
+        )
+        logger.info(
+            f"[ModelUpdateService] finalize_weight_update_ok pipeline_id={self.pipeline_id} sync_id={sync_id}"
+        )
+
+        # --- Phase 5: Post-sync verification ---
         # The cache owner returns weight_stats (checksums / norms) alongside the sync result.
         # We forward these to each target worker's verify_model to confirm weights landed correctly.
         if verify:

@@ -440,20 +440,16 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
             ray.get(self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
             ray.get(self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
 
-            # Feature 4: create lifecycle tracker and promote initial base-model cache (version=-1).
+            # Feature 4: create lifecycle tracker. The initial base-model cache (version=-1)
+            # was already built and promoted above (before actor_infer init). Record the
+            # version in the lifecycle without re-calling workers.
             from rlix.pipeline.bucket_cache_lifecycle import BucketCacheLifecycle
 
             self._lifecycle = BucketCacheLifecycle(
                 pipeline_id=self._pipeline_id,
                 workers=list(self.actor_train.workers),
             )
-            ray.get(
-                [
-                    worker.promote_active_checkpoint.remote(BucketCacheLifecycle._BASE_VERSION)
-                    for worker in self.actor_train.workers
-                ]
-            )
-            self._lifecycle.promote_base()
+            self._lifecycle.mark_promoted(BucketCacheLifecycle._BASE_VERSION)
             self._current_weight_version = self._lifecycle.cache_ready_step
 
             self._initialized = True
@@ -1020,10 +1016,17 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                             metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
                         metrics["time/train_step"] = actor_train_timer.last
 
-                        # Feature 4: promote trained weights and track version.
-                        # Megatron-only: DeepSpeed strategies do not implement promote_active_checkpoint.
+                        # Feature 4: build CPU bucket cache, then promote to active.
+                        # Build must precede promote (spec: nemorl-port-plan.md:332-338).
+                        # Megatron-only: DeepSpeed strategies do not implement these methods.
                         checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
                         try:
+                            ray.get(
+                                [
+                                    worker.build_latest_bucket_cache.remote(checkpoint_version)
+                                    for worker in self.actor_train.workers
+                                ]
+                            )
                             ray.get(
                                 [
                                     worker.promote_active_checkpoint.remote(checkpoint_version)
@@ -1031,10 +1034,10 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                                 ]
                             )
                             assert self._lifecycle is not None
-                            self._lifecycle.promote(checkpoint_version)
+                            self._lifecycle.mark_promoted(checkpoint_version)
                         except RuntimeError as e:
                             if "does not support" in str(e):
-                                logger.info("[train][%s] skipping promote_active_checkpoint: %s", self._pipeline_id, e)
+                                logger.info("[train][%s] skipping bucket cache build/promote: %s", self._pipeline_id, e)
                             else:
                                 raise
 

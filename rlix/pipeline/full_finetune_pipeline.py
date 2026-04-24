@@ -542,17 +542,20 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
             ]
             ray.get(finalize_refs)
 
-            # Step 2: Wake overlap ranks and activate routing (skip_load=True — weights
-            # were already synced in step 1; ROLL only needs to update active_dp_ranks).
-            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
-            ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
-
-            # Step 3+4: Publish current weight version (no version bump on expand).
+            # Step 2: Publish version BEFORE activating routing.
+            # Spec (nemorl-port-plan.md lines 602-608): version must be published before
+            # activate_dp_ranks so the collector sees the correct weight version as soon
+            # as newly expanded ranks start serving requests.
             if self._lifecycle is not None:
                 self._current_weight_version = self._lifecycle.cache_ready_step
                 _tc = self._get_trajectory_collector()
                 if _tc is not None:
                     ray.get(_tc.set_weight_version.remote(self._current_weight_version))
+
+            # Step 3: Activate routing AFTER version is published.
+            # skip_load=True — weights already synced in step 1.
+            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
+            ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
             return cast(Dict[str, Any], result)
 
     def _ensure_initialized(self) -> None:

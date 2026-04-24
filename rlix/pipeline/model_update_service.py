@@ -34,19 +34,49 @@ class ModelUpdateService:
     - Calls into sender-side sync, which serializes via sender cache_lock.
     """
 
-    def __init__(self, *, pipeline_id: str, src_cluster: Cluster, tgt_cluster: Cluster):
+    def __init__(
+        self,
+        *,
+        pipeline_id: str,
+        src_cluster: Cluster,
+        tgt_cluster: Cluster,
+        model_update_transport: str = "cpu_serialize",
+        bucket_size_bytes: Optional[int] = None,
+    ):
         """Initialize the model update service for a single pipeline.
 
         Args:
             pipeline_id: Unique identifier for the pipeline this service belongs to.
             src_cluster: Training cluster that holds the authoritative model weights.
             tgt_cluster: Inference cluster whose workers will receive weight updates.
+            model_update_transport: Transport mode for colocated (IPC) weight transfer.
+                ``"cpu_serialize"`` — DMA to pinned CPU tensor, send via ZMQ multipart
+                (default; avoids GPU memory for the staging buffer).
+                ``"cuda_ipc"`` — CUDA IPC handle zero-copy (lower latency, requires
+                sender and receiver on the same physical GPU).
+                Non-colocated (cross-GPU) transfers always use the dynamic NCCL
+                broadcast path regardless of this setting.
+            bucket_size_bytes: Maximum bytes per bucket when staging CPU→GPU during
+                sync.  Must be set explicitly in production; ``None`` skips the VRAM
+                budget guard (acceptable only in tests / single-GPU setups).
+                Spec: nemorl-port-plan.md line 343.
         """
         if not isinstance(pipeline_id, str) or pipeline_id == "":
             raise ValueError("pipeline_id must be non-empty str")
+        _valid_transports = {"cpu_serialize", "cuda_ipc"}
+        if model_update_transport not in _valid_transports:
+            raise ValueError(
+                f"model_update_transport={model_update_transport!r} is not valid; "
+                f"choose one of {sorted(_valid_transports)}"
+            )
+        if bucket_size_bytes is not None and (not isinstance(bucket_size_bytes, int) or bucket_size_bytes <= 0):
+            raise ValueError("bucket_size_bytes must be a positive int or None")
+
         self.pipeline_id = pipeline_id
         self.src_cluster: Any = src_cluster
         self.tgt_cluster: Any = tgt_cluster
+        self.model_update_transport: str = model_update_transport
+        self.bucket_size_bytes: Optional[int] = bucket_size_bytes
 
         # Nonce scopes NCCL group names to this service instance, avoiding collisions
         # when multiple services coexist (e.g. after a coordinator restart).
@@ -346,6 +376,7 @@ class ModelUpdateService:
                         tgt_device_mapping=tgt_device_mapping,
                         tgt_num_gpus_per_worker=int(tgt_num_gpus_per_worker),
                         adapters_to_sync=adapters_to_sync,
+                        model_update_transport=self.model_update_transport,
                     )
                 )
             sync_results = self._ray_get_with_timeout(
@@ -365,14 +396,45 @@ class ModelUpdateService:
                 "This is a fail-fast guard to avoid indefinite hangs in sync_selected_workers."
             ) from exc
         finally:
-            # Release only after the full barrier — on failure, remote workers
-            # may still hold the port; leaking the claim is safer than a collision.
-            if sync_completed:
-                self._release_master_port_claim(master_addr=master_addr, master_port=master_port)
-        # NCCL groups are destroyed inside selective_sync_active_cache (owner side) before returning.
-        # ray.get(sync_refs) above confirms teardown is complete.
+            # On failure: intentionally leak the port claim — remote workers may still hold
+            # the port and releasing it would risk collision on a future sync.
+            # On success: release is deferred to AFTER receiver teardown (Phase 4 below),
+            # so the claim covers the full sync+teardown cycle per spec (lines 380-389).
+            pass
 
-        # --- Phase 3: Post-sync verification ---
+        # --- Phase 4: Receiver-side NCCL group teardown ---
+        # The sender destroys its group inside selective_sync_active_cache before returning.
+        # Receivers must also destroy their side — the group_name is shared.
+        # Port claim is released AFTER teardown so it covers the full cycle.
+        # Spec: nemorl-port-plan.md lines 380-389.
+        if tgt_ranks_in_group:
+            teardown_refs = [
+                self.tgt_cluster.rank2worker[int(tgt_rank)].destroy_collective_group.remote(group_name)
+                for tgt_rank in tgt_ranks_in_group
+            ]
+            self._ray_get_with_timeout(
+                teardown_refs,
+                timeout_s=self._timeout_s,
+                desc=(
+                    "[ModelUpdateService] destroy_collective_group (receivers) "
+                    f"pipeline_id={self.pipeline_id} sync_id={sync_id} tgt_dp_ranks={tgt_dp_ranks}"
+                ),
+            )
+            logger.info(
+                "[ModelUpdateService] receiver_nccl_teardown_ok "
+                f"pipeline_id={self.pipeline_id} sync_id={sync_id}"
+            )
+
+        # Release port claim after full teardown cycle (spec: nemorl-port-plan.md lines 380-389).
+        if sync_completed:
+            self._release_master_port_claim(master_addr=master_addr, master_port=master_port)
+
+        # --- Phase 5: Post-sync verification ---
+        # Spec (nemorl-port-plan.md line 624-632): finalize_weight_update() is owned
+        # by the PIPELINE, not ModelUpdateService — the pipeline calls it after
+        # sync_selected_workers() returns, because the pipeline controls the full
+        # expand sequence (sync → finalize → version_publish → activate_routing).
+        # ModelUpdateService does NOT call finalize here.
         # The cache owner returns weight_stats (checksums / norms) alongside the sync result.
         # We forward these to each target worker's verify_model to confirm weights landed correctly.
         if verify:

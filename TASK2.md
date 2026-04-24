@@ -174,15 +174,20 @@ python tests/integration/test_gate2_5_trajectory_collector.py
 
 ```python
 # 在测试或调试时手动构造 bucket cache 并验证 pack/unpack
-import torch
-import sys
-sys.path.insert(0, ".")  # rlix repo root
+import torch, importlib.util, sys
+from pathlib import Path
 
-from rlix.pipeline.bucket_cache import (
-    _bucket_named_tensors,
-    unpack_bucket_record,
-    VersionedBucketCache,
-)
+# 直接加载文件（避免 rlix package __init__ 的重依赖）
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod; spec.loader.exec_module(mod); return mod
+
+repo = Path(__file__).parent  # rlix repo root
+bc = _load("rlix.pipeline.bucket_cache", repo / "rlix/pipeline/bucket_cache.py")
+_bucket_named_tensors = bc._bucket_named_tensors
+unpack_bucket_record  = bc.unpack_bucket_record
+VersionedBucketCache  = bc.VersionedBucketCache
 
 # 1. 打包
 named_tensors = [("fc1.weight", torch.randn(256, 256)),

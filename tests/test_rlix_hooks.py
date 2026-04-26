@@ -216,6 +216,19 @@ class TestGrpoTrainHookOrdering:
         # Should complete without error even with hooks=None
         grpo_train(_Cfg(), hooks=None)
 
+    def test_begin_progress_batch_called_before_before_generation(self) -> None:
+        # begin_progress_batch must precede before_generation each step so that
+        # _count_intended_for_step is set when Task 7 reads it as step_target_estimate.
+        rec = _RecordingHooks()
+        self._run(rec, num_steps=1)
+        method_names = [name for name, _ in rec.calls]
+        begin_idx = method_names.index("begin_progress_batch")
+        gen_idx = method_names.index("before_generation")
+        assert begin_idx < gen_idx, (
+            f"begin_progress_batch (pos {begin_idx}) must come before "
+            f"before_generation (pos {gen_idx})"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Task 6: begin_progress_batch / end_progress_batch

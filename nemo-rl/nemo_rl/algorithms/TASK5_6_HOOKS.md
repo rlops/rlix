@@ -13,11 +13,11 @@ Task 5 在训练循环里打入 hook 接口；Task 6 在 hook 里实现进度上
 ```
 nemo-rl/nemo_rl/algorithms/
 ├── rlix_hooks.py        # Task 5 + 6 核心实现
-├── grpo.py              # grpo_train() stub，含 5 个 hook 插入点
+├── grpo.py              # grpo_train() stub，含 hook 插入点
 └── TASK5_6_HOOKS.md     # 本文档
 
 tests/
-└── test_rlix_hooks.py   # 30 个单元测试，无 GPU/Ray 依赖
+└── test_rlix_hooks.py   # 31 个单元测试，无 GPU/Ray 依赖
 ```
 
 ---
@@ -59,7 +59,7 @@ NemoRLRLixHooks(
 )
 ```
 
-### `grpo.py` 中的插桩
+### `grpo.py` 中的完整调用顺序
 
 ```python
 DO_TIME_SHARING: bool = False  # RLix 模式下设为 True
@@ -68,8 +68,11 @@ def grpo_train(config, *, hooks=None):
     if hooks is None:
         hooks = NoOpRLixHooks()
     for step in range(num_steps):
+        # begin_progress_batch 必须在 before_generation 之前调用（见下方说明）
+        hooks.begin_progress_batch(step, step_trajectory_target)
         hooks.before_generation(step)
         # ... prepare_for_generation → generate → finish_generation ...
+        # hooks.end_progress_batch(step, n) 在 generation 循环内每批调用
         hooks.after_generation(step)
         # ... compute_advantages ...
         hooks.before_training(step)
@@ -83,11 +86,30 @@ def grpo_train(config, *, hooks=None):
 
 ## Task 6 — 进度上报（2% 桶粒度）
 
-### 设计
+### 问题：0 trajectory 时 scheduler 看不到需求
 
-调度器的 gap-ratio 算法需要知道每个 pipeline 的 rollout 进度，以在多 pipeline 间公平分配 GPU。但不能每条 trajectory 都发 RPC（会洪水）。解决方案：把 0-100% 分成 50 个桶（每桶 2%），只在桶编号变化时才 emit。
+generation 开始前 pipeline 还没有任何 trajectory，scheduler 看到的 demand = 0，gap-ratio 算法会忽略这个 pipeline，不分配 GPU。但没有 GPU 就没法收集 trajectory——chicken-and-egg。
 
-### 状态机
+### 解决方案：两套机制配合
+
+| 机制 | 时机 | 作用 |
+|------|------|------|
+| `step_target_estimate`（在 GPU request 里传） | generation **开始前**（0 trajectories） | Bootstrap demand：告诉 scheduler "我将要有这么多需求" |
+| `end_progress_batch` 桶上报 | generation **进行中** | 实时更新 remaining demand，驱动动态 rebalance |
+
+`begin_progress_batch` 必须在 `before_generation` **之前**调用，原因是 Task 7 填入 `before_generation` 的 TODO 时，需要从 `hooks._count_intended_for_step` 读取 `step_target_estimate` 一起发给 scheduler：
+
+```python
+# Task 7 填入 before_generation 时的样子：
+ray.get(self._scheduler.request_gpus.remote(
+    cluster_id=self._cluster_ids["actor_infer"],
+    priority=Priority.GENERATION,
+    global_step=step,
+    step_target_estimate=self._count_intended_for_step,  # ← begin_progress_batch 已设好
+))
+```
+
+### 桶状态机
 
 ```
 begin_progress_batch(step, count_intended)
@@ -138,7 +160,7 @@ def _emit_progress(self, step: int) -> None:
 
 ---
 
-## 测试覆盖（30 个，全部 pass，无 GPU/Ray 依赖）
+## 测试覆盖（31 个，全部 pass，无 GPU/Ray 依赖）
 
 ### Task 5 — Protocol & NoOp（5 个）
 
@@ -150,7 +172,7 @@ def _emit_progress(self, step: int) -> None:
 | `test_satisfies_rlix_hooks_protocol` (NemoRL) | `NemoRLRLixHooks` 也满足 Protocol |
 | `test_gpu_hooks_are_no_ops_until_task7` | GPU hook 为 placeholder，返回 None 不 crash |
 
-### Task 5 — DO_TIME_SHARING & grpo_train 插桩（7 个）
+### Task 5 — DO_TIME_SHARING & grpo_train 插桩（8 个）
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -161,8 +183,9 @@ def _emit_progress(self, step: int) -> None:
 | `test_hooks_called_once_per_step` | 3 steps → 每个 hook 恰好 3 次，无重复无遗漏 |
 | `test_step_index_passed_correctly` | step=0,1 正确传入每个 hook |
 | `test_noop_hooks_used_when_none_passed` | `hooks=None` 时使用 NoOp，不 crash |
+| `test_begin_progress_batch_called_before_before_generation` | `begin_progress_batch` 在 `before_generation` 之前，保证 `step_target_estimate` 已就绪 |
 
-### Task 6 — begin/end_progress_batch 状态机（8 个）
+### Task 6 — begin/end_progress_batch 状态机（10 个）
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -177,7 +200,7 @@ def _emit_progress(self, step: int) -> None:
 | `test_accumulates_collected_count` | 多次 end 累加正确 |
 | `test_bucket_does_not_exceed_max` | 超额收集时 bucket 钳位到 50 |
 
-### Task 6 — 桶去重逻辑（9 个）
+### Task 6 — 桶去重逻辑（8 个）
 
 | 测试 | 验证内容 |
 |------|---------|
@@ -197,7 +220,7 @@ def _emit_progress(self, step: int) -> None:
 | 位置 | 等待 | 内容 |
 |------|------|------|
 | `before_weight_sync` | Task 3 | NCCL communicator destroy/reload（TP>1） |
-| `before/after_generation` | Task 7 | `scheduler.request_gpus.remote()` / `notify_release_gpus.remote()` |
+| `before/after_generation` | Task 7 | `scheduler.request_gpus.remote(step_target_estimate=...)` / `notify_release_gpus.remote()` |
 | `before/after_training` | Task 7 | 同上，actor_train cluster |
 | `_emit_progress` | Task 7 | `scheduler.report_progress.remote(ProgressReport(...))` |
 
@@ -207,5 +230,5 @@ def _emit_progress(self, step: int) -> None:
 
 ```bash
 PYTHONPATH=nemo-rl python -m pytest tests/test_rlix_hooks.py -v
-# 30 passed in 0.03s
+# 31 passed in 0.05s
 ```

@@ -6,9 +6,11 @@
 
 阶段定义：
 
-- **Phase 1**：验证 RLix-managed barrier async
+- **Phase 1**：验证 RLix-managed barrier async，并以最小 framework 改动把 scheduler 跑通
 - **Phase 2**：补 subset lifecycle 和 admission close
 - **Phase 3**：补 true request migration 与 turn-scoped retry
+
+当前 milestone 只把 TASK 0-6 作为 release critical path；TASK 7-13 保留为后续与 NeMo/ROLL 更强对齐的 deferred work。
 
 ## TASK 0：分支、基线、文档
 
@@ -115,6 +117,7 @@ Owner：RLix control-plane team + MILES training-loop team
 动作：
 
 - 在 MILES safe point 周围增加 RLix request/release
+- 当前 milestone 明确 port 主线 `train_async.py` 的 one-step-off 语义，不把 `examples/fully_async` 当作 baseline
 - Phase 1 async path 仅覆盖 non-colocate，因为当前 `train_async.py` 明确不支持 colocate
 - colocate 配置只能先走 sync-safe smoke / fallback
 - 第一批 smoke test 可先用 sync-safe 顺序：
@@ -181,7 +184,7 @@ Owner：progress/accounting team
 - scheduler ingress 的 canonical demand 只由 `metrics["completed"]` 推导
 - progress 在单 batch window 内单调前进
 
-## TASK 5：Weight Boundary 与 Version Accounting
+## TASK 5：Full Sync 路径与 Weight Boundary
 
 Owner：weight-sync team
 
@@ -199,9 +202,10 @@ Owner：weight-sync team
 动作：
 
 - 把 MILES 的 `update_weights_interval` 当作 active checkpoint activation boundary
+- 先把当前 full/global sync 路径在 RLix 下跑通
 - 把 `Sample.weight_versions` 与 `oldest_weight_version` 传播到 RLix metrics
 - 记录 rollout batch start version 与 train-data handoff version
-- Phase 1 保持现有 global weight update 语义，不尝试 selective sync
+- 当前 milestone 保持现有 global weight update 语义，不尝试 selective sync
 
 验收：
 
@@ -209,7 +213,7 @@ Owner：weight-sync team
 - Phase 1 不触发 selective sync
 - stale rollout 的程度在 metrics 中可见
 
-## TASK 6：Phase 1 双 Pipeline E2E
+## TASK 6：当前 Milestone 集成测试（先 1 个，再 2 个）
 
 Owner：integration team
 
@@ -227,15 +231,23 @@ Owner：integration team
 
 动作：
 
-- 让两条 pipeline 在 RLix scheduler 下运行，其中至少一条是 MILES
-- 验证 batch-boundary time sharing
+- 先跑一个 simple single-turn / 低副作用示例，验证 scheduler、registration、progress、full/global sync 都正常
+- 再让两条 pipeline 在 RLix scheduler 下运行，其中至少一条是 MILES
+- 两条 pipeline 的目标是验证 scheduler 是否能正常完成 resource handoff / overlap，而不是先做复杂 multi-turn preemption
 - 记录 scheduler 日志或 Perfetto trace，展示 request/release 顺序
+- `retool_v2` 作为第一批 multi-turn 集成目标，SWE-agent 后置
 
 验收：
 
+- 单 pipeline 简单示例能稳定跑通
 - 各 pipeline 不会越过 scheduler allocation 重叠占用 GPU
+- 两条 pipeline 在同一测试中完成真实的 release/request handoff
 - MILES 在声明的 safe point 上释放 infer/train 资源
-- Phase 1 不使用任何 mid-flight subset preemption
+- 当前 milestone 不使用任何 mid-flight subset preemption
+
+## 未来对齐任务（不属于当前 milestone critical path）
+
+以下 TASK 7-13 保留在总计划中，用于后续与 NeMo/ROLL 的更强语义对齐；它们当前不阻塞 first release。
 
 ## TASK 7：Router Admission API
 
@@ -295,7 +307,7 @@ Phase 2 scope 限制：
 - `onload(indices=[i])` 只影响 engine `i`
 - 其他 engine 继续 routable 且健康
 
-## TASK 9：Phase 2 Close-And-Drain Shrink
+## TASK 9：Phase 2 Close-And-Drain Shrink（deferred）
 
 Owner：RLix control-plane team + MILES lifecycle team
 
@@ -311,6 +323,7 @@ Owner：RLix control-plane team + MILES lifecycle team
 
 动作：
 
+- 这一步当前明确是 deferred，不进入 first release critical path
 - shrink 顺序：
   1. disable router admission for target indices
   2. wait for drain 或 timeout
@@ -357,7 +370,7 @@ Owner：weight-sync team
 - scheduler 能区分 loaded-but-disabled 与 enabled-and-serving
 - global sync path 仍保留可用
 
-## TASK 11：Deterministic Request IDs 与 Targeted Abort
+## TASK 11：Deterministic Request IDs 与 Targeted Abort（deferred，当前 milestone 不做）
 
 Owner：migration team
 
@@ -376,6 +389,8 @@ Owner：migration team
 
 动作：
 
+- 这一步当前不进入 first release critical path，目的是尽量减少对 MILES 原有框架的改动
+- 只有当后续明确要做 true targeted abort + current-turn retry 时，再启用这一组工作
 - 生成 RLix request id：
   - `pipeline_id`
   - `rollout_id`
@@ -394,7 +409,7 @@ Owner：migration team
 - 缺失 ACK 时会受控失败或标 unhealthy，而不是 silent offload
 - retry 前后 request id 只允许 `attempt` 改变
 
-## TASK 12：Retool V2 Turn-Scoped Retry
+## TASK 12：Retool V2 Turn-Scoped Retry（deferred，作为第一批 multi-turn 目标）
 
 Owner：migration + examples team
 
@@ -422,7 +437,7 @@ Owner：migration + examples team
 - earlier completed turns 保持 intact
 - metrics 能区分 preemption retry 与普通 engine error retry
 
-## TASK 13：SWE-Agent Idempotency 与 Resume
+## TASK 13：SWE-Agent Idempotency 与 Resume（deferred，晚于 Retool）
 
 Owner：agentic examples team
 
@@ -461,9 +476,9 @@ Owner：release owner
 
 依赖：
 
-- Phase 1 release 依赖 TASK 6
-- Phase 2 release 依赖 TASK 9
-- Phase 3 release 依赖 TASK 12 或 TASK 13
+- 当前 milestone release 依赖 TASK 6
+- 后续 subset lifecycle / admission-close release 依赖 TASK 9 与 TASK 10
+- 后续 true migration / multi-turn retry release 依赖 TASK 12 或 TASK 13
 
 动作：
 

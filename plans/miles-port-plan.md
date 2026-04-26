@@ -34,15 +34,16 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 
 - **Phase 1：RLix-managed barrier async**
   - 先把 MILES 变成 RLix 可统一调度的 async backend
+  - 直接 port 当前主线 `train_async.py` 的 one-step-off 语义
   - 只在 MILES 已有 safe boundary 上做 request / release / progress / shared-PG 接入
-  - 不承诺 mid-flight subset preemption
+  - 保留当前 full/global sync 路径，不承诺 mid-flight subset preemption
 - **Phase 2：subset lifecycle + admission close**
   - 增加 subset shrink/expand 所需的 engine indexing、router disable/remove、close-and-drain
   - 支持 DP 粒度 rollout subset 生命周期
 - **Phase 3：true mid-flight migration**
   - 增加 deterministic request id、targeted abort ACK、turn-scoped retry、selective sync
 
-这是当前最可信、也最快能做出端到端 demo 的路线。重点是先让计划和 MILES 当前真实状态一致，而不是提前承诺框架还没有的能力。
+当前 milestone 只承诺交付 Phase 1，并以最小 framework 改动让 scheduler 跑通。Phase 2/3 仍保留在总计划里，但不进入第一版关键路径。重点是先让计划和 MILES 当前真实状态一致，而不是提前承诺框架还没有的能力。
 
 ## 2. 分支与仓库策略
 
@@ -79,7 +80,9 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 
 含义：
 
-- Phase 1 必须保留这个 barrier
+- 当前主线 async 是 **one-step-off**：`rollout N+1` overlap `train N`
+- 它不是 `n+1 ... n+k` 的 bounded-staleness rollout pool
+- Phase 1 必须保留这个 barrier，并直接 port 这条主线语义
 - RLix 应把 MILES async 理解为：
   - “一个 rollout 可以和一个 train step overlap”
   - “active checkpoint 只在 MILES 自己的安全更新边界上前进”
@@ -174,6 +177,7 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 
 含义：
 
+- 当前 milestone 明确保留这条 full/global sync 路径
 - Phase 1 直接复用当前 global sync
 - Phase 2 如果 expand 仍然只发生在 batch boundary，可以先用 global sync
 - 真正的 selective sync 应放到 Phase 3；因为 process group、transfer plan、active engine set 都要变成 subset-aware
@@ -407,13 +411,15 @@ Phase 1 推荐首个目标：
 - non-colocate async path
 - `sglang_data_parallel_size = 1`
 - 单 updateable model
-- `retool_v2` 或一个更简单的 single-turn 示例
+- **先选一个更简单的 single-turn / 低副作用示例作为 scheduler integration baseline**
+- `retool_v2` 作为第一批 multi-turn 集成目标
 
 Phase 1 明确排除：
 
 - PD disaggregation
 - SWE-agent external gym
 - session-server agentic tool loops
+- first milestone 中的 targeted abort + current-turn retry
 - colocate async overlap path；colocate 只作为 sync-safe smoke / fallback
 - Miles router + partial rollout 混合路径
 - selective P2P update
@@ -446,9 +452,12 @@ Gate P1-D：progress correctness
 - `completed` 只在 train batch 真正 ready 时达到 target
 - 旧 progress stream 会在 batch 被消费后清除
 
-Gate P1-E：two-pipeline time sharing
+Gate P1-E：two-pipeline scheduler integration
 
-- 两个 MILES pipeline，或 MILES + 另一个 RLix pipeline，能在 batch/update boundary 上交替运行
+- 先通过一个 single-pipeline 简单示例 gate，证明 scheduler、registration、progress、full/global sync 都正常
+- 最后再跑两个 pipeline（两个 MILES pipeline，或 MILES + 另一个 RLix pipeline）
+- 目标是验证 RLix scheduler 的真实 resource handoff / overlap 是否成立，而不是只做单 pipeline smoke test
+- 在当前 milestone 内，这个 gate 仍以 batch/update boundary 上的 handoff 为主，不要求 mid-flight subset preemption
 - Perfetto 或 scheduler logs 能显示 release/request 顺序
 
 ## 6. Phase 2：Subset Lifecycle + Admission Close
@@ -708,5 +717,6 @@ Selective sync 与 lifecycle 是独立问题。
 
 - 批准 Phase 1 采用 **RLix-managed barrier async**
 - 把 subset shrink/expand 与 current-turn retry 明确当作 Phase 2 / Phase 3 的独立工作流
+- 第一批 scheduler 集成验证目标先选 simple single-turn / 低副作用示例
 - 第一批 multi-turn 验证目标选 `Retool v2`
 - 在 retry 语义跑通前，不把 SWE-agent 当作早期主验证路径

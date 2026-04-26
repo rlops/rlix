@@ -117,6 +117,13 @@ nemo_rl/algorithms/grpo.py
 
 ## 测试文件说明
 
+### 第 0 步：环境检查（每次新机器必跑，其他测试之前）
+
+```bash
+# 检查 setup.py / pyproject.toml VCS hash 一致性、子模块初始化、核心模块可导入
+python tests/test_env_install.py
+```
+
 ### 单元测试（无 GPU / Ray）
 
 ```bash

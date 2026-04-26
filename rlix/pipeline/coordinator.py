@@ -153,6 +153,11 @@ def _validate_offload_nccl(*, pipeline_config: Any) -> None:
         device_mapping = getattr(worker_config, "device_mapping", None)
         if not device_mapping:
             continue
+        # DeepSpeed strategies manage their own process groups and are incompatible with
+        # ROLL's ReloadableProcessGroup monkey-patch. Skip enforcement for deepspeed clusters.
+        strategy_name = getattr(getattr(worker_config, "strategy_args", None), "strategy_name", "")
+        if strategy_name.startswith("deepspeed"):
+            continue
         offload_nccl = getattr(worker_config, "offload_nccl", None)
         if offload_nccl is None:
             worker_config.offload_nccl = True
@@ -496,6 +501,51 @@ class PipelineCoordinator(Coordinator):
                     verify=self._verify_model_after_sync,
                 )
             )
+        finally:
+            self._resize_sync_lock.release()
+
+    def sync_base_weights_to_active(self) -> List[int]:
+        """Push trained base model weights to all currently-awake infer workers.
+
+        Called by the pipeline after train_step + promote + offload, before releasing
+        actor_train GPUs.  Mirrors sync_lora_weights() but syncs the full base model
+        (adapters_to_sync=None) instead of only LoRA adapters.
+
+        Same lock/skip semantics as sync_lora_weights: holds _resize_sync_lock for the
+        entire NCCL broadcast to prevent active_dp_ranks from changing mid-flight.
+        If all infer workers are sleeping (active_infer_dp_ranks is empty), sync is
+        skipped — sleeping workers receive the base weights via expand_worker on wake.
+        """
+        acquired = self._resize_sync_lock.acquire(
+            timeout=_RESIZE_LOCK_TIMEOUT_S if _RESIZE_LOCK_TIMEOUT_S is not None else -1
+        )
+        if not acquired:
+            raise RuntimeError(
+                f"sync_base_weights_to_active timed out waiting for _resize_sync_lock after {_RESIZE_LOCK_TIMEOUT_S}s "
+                f"(likely blocked by a long-running resize_infer). "
+                f"pipeline_id={self._pipeline_id!r}"
+            )
+        try:
+            active_ranks = sorted(self._active_infer_dp_ranks)
+            if not active_ranks:
+                return []
+            if self._model_update_service is None:
+                model_update_service_name = f"{self._pipeline_id}_model_update_service"
+                self._model_update_service = get_actor_or_raise(
+                    model_update_service_name,
+                    self._ray_namespace,
+                    error_context=f"ModelUpdateService required for pipeline_id={self._pipeline_id!r}.",
+                )
+            model_update_service = self._model_update_service
+            assert model_update_service is not None
+            ray.get(
+                model_update_service.sync_selected_workers.remote(
+                    active_ranks,
+                    adapters_to_sync=None,
+                    verify=self._verify_model_after_sync,
+                )
+            )
+            return active_ranks
         finally:
             self._resize_sync_lock.release()
 

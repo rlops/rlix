@@ -26,24 +26,23 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 - rollout lifecycle 现在本质上仍是“全 engine 操作”
 - Miles Router 没有 scheduler-owned 的 admission-close API
 - abort 仍以 `abort_all` 或样本终止为主，不是 targeted request migration
-- 多 turn 路径还没有 current-turn retry / turn-scoped retry
+- 当前还没有 request-level migration 或更细粒度恢复语义
 - placement group 由 MILES 内部创建和切分，不能直接复用 RLix 拥有的 shared PG
 - 权重更新路径会 pause / flush / update / continue 全部 rollout engines
 
 因此推荐采用三阶段策略：
 
-- **Phase 1：RLix-managed barrier async**
-  - 先把 MILES 变成 RLix 可统一调度的 async backend
-  - 直接 port 当前主线 `train_async.py` 的 one-step-off 语义
-  - 只在 MILES 已有 safe boundary 上做 request / release / progress / shared-PG 接入
-  - 保留当前 full/global sync 路径，不承诺 mid-flight subset preemption
-- **Phase 2：subset lifecycle + admission close**
-  - 增加 subset shrink/expand 所需的 engine indexing、router disable/remove、close-and-drain
-  - 支持 DP 粒度 rollout subset 生命周期
-- **Phase 3：true mid-flight migration**
-  - 增加 deterministic request id、targeted abort ACK、turn-scoped retry、selective sync
+- **Phase 1：RLix-managed bounded-staleness fullasync baseline**
+  - 先把 MILES 变成 RLix 可统一调度的 fullasync backend
+  - baseline 明确对齐 `examples/fully_async` 这条 bounded-staleness 路线，当前以 `fully_async_rollout.py` + `run-qwen3-4b-fully_async.sh` 承载的 math example 作为第一版载体
+  - handoff 语义先落在 engine-granularity abort + requeue，复用现有 `fully_async` 的 group-level recycle 行为
+  - Phase 1 暂沿用当前 global sync / `actor_model.update_weights()` 作为 functional baseline，但明确它不是最终形态
+- **Phase 2：router admission、subset lifecycle、sync-on-expand 准备**
+  - 增加 engine indexing、router disable/remove、subset `onload/offload` 与 sync-on-expand 所需基础设施
+- **Phase 3：selective sync 与更细粒度恢复语义（如确有必要）**
+  - 只有在 Phase 1/2 证明当前 baseline 不足时，再补 subset-aware selective sync 或更细粒度 recovery hardening
 
-当前 milestone 只承诺交付 Phase 1，并以最小 framework 改动让 scheduler 跑通。Phase 2/3 仍保留在总计划里，但不进入第一版关键路径。重点是先让计划和 MILES 当前真实状态一致，而不是提前承诺框架还没有的能力。
+当前 milestone 仍然先追一个最小可跑通的版本，但目标语义已经切到基于 `examples/fully_async` 的 bounded-staleness fullasync baseline。重点是先让 scheduler、refresh、engine-level abort+requeue 这条链路在 math example 上跑通，再逐步加后续基础设施。
 
 ## 2. 分支与仓库策略
 
@@ -68,7 +67,7 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 
 ## 3. 当前 MILES Reality Check
 
-### 3.1 Async Loop 已存在，但权重激活边界是 barrier
+### 3.1 `train_async.py` 当前仍是 one-step-off，对照用而非本计划 baseline
 
 文件：`train_async.py`（MILES 仓库根目录）
 
@@ -81,14 +80,31 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 含义：
 
 - 当前主线 async 是 **one-step-off**：`rollout N+1` overlap `train N`
-- 它不是 `n+1 ... n+k` 的 bounded-staleness rollout pool
-- Phase 1 必须保留这个 barrier，并直接 port 这条主线语义
-- RLix 应把 MILES async 理解为：
-  - “一个 rollout 可以和一个 train step overlap”
-  - “active checkpoint 只在 MILES 自己的安全更新边界上前进”
-- 这不是 hot weight update，也不是任意 mid-turn 的模型替换
+- 这条路径不是本计划要对接的 baseline，只作为对照与必要时的 smoke fallback
+- 本计划的 baseline 明确建立在 `examples/fully_async` 的 bounded-staleness fullasync 路线上
 
-### 3.2 同步训练循环已经有完整的 safe boundary
+### 3.2 `examples/fully_async` 是当前 baseline
+
+文件：
+
+- `examples/fully_async/README.md`
+- `examples/fully_async/fully_async_rollout.py`
+- `examples/fully_async/run-qwen3-4b-fully_async.sh`
+
+当前行为：
+
+- generation 由 persistent background worker 持续拉取数据并执行
+- `train_async.py` 每次只是从输出队列 drain 已完成结果
+- aborted group 会被 reset 后重新塞回 data buffer
+- 已有 `max_weight_staleness`、`weight_version`、`oldest_weight_version` 等 fullasync / staleness 相关机制
+- 当前最直接的 baseline 载体就是 `fully_async_rollout.py` + `run-qwen3-4b-fully_async.sh` 这一组 math example
+
+含义：
+
+- 这条路径本身就是 bounded-staleness fullasync rollout pool，本计划明确 built against 这条路径
+- 第一版不要求 request-level migration，但 handoff 语义要复用这里已有的 background generation + aborted-group recycle
+
+### 3.3 同步训练循环已经有完整的 safe boundary
 
 文件：`train.py`（MILES 仓库根目录）
 
@@ -100,9 +116,9 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 含义：
 
 - `train.py` 适合作为最早的 control-plane smoke test 目标
-- `train_async.py` 是真正的 Phase 1 主目标，但在此之前可以先拿 `train.py` 打通最简单链路
+- 但当前 milestone baseline 仍是 `examples/fully_async` 路径；这里的 `train_async.py` 只作为承载 fullasync rollout function 的 training driver，不应再被表述成独立的 Phase 1 主目标
 
-### 3.3 Placement Group 仍由 MILES 内部创建
+### 3.4 Placement Group 仍由 MILES 内部创建
 
 文件：`miles/ray/placement_group.py`
 
@@ -121,7 +137,7 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
   - 允许显式指定 actor/rollout bundle index 范围
   - 不改变 RLix 之外的普通 MILES 运行方式
 
-### 3.4 Rollout lifecycle 现在是 all-engine 级别
+### 3.5 Rollout lifecycle 现在是 all-engine 级别
 
 文件：
 
@@ -140,7 +156,7 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 - Phase 2 才能增加 engine index map 和 `indices=` 过滤
 - 如果未来要 shrink subset，必须先 close admission，再 flush/offload；否则新请求会继续进来，drain 可能永远不会完成
 
-### 3.5 Router 还没有 scheduler-owned 的 admission close
+### 3.6 Router 还没有 scheduler-owned 的 admission close
 
 文件：`miles/router/router.py`
 
@@ -155,13 +171,12 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 
 - 旧文档里“shrink 时 remove worker”的说法目前不是现有能力
 - Phase 2 需要给 router 增加 worker state：至少 `enabled / disabled / dead`，最好还有 inflight 统计
-- shrink 顺序必须是：
-  - close admission
-  - drain 或 abort
-  - 等 drain / ACK
-  - 再释放显存
+- 后续 subset lifecycle 至少要保证：
+  - 先 close admission
+  - 再走 engine-granularity abort + requeue 或明确的安全释放点
+  - 在确认安全释放点之前不能释放显存
 
-### 3.6 权重更新当前是 global sync
+### 3.7 权重更新当前是 global sync，Phase 1 先沿用其 functional baseline
 
 文件：
 
@@ -177,42 +192,31 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 
 含义：
 
-- 当前 milestone 明确保留这条 full/global sync 路径
-- Phase 1 直接复用当前 global sync
-- Phase 2 如果 expand 仍然只发生在 batch boundary，可以先用 global sync
-- 真正的 selective sync 应放到 Phase 3；因为 process group、transfer plan、active engine set 都要变成 subset-aware
+- Phase 1 暂沿用这条 global sync / `actor_model.update_weights()` 路径作为 functional baseline
+- 但它不是最终形态；subset sync / sync-on-expand 仍后置到后续阶段
+- 文档必须明确这一点，避免把“Phase 1 继续沿用 global sync”误写成“全计划最终保留 global sync”
 
-### 3.7 Multi-turn abort 当前仍是 terminal 语义
+### 3.8 当前现成的 retry 语义是 fully_async 的 group-level recycle
 
 文件：
 
 - `miles/rollout/generate_hub/multi_turn.py`
-- `examples/retool/generate_with_retool.py`
-- `examples/retool_v2/*`
-- `examples/experimental/swe-agent/generate_with_swe_agent.py`
 - `miles/utils/types.py`
 - `examples/fully_async/fully_async_rollout.py`
 
 当前行为：
 
-- 通用 multi-turn generate 在遇到 `abort` 或 `length` 时会终止当前路径
-- Retool v1 直接把 abort 标成 `Sample.Status.ABORTED`
-- SWE-agent v1 把非成功退出当作 aborted / truncated
-- `Sample.reset_for_retry()` 会清空整条 sample 的输出状态，不是 current-turn continuation primitive
-- 只有 fully-async 示例会在 group 层面把 aborted 样本 reset 后重新塞回 buffer
+- 除 `fully_async` 之外的通用 generate path 在遇到 `abort` 或 `length` 时会直接终止当前路径
+- `Sample.reset_for_retry()` 会清空整条 sample 的输出状态，不是 request-level migration primitive
+- `examples/fully_async` 会在 group 层面把 aborted 样本 reset 后重新塞回 buffer
 
 含义：
 
-- 旧计划里“preserve token/history state，然后 retry 当前 turn”不是当前现成能力
-- Phase 1 绝不能依赖这个语义
-- Phase 2 默认只做 close-and-drain，或对明确无 side effect 的 stateless path 做 whole-sample retry
-- Phase 3 才能显式增加：
-  - per-turn state capture
-  - deterministic request id
-  - targeted abort ACK
-  - side-effect commit 规则
+- 当前 milestone 不再追 request-level deterministic migration，也不定义更细粒度的 request/turn-level recovery
+- handoff 语义直接建立在 engine-granularity abort + group-level requeue 之上
+- 这正好匹配 `examples/fully_async` 已有的 recycle 行为
 
-### 3.8 Weight version metadata 已经有用
+### 3.9 Weight version metadata 已经有用
 
 文件：
 
@@ -239,7 +243,7 @@ MILES 当前已经具备一批对接 RLix 很有价值的基础能力：
 | --- | --- | --- |
 | `actor_train` | `RayTrainGroup` / `actor_model` | 整体训练 allocation |
 | `actor_infer` | `RolloutManager` / SGLang engines | 整体 rollout allocation |
-| Pipeline runtime | MILES 训练入口 / 新 wrapper | 在 safe boundary 上调 RLix |
+| Pipeline runtime | MILES 训练入口 / 新 wrapper | 以 fullasync / background generation 语义接 RLix |
 | Progress stream | rollout batch/group accounting | batch 开始 + band 更新 |
 | Weight activation | `actor_model.update_weights()` | 沿用 MILES barrier |
 | Rollout version | `Sample.weight_versions` | 上报到 metrics / validation |
@@ -265,60 +269,52 @@ Phase 1 和 Phase 2 的 infer DP 单位定义为：
 #### Phase 1 允许的情况
 
 - 同一个 MILES pipeline 可以同时持有 `actor_infer` 和 `actor_train` allocation
-- 这样才保留 MILES 当前 `train_async.py` 的 rollout / train overlap
-- Phase 1 async path 仅覆盖 non-colocate，因为当前 `train_async.py` 明确 `assert not args.colocate`
-- 但 RLix 不得在 rollout future 仍 live 时对该 pipeline 执行 infer shrink/offload
+- generation 应持续在后台推进，trainer 消费已完成结果；这更接近 `fully_async` 的 persistent worker 语义
+- 第一版仍只覆盖 non-colocate；colocate 不作为 fullasync baseline
+- scheduler 可以在目标 subset 上触发 preempt，但预期语义应是 abort + requeue / retry，而不是以 wait-for-drain 为主
 
 #### Phase 1 的 fallback
 
-- 如果 scheduler 在某一时刻不能同时满足 infer/train 两类 allocation，或者 MILES 配置为 colocate，pipeline 必须退化成 sync-safe ordering：
-  1. request infer
-  2. generate
-  3. release infer
-  4. request train
-  5. train + update
-  6. release train
-- 也就是说，Phase 1 允许 overlap，但不保证永远能 overlap
+- 如果 scheduler 或环境限制导致 fullasync 路径暂时跑不起来，允许用更保守的 safe ordering 做临时 smoke test
+- 但这只能作为 bring-up / debugging fallback，不能写成当前 milestone 的目标形态
 
 #### Phase 1 明确不做的事
 
-- 不对 live rollout future 做 shrink
-- 不做 mid-flight subset preemption
-- 不在 weight update 期间尝试 selective sync
+- 不承诺第一版就有 request-level deterministic migration
+- 不承诺第一版就有最细粒度 current-turn targeted retry
+- 不要求第一版就完成 selective sync
 
-### 4.4 Safe Phase 1 Timeline
+### 4.4 与 NeMo F4/F7/F10 的对齐说明
 
-#### 同步安全顺序
+- **F4（CPU bucket cache）**：MILES 当前路径不假设必须复刻 NeMo 的 CPU bucket cache 方案。Phase 1 先沿用现有 global sync baseline；只有在后续 subset expand / sync-on-expand 场景证明会遇到 OOM 或 staging 约束时，再显式补 CPU-side cache / staging 设计。
+- **F7（namespace isolation）**：当前 milestone 的最终 gate 要跑 2 个 MILES pipelines，因此必须显式隔离 per-pipeline Ray namespace、actor 命名、progress stream 与临时状态。
+- **F10（topology validation）**：Phase 1 需要 fail-fast validation；至少覆盖 non-colocate、`sglang_data_parallel_size == 1`、单 updateable model/server、以及 actor/infer device mapping 约束。
 
-1. request `actor_infer`
-2. generate rollout batch
-3. release `actor_infer`
-4. request `actor_train`
-5. train rollout batch
-6. 在 MILES update boundary 上执行 `actor_model.update_weights()`
-7. release `actor_train`
+### 4.5 Safe Phase 1 Timeline
 
-#### barrier-async 顺序
+#### fullasync baseline 顺序
 
 1. request `actor_infer`
-2. 启动 rollout `N`
-3. 在 train allocation 已就绪时，训练 rollout `N-1`
-4. 到 MILES 的 weight update boundary 前，先 drain in-flight rollout future
-5. 只有 future drain 完成后，才允许 release / resize `actor_infer`
-6. 执行 MILES 现有 global update
-7. 以新的 active version 恢复下一轮 rollout
+2. 启动 persistent background generation
+3. request `actor_train`
+4. trainer 持续消费已完成 rollout 结果
+5. scheduler 需要训练资源或做 handoff 时，对目标 subset 触发 abort
+6. aborted group / request 重新回到 data buffer 或 active worker 集合继续生成
+7. 执行改造后的 refresh/sync 路径，继续 generation
 
-这个语义和当前 MILES 源码一致，也避免了 unsafe mid-flight preemption。
+#### bring-up fallback
 
-## 5. Phase 1：RLix-Managed Barrier Async
+- 如果 fullasync 路径在最早调试阶段还不稳定，可以短暂用 safe ordering 验证 PG / registration / scheduler hook 是否正常
+- 但该 fallback 不应成为最终 gate，也不应写成当前 milestone 的目标语义
+
+## 5. Phase 1：RLix-Managed Fullasync Baseline
 
 目标：
 
-- 让 MILES 成为 RLix 可统一调度的 async backend
-- 只在 MILES 已有 safe boundary 上接入 scheduler
-- 不要求 subset shrink/expand
-- 不要求 current-turn retry
-- 保留 MILES 现有 weight update barrier
+- 让 MILES 成为 RLix 可统一调度的 fullasync backend
+- baseline 对齐 `examples/fully_async` 的 persistent generation + abort 后 requeue / retry 语义
+- 第一版先不要求最细粒度 current-turn targeted retry
+- 但不再把 current global sync / drain-only 路径当成目标形态
 
 ### 5.1 RLix 侧工作
 
@@ -328,7 +324,7 @@ Phase 1 和 Phase 2 的 infer DP 单位定义为：
 - 当前 `PipelineCoordinator` 里有值得复用的 scheduler/progress/resize-lock/per-pipeline actor delegation 设计
 - 但当前实现仍带有 ROLL / vLLM / offload-NCCL / `RollResourceManagerProxy` 假设，不是 backend-neutral generic coordinator
 - MILES Phase 1 应先抽出 backend-neutral base coordinator / resource-provider seam，或先新增专用 `miles_coordinator.py`
-- 新增 MILES-specific pipeline runtime / pipeline actor
+- 新增 MILES-specific pipeline runtime / pipeline actor，并在这里落下 F7 对应的 per-pipeline namespace isolation
 
 原因：
 
@@ -352,7 +348,7 @@ Phase 1 和 Phase 2 的 infer DP 单位定义为：
 
 - 将 MILES pipeline id 和 cluster config 注册到 RLix scheduler
 - 把 MILES GPU topology 翻译为 RLix 的 `actor_train` / `actor_infer` cluster config
-- 在 generation / train / update safe point 周围发起 request/release
+- 让 scheduler 能驱动 fullasync generation / train / refresh 生命周期
 - 串行化所有会触碰同一个 MILES runtime 的 scheduler 动作
 - 把 MILES 本地 progress accounting 聚合成 RLix 接受的 wire-level progress report
 
@@ -408,22 +404,18 @@ Phase 1 推荐首个目标：
 
 - 非 PD 的 SGLang rollout
 - Megatron actor
-- non-colocate async path
+- non-colocate fullasync path
 - `sglang_data_parallel_size = 1`
 - 单 updateable model
-- **先选一个更简单的 single-turn / 低副作用示例作为 scheduler integration baseline**
-- `retool_v2` 作为第一批 multi-turn 集成目标
+- **当前 milestone baseline 直接绑定 `examples/fully_async` 的 math example（由 `fully_async_rollout.py` + `run-qwen3-4b-fully_async.sh` 承载）**
+- 不再额外设计 single-turn smoke path；当前第一批验证直接从这组 `fully_async` baseline 起步
 
 Phase 1 明确排除：
 
 - PD disaggregation
-- SWE-agent external gym
-- session-server agentic tool loops
-- first milestone 中的 targeted abort + current-turn retry
-- colocate async overlap path；colocate 只作为 sync-safe smoke / fallback
-- Miles router + partial rollout 混合路径
+- first milestone 中的 request-level deterministic migration
+- colocate async overlap path；colocate 只作为 bring-up fallback
 - selective P2P update
-- mid-flight shrink
 
 ### 5.4 Phase 1 Validation Gates
 
@@ -439,11 +431,11 @@ Gate P1-B：single-pipeline scheduler control
 - generation / training phase 会发起 request / release
 - 不会在 rollout future live 时尝试 resize
 
-Gate P1-C：barrier async correctness
+Gate P1-C：fullasync correctness
 
-- `train_async.py` 在 weight update 前仍会 drain next rollout future
-- 不会在 tracked rollout future live 时执行 `actor_model.update_weights()`
-- async overlap 验证仅覆盖 non-colocate；colocate 不进入该 path
+- baseline 走 `fully_async` 风格的 persistent background generation
+- generation 与 trainer consume 并行存在，scheduler 不会把 pipeline 错误降级成单纯 one-step-off smoke
+- abort 后的 group 能回到 data buffer / active worker 集合继续生成
 - generated train data 中带有 `weight_versions`
 
 Gate P1-D：progress correctness
@@ -454,19 +446,18 @@ Gate P1-D：progress correctness
 
 Gate P1-E：two-pipeline scheduler integration
 
-- 先通过一个 single-pipeline 简单示例 gate，证明 scheduler、registration、progress、full/global sync 都正常
-- 最后再跑两个 pipeline（两个 MILES pipeline，或 MILES + 另一个 RLix pipeline）
-- 目标是验证 RLix scheduler 的真实 resource handoff / overlap 是否成立，而不是只做单 pipeline smoke test
-- 在当前 milestone 内，这个 gate 仍以 batch/update boundary 上的 handoff 为主，不要求 mid-flight subset preemption
-- Perfetto 或 scheduler logs 能显示 release/request 顺序
+- 先通过 `examples/fully_async` 的 math example gate，证明 scheduler、registration、progress、refresh path 都正常
+- 最后再跑两个 MILES pipelines
+- 目标是验证 RLix scheduler 的真实 resource handoff / overlap 是否成立
+- 该 gate 允许通过 engine-granularity abort + requeue 实现 handoff
+- Perfetto 或 scheduler logs 能显示 overlap、handoff、requeue
 
-## 6. Phase 2：Subset Lifecycle + Admission Close
+## 6. Phase 2：Router Admission 与 Subset Lifecycle Preparation
 
 目标：
 
-- 支持 DP 粒度 rollout shrink/expand
-- 引入 close-and-drain 语义
-- 仍默认避免对 stateful multi-turn 做 abort+retry
+- 让后续 subset lifecycle 和 sync-on-expand 拥有明确的 router / engine / index 基础设施
+- 但不把 request-level migration 或更细粒度恢复语义带回当前计划
 
 ### 6.1 Phase 2 scope 限制
 
@@ -481,7 +472,7 @@ Phase 2 默认只覆盖：
 原因：
 
 - 当前 `RolloutManager.get_updatable_engines_and_lock()` 还是基于一个 updatable server 组织
-- 如果不先限定 scope，subset lifecycle / selective sync 的复杂度会被文档提前低估
+- 如果不先限定 scope，subset lifecycle / sync-on-expand 的复杂度会被文档提前低估
 
 ### 6.2 Rollout engine indexing
 
@@ -517,31 +508,13 @@ router 选择规则：
 
 - 仅把新请求派发到 `enabled == true && dead == false` 的 worker
 - disabled worker 允许把 in-flight 工作跑完，但不得再接新请求
-- remove 只能在 worker drain/shutdown 后执行
+- baseline handoff 继续沿用 Phase 1 的 engine-granularity abort + requeue，不在这里引入 request-level migration
 
-### 6.4 Close-and-drain shrink
-
-对 `indices=P` 的 shrink 顺序：
-
-1. 在 router 中 disable 目标 worker URL
-2. 向 scheduler 报告目标 subset 进入 draining 状态
-3. 等待目标 engine drain 或超时
-4. 仅对目标 engine 调 `flush_cache()`
-5. 仅对目标 engine 调 `release_memory_occupation(tags=...)`
-6. 在 RLix 里把目标 infer DP rank 标为 inactive
-7. 向 scheduler 发送 release ACK
-
-默认策略：
-
-- 对 stateful multi-turn path，默认使用 drain，不使用 abort
-- abort 仅在明确无 side effect 的 stateless 示例或专项测试中启用
-
-### 6.5 Phase 2 Validation Gates
+### 6.4 Phase 2 Validation Gates
 
 Gate P2-A：router disable/remove
 
 - disabled worker 不再接收新 routed request
-- 其上的 in-flight request 可以自然完成
 - `/remove_worker` 与 `SGLangEngine.shutdown()` 语义对齐
 
 Gate P2-B：subset lifecycle
@@ -550,91 +523,19 @@ Gate P2-B：subset lifecycle
 - 其他 engine 继续 serving
 - `onload(indices=[i])` 只恢复目标 engine `i`
 
-Gate P2-C：shrink without starvation
+Gate P2-C：expand readiness
 
-- scheduler 会在 flush/offload 之前先 close admission
-- 持续外部请求不会让 target engine 永远 drain 不完
-
-Gate P2-D：expand
-
-- 只有在 weights/KV 已加载完成后，expanded engine 才重新 enable
+- newly expanded engine 在重新 enable 前已经拿到预期的 active weight version
 - router 会把新工作发到恢复后的 active set
 
-## 7. Phase 3：True Mid-Flight Migration
+## 7. Phase 3：Selective Sync（如确有必要）
 
 目标：
 
-- 支持 scheduler 触发的 mid-flight shrink/expand
-- 要求 request-level abort ACK + safe retry
-- 第一批仅针对受控的 multi-turn 示例，例如 Retool v2
+- 在已有 bounded-staleness fullasync baseline 之上，补 subset-aware sync-on-expand
+- 不默认引入 request-level migration；只有在 Phase 1/2 被证明不够时，才继续细化恢复语义
 
-### 7.1 Deterministic request IDs
-
-每次模型生成请求都需要 RLix-owned request id：
-
-`rid = "{pipeline_id}:{rollout_id}:{group_id}:{sample_id}:{turn_id}:{attempt}"`
-
-需要维护的状态：
-
-- `trajectory_id`
-- `turn_id`
-- `attempt`
-- 当前分配到的 engine
-- worker URL
-- creation timestamp
-- active weight version
-- retry cause
-
-### 7.2 Targeted abort
-
-需要补齐或验证 SGLang 端支持：
-
-- `POST /abort_request` 支持按 request id 定向 abort
-- 仅 abort 指定 worker 上的指定 request
-- 能明确返回或暴露 finish reason 为 `abort` 的 ACK
-
-shrink + abort 顺序：
-
-1. disable target worker admission
-2. 找出 target worker 上的 in-flight rid
-3. 对选中的 rid 发送 targeted abort
-4. 等 abort ACK
-5. 把可重试的 current turn 重新分派到 active workers
-6. 只有 ACK 或安全 drain 完成后，才能 offload target engines
-
-硬规则：
-
-- 如果 ACK 超时，正常模式下不得 silent offload
-- 必须 crash 或把 pipeline 标成 unhealthy，而不是默默丢工作
-
-### 7.3 Turn-scoped retry
-
-这是当前 MILES 没有的能力，必须新增。
-
-需要的语义：
-
-- 保留已完成 earlier turns
-- 保留直到最后一个 committed non-abort turn 为止的环境 / tool 状态
-- 只重试当前 aborted 的 model call / 当前 turn
-- request id 中仅 `attempt` 增长
-- 当前 turn retry 不得复用 `Sample.reset_for_retry()`，因为那是 whole-sample reset
-
-side-effect commit 规则：
-
-- tool / env side effect 只有在该 turn 的模型生成结果被确认为 non-abort 后才算 committed
-- 如果外部工具已经执行，则 example 必须提供 idempotency key 或 resume protocol
-
-推荐第一目标：
-
-- `examples/retool_v2/*`
-- 具体实现落点优先考虑 `miles.rollout.generate_hub.multi_turn.generate`
-
-SWE-agent：
-
-- 晚于 Retool
-- 因为 external gym 持有 tool 执行语义，需要更明确的 idempotency / resume 设计
-
-### 7.4 Selective sync
+### 7.1 Selective sync
 
 Selective sync 与 lifecycle 是独立问题。
 
@@ -647,8 +548,8 @@ Selective sync 与 lifecycle 是独立问题。
 
 务实顺序：
 
-1. Phase 2 expand 先继续使用 global batch-boundary sync
-2. Phase 3 再增加 subset sync-on-expand
+1. Phase 1 继续沿用 global sync / `actor_model.update_weights()` 作为 functional baseline
+2. Phase 2/3 再增加 subset sync-on-expand
 3. P2P selective update 放在 broadcast/tensor subset sync 正确之后
 
 ## 8. 建议的人力拆分
@@ -672,7 +573,7 @@ Selective sync 与 lifecycle 是独立问题。
 - engine index map
 - subset `onload/offload/onload_weights/onload_kv`
 - router worker disable/enable/remove
-- close-and-drain shrink 实现
+- router admission + subset lifecycle glue
 
 ### Team D：progress / accounting
 
@@ -681,12 +582,11 @@ Selective sync 与 lifecycle 是独立问题。
 - in-flight/completed/consumed counters
 - 2% band reporting
 
-### Team E：migration / multi-turn retry
+### Team E：lifecycle / retry glue
 
-- deterministic request ids
-- targeted abort + ACK tracking
-- Retool v2 的 turn-scoped retry
-- 后续 SWE-agent idempotency / resume
+- group-level abort/requeue 集成
+- `fully_async` baseline 与 RLix handoff 的粘合逻辑
+- 如后续证明必要，再单独补更细粒度 recovery hardening
 
 ### Team F：weight sync
 
@@ -699,24 +599,23 @@ Selective sync 与 lifecycle 是独立问题。
 
 ### 9.1 待定决策
 
-- Phase 1 是否先拿 `train.py` 做同步 smoke test，再切到 `train_async.py`
+- Phase 1 是否先拿 `train.py` 做同步 smoke test，再切到 `examples/fully_async` baseline（由 `train_async.py` + fullasync rollout function 承载）
 - RLix 应以 library 方式调用 MILES，还是由 MILES 新建 RLix-aware training entrypoint
 - 是先抽 backend-neutral base coordinator，还是先实现 `miles_coordinator.py` 再回收公共逻辑
 - 是否现在就创建 `rlops/miles` 社区 fork
 - Phase 2 是否统一基于 Miles Router，而不是 SGLang Model Gateway
+- 第一版 fullasync baseline 明确使用 `examples/fully_async/fully_async_rollout.py` + `examples/fully_async/run-qwen3-4b-fully_async.sh` 这组 math example
 
 ### 9.2 主要风险
 
 - `sglang_data_parallel_size > 1` 会引入一层当前 RLix 还未建模的 DP 轴
 - PD disaggregation 的 engine role 比“一个 rollout engine = 一个 infer DP worker”复杂得多
-- SWE-agent / session-server 例子会产生外部 side effect，在 idempotency 明确之前，abort+retry 是不安全的
 - P2P weight transfer 对性能重要，但它当前仍偏静态；不要让 selective P2P 阻塞 Phase 1
 - 如果没有 admission close，global `flush_cache()` 在 shrink 时会被持续新请求饿死
 
 ### 9.3 推荐的立即决策
 
-- 批准 Phase 1 采用 **RLix-managed barrier async**
-- 把 subset shrink/expand 与 current-turn retry 明确当作 Phase 2 / Phase 3 的独立工作流
-- 第一批 scheduler 集成验证目标先选 simple single-turn / 低副作用示例
-- 第一批 multi-turn 验证目标选 `Retool v2`
-- 在 retry 语义跑通前，不把 SWE-agent 当作早期主验证路径
+- 批准 Phase 1 采用 **RLix-managed bounded-staleness fullasync baseline**
+- 让 engine-granularity abort + requeue 成为当前 milestone 的 handoff 主方向
+- 第一批 scheduler 集成验证目标直接绑定 `examples/fully_async` 的 math example
+- 最终 gate 收窄为 2 个 MILES pipelines under RLix scheduler

@@ -51,3 +51,13 @@ class Coordinator(ABC):
             loras_to_sync: List of LoRA names to sync.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def sync_base_weights_to_active(self) -> List[int]:
+        """Push base model weights to currently-active infer workers.
+
+        Returns:
+            Sorted inference DP ranks that were targeted. Empty means all
+            inference workers are sleeping and will be synced on expand.
+        """
+        raise NotImplementedError

@@ -185,9 +185,10 @@ def test_pending_request_uses_step_target_estimate_without_progress_snapshot(mon
     assert len(plan.sched_guided_allocation_ops) == 1
     op = plan.sched_guided_allocation_ops[0]
     assert op.cluster_id == cluster_id
-    assert set(op.gpus_to_allocate)
-    assert set(op.gpus_to_allocate).issubset({0, 1})
-    assert set(op.dp_ranks_to_add)
+    all_gpus = {g for gpus in op.dp_rank_to_gpus_to_add.values() for g in gpus}
+    assert all_gpus
+    assert all_gpus.issubset({0, 1})
+    assert op.dp_rank_to_gpus_to_add
     assert remaining_idle != {0, 1}
 
 
@@ -310,7 +311,7 @@ def test_real_progress_overrides_pending_estimate(monkeypatch: pytest.MonkeyPatc
 
     assert len(plan.sched_guided_allocation_ops) == 1
     op = plan.sched_guided_allocation_ops[0]
-    assert set(op.gpus_to_allocate) == {0, 1}
+    assert {g for gpus in op.dp_rank_to_gpus_to_add.values() for g in gpus} == {0, 1}
 
 
 def test_two_pipelines_donor_shrink(monkeypatch: pytest.MonkeyPatch) -> None:

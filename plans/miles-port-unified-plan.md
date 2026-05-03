@@ -936,11 +936,19 @@ tool error 等），与本 port 完全正交：
 "dispatch 选了 engine X → shrink 并发把 X 标 disabled → request 仍发到 disabling
 engine"的 TOCTOU。详见 Feature 2 第 5 条 compound operation 不变量。
 
-**Shrink-to-zero 由 F10 拓扑保证：** MILES 不需要 NeMo 的 `_wait_for_active_dp_shards()`
-collector 阻塞，因为 Feature 10 验证 `len(infer_devices - train_devices) >=
-rollout_num_gpus_per_engine` 已保证 ≥1 非重叠 engine 常驻 active。所有 shrink 操作只
-针对 overlap subset，永远不会出现 "全部 engines sleeping → collector 无处 dispatch" 的
-状态。
+**Shrink-to-zero 在 M11.1 由 F10 拓扑保证 (single-pipeline only)：** MILES 不需要 NeMo
+的 `_wait_for_active_dp_shards()` collector 阻塞，因为 Feature 10 验证
+`len(infer_devices - train_devices) >= rollout_num_gpus_per_engine` 已保证 ≥1 非重叠
+engine 常驻 active —— **但这是 declared-topology precondition, 仅在 single-pipeline
+M11.1 覆盖整个 actor_infer 分配的前提下成立**。所有 shrink 操作只针对 overlap subset，
+永远不会出现 "全部 engines sleeping → collector 无处 dispatch" 的状态。
+
+**M11.2 0-active runtime state 是 legit status, 由 router suspend (下方 §7+§8+§9) 处理：**
+M11.2 partial-allocation 下, pipeline 的非重叠 engine slot 可能在 `shell` state
+(scheduler 没分到对应 GPU)，own-train cycle sleep overlap engine 后 runtime
+active engine count 真的会到 0。这不是异常状态、不是拓扑违规、不应该 crash —— 应当
+suspend background generation request 直到 expand/enable 唤醒。see §7 router
+`_use_url` block-with-notify + §8 HTTP sentinel + §9 client translation.
 
 **6. Retry safety 适用范围说明**
 
@@ -952,10 +960,237 @@ success 模式。如未来引入 stateful tool / NeMo-Gym 风格的 mid-turn env
 idempotency key 才能启用 turn retry。这与 NeMo plan F3 的 retry safety invariant 是同
 一约束。
 
-改动量：~180 行（router 4-state lifecycle + metadata 注入 ~50, routing lock + abort
+**7. Router `_use_url` block-with-notify on empty active set (M11.2 — C20)**
+
+M11.2 partial-allocation legit-status path. 当 `set(self.worker_request_counts) &
+self.enabled_workers - self.dead_workers` 为空时，`_use_url` 不能 raise (会被 retry
+loop 误当 transient 失败重试 60 次), 也不能 fail-fast crash (M11.2 own-train cycle
+正常会进入这个状态)。**必须 suspend dispatch 直到 add/enable 唤醒**, 由 bounded
+timeout 兜底防止 silent hang.
+
+```python
+# miles/router/router.py — replace synchronous _use_url with async block-with-notify
+
+import os
+
+class _RouterDispatchTimeout(Exception):
+    """Local marker — translated to HTTP 503 + X-Miles-Preempt by do_proxy.
+
+    NOT EnginePreemptedError — that type lives in miles.rollout.base_types
+    and would not survive serialization across the router's HTTP boundary.
+    Client-side _post translates the sentinel response to EnginePreemptedError
+    (see §8). Router process never imports miles.rollout.base_types.
+    """
+
+    def __init__(self, wait_s, enabled, dead, registered):
+        self.wait_s = wait_s
+        super().__init__(
+            f"router dispatch timed out after {wait_s}s with empty active set "
+            f"(enabled={len(enabled)}, dead={len(dead)}, registered={len(registered)})"
+        )
+
+
+class MilesRouter:
+    def __init__(self, args, ...):
+        ...
+        # M11.2 0-active suspend (C20):
+        # asyncio.Condition synchronizes _use_url waiters with state-mutating
+        # endpoints. notify_all from add_worker / enable_worker / health-check
+        # recover wakes all suspended dispatchers; each re-checks the predicate
+        # under the lock and either dispatches or re-suspends.
+        self._workers_changed = asyncio.Condition()
+        self._wait_timeout_s = float(os.environ.get("MILES_ROUTER_DISPATCH_WAIT_S", "60"))
+
+    async def _use_url(self):
+        """Select worker URL with min in-flight; suspend if active set empty.
+
+        M11.2 0-active is legit; suspend until add/enable. Bounded by
+        MILES_ROUTER_DISPATCH_WAIT_S (default 60s). On timeout, raise
+        _RouterDispatchTimeout — do_proxy converts to HTTP 503 + sentinel
+        header. **NEVER raise generic RuntimeError from this method** —
+        the previous "no enabled live workers" path swallowed the
+        legit-status signal as transient failure.
+        """
+        async with self._workers_changed:
+            try:
+                await asyncio.wait_for(
+                    self._workers_changed.wait_for(
+                        lambda: bool(set(self.worker_request_counts) & self.enabled_workers - self.dead_workers)
+                    ),
+                    timeout=self._wait_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                raise _RouterDispatchTimeout(
+                    self._wait_timeout_s, self.enabled_workers, self.dead_workers, self.worker_request_counts
+                )
+            valid = set(self.worker_request_counts) & self.enabled_workers - self.dead_workers
+            url = min(valid, key=self.worker_request_counts.get)
+            # Load accounting MUST stay inside the lock so _finish_url's
+            # `assert >= 0` cannot fire under concurrent suspend/resume.
+            self.worker_request_counts[url] += 1
+            return url
+```
+
+`do_proxy` 必须 `await self._use_url()` (not `self._use_url()`), 并把
+`_RouterDispatchTimeout` 翻译成 HTTP 503 + sentinel header — **client side 据此
+raise `EnginePreemptedError`** (§8):
+
+```python
+async def do_proxy(self, request, path, body=None, headers=None) -> dict:
+    try:
+        worker_url = await self._use_url()           # was: self._use_url()
+    except _RouterDispatchTimeout as e:
+        return {
+            "request_body": body or b"",
+            "response_body": json.dumps({
+                "error": "router_preempt",
+                "reason": "empty_active_set_timeout",
+                "wait_s": e.wait_s,
+            }).encode(),
+            "status_code": 503,
+            "headers": {"X-Miles-Preempt": "empty_active_set_timeout"},
+        }
+    url = f"{worker_url}/{path}"
+    ...   # rest unchanged
+```
+
+**Notification 在 endpoint layer, helpers 仍 sync**: F3 §(b.4) 定义的
+`_add_worker_internal / _enable_worker_internal / _disable_worker_internal /
+_remove_worker_internal` 全部保持 `def` (synchronous). Notification 由 async
+endpoint 在 sync mutation 之后发出:
+
+```python
+async def add_worker(self, request: Request):
+    url, engine_index = self._parse_add_worker(request)
+    self._add_worker_internal(url, engine_index)
+    async with self._workers_changed:
+        self._workers_changed.notify_all()
+    return JSONResponse({"status": "success", ...})
+
+# disable_worker / enable_worker / remove_worker 同模式 — sync helper + async notify.
+
+async def _health_check_loop(self):
+    """既有循环已是 async; 在 mark-dead / recovered 处直接 notify."""
+    ...
+    if any_dead_or_recovered_transition:
+        async with self._workers_changed:
+            self._workers_changed.notify_all()
+```
+
+**理由**:
+- **Block, 不 503-then-retry**: caller 是 fully_async background generation tasks，
+  应当在 router 内部 silent suspend，不应该跑 60-retry loop 累计 wall-clock。
+- **Bounded timeout**: 防 pipeline-stuck 无 expand 的死锁，60s 默认与
+  `ROLL_SELECTIVE_MODEL_UPDATE_TIMEOUT_S` 同 order；env-tunable。
+- **`_RouterDispatchTimeout` not `EnginePreemptedError`**: 后者位于
+  `miles.rollout.base_types`，router process import 它会引入循环依赖；HTTP
+  序列化也不保留 Python type，client-side 必须重新 raise。
+
+**8. Client `_post` HTTP sentinel translation (M11.2 — C20)**
+
+`miles.utils.http_utils._post` 在 `raise_for_status()` 与 retry loop **之前**
+检测 `X-Miles-Preempt` header，把 router 503 sentinel 翻译成
+`EnginePreemptedError` (NOT `httpx.HTTPStatusError`, NOT generic `Exception`)，
+进入既有 `multi_turn.py` turn-redispatch + `fully_async` fatal-sentinel chain，
+**不消耗 60-retry budget**:
+
+```python
+# miles/utils/http_utils.py
+async def _post(client, url, payload, max_retries=60, action="post", headers=None):
+    # Lazy import at function TOP (NOT inside try). Python 把 function body
+    # 内的 `from ... import EnginePreemptedError` 视为 LOCAL binding; 如果
+    # 这行在 try 内、await 之前的语句 raise, `except EnginePreemptedError:`
+    # 会因 unbound local 抛 UnboundLocalError 替代真正的异常处理. 函数顶部
+    # import 一次, sys.modules 缓存让后续调用 O(1).
+    from miles.rollout.base_types import EnginePreemptedError
+
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            if action in ("delete", "get"):
+                assert not payload
+                response = await getattr(client, action)(url, headers=headers)
+            else:
+                response = await getattr(client, action)(url, json=payload or {}, headers=headers)
+
+            # Sentinel detection BEFORE raise_for_status / retry — 否则 503
+            # 触发 raise_for_status -> generic except -> retry 60 次。
+            if response.status_code == 503 and response.headers.get("X-Miles-Preempt"):
+                raise EnginePreemptedError(
+                    f"router preempt sentinel "
+                    f"(reason={response.headers['X-Miles-Preempt']}, url={url})"
+                )
+
+            response.raise_for_status()
+            try:
+                output = response.json()
+            except json.JSONDecodeError:
+                output = response.text
+        except EnginePreemptedError:
+            # Propagate WITHOUT retry — reaches multi_turn.py redispatch /
+            # fully_async fatal sentinel through normal exception flow.
+            # Must come BEFORE generic `except Exception` clause.
+            raise
+        except Exception as e:
+            ...   # existing retry path, unchanged
+        break
+    return output
+```
+
+**Forward-compat note**: M11.5 follow-up "5xx → preempt synthesis"
+([§Implementation follow-up](#implementation-follow-up)) 可以复用同一个
+`X-Miles-Preempt` header 从 SGLang ingress 5xx 路径触发 — 同一个
+translator 处理，不需要额外 client 改动。
+
+**9. Distributed POST hot-path coverage (M11.2 — C20)**
+
+`miles.utils.http_utils.post()` 在 `_distributed_post_enabled` 时通过 Ray actor
+分发到 `_HttpPosterActor.do_post`，actor 内部仍调 `_post(...)` —— 所以 §8
+的 sentinel 检测在 actor 进程内自动覆盖, `EnginePreemptedError` 跨 Ray RPC
+被 wrap 成 `ray.exceptions.RayTaskError`. 当前 `post()` 的
+`except Exception → fall back to local _post` 是 harmless (local retry 命中同
+router 503 + sentinel 再翻译一次), **但浪费一次 RTT per preempt**. 为消除浪费,
+`post()` 必须 unwrap `RayTaskError.cause` 并 propagate `EnginePreemptedError`
+**before** generic fallback:
+
+```python
+# miles/utils/http_utils.py — module top, GUARDED import (Ray-absent 环境
+# 不能 break import; eager `import ray.exceptions` 会 break standalone /
+# CI 测试 / 单机 dev 环境)
+try:
+    from ray.exceptions import RayTaskError
+except ImportError:
+    RayTaskError = ()   # `except ()` matches nothing → branch is dead in non-Ray envs
+
+from miles.rollout.base_types import EnginePreemptedError
+
+async def post(url, payload, max_retries=60, action="post", headers=None):
+    if _distributed_post_enabled and _post_actors:
+        try:
+            actor = _next_actor()
+            if actor is not None:
+                return await actor.do_post.remote(url, payload, max_retries, action=action, headers=headers)
+        except RayTaskError as e:
+            # Unwrap Ray RPC wrapper; propagate preempt without local fallback.
+            # MUST come BEFORE generic `except Exception` so preempt is recognized.
+            if isinstance(e.cause, EnginePreemptedError):
+                raise EnginePreemptedError(str(e.cause)) from e
+            logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
+        except Exception as e:
+            logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
+    return await _post(_http_client, url, payload, max_retries, action=action, headers=headers)
+```
+
+**Implementer alternative**: import `RayTaskError` 改在
+`if _distributed_post_enabled and _post_actors:` branch 内 (lazy)。
+Module-top guarded form 更清晰，避免未来 call site 增加导致 `NameError`。
+
+改动量：~280 行 (router 4-state lifecycle + metadata 注入 ~50, routing lock + abort
 触发口 ~20, turn snapshot/restore + redispatch loop + raise EnginePreemptedError
 ~80, _is_scheduler_preempt + RLixRouterMetadataError + fully_async fatal sentinel
-queue 单路径 ~30）
+queue 单路径 ~30, **§7 router `_use_url` async + `_workers_changed` Condition +
+`_RouterDispatchTimeout` + endpoint notifies ~50, §8 client `_post` sentinel
+detection ~20, §9 client `post()` `RayTaskError` unwrap + guarded import ~10**)
 
 ---
 
@@ -2952,6 +3187,25 @@ assert not getattr(args, "rollout_force_stream", False), (
     "RLix mode requires non-streaming generate; metadata injection requires JSON body"
 )
 
+# NOTE: this validation block assumes module-level `import os` (already
+# present for adjacent `os.path.isdir`, `os.environ.get` calls in F10).
+
+# C20: M11.2 0-active-engine generation-path is a legit runtime status — router
+# `_use_url` 必须 block-with-notify on empty active set (不能 raise generic
+# RuntimeError, 不能 fail-fast crash). M11.1 single-pipeline 下因为 declared-
+# topology 已保证 ≥1 active, suspend 路径不会触发; 但代码 / 配置在 M11.1 就要
+# present 以避免 M11.2 时实施漂移. Bounded by MILES_ROUTER_DISPATCH_WAIT_S
+# (default 60s); timeout returns HTTP 503 + X-Miles-Preempt header (sentinel),
+# client `miles.utils.http_utils._post` 必须翻译成 EnginePreemptedError 进入
+# turn-redispatch / fatal-sentinel chain — 不能跑 60-retry HTTP loop.
+# 实现 spec 见 §Feature 3 §7+§8+§9. Enforcement 由 router/client 单元测试 +
+# Gate 4 (f) 保证, 不在此处加 startup assert (timeout default 来自 env, 拓扑
+# 不可静态校验).
+_router_wait_s = float(os.environ.get("MILES_ROUTER_DISPATCH_WAIT_S", "60"))
+assert _router_wait_s > 0, (
+    "MILES_ROUTER_DISPATCH_WAIT_S must be positive (router suspend bounded timeout)"
+)
+
 # S2: Bucket size GPU 上界 check 仅在 NCCL broadcast (non-colocate receiver) 存在时
 # 触发. M11.1 cpu_serialize colocate path 不需要 sender GPU staging. NCCL broadcast
 # path 需要 (NCCL 不支持 CPU tensor, sender 必须 H2D staging 到 cache_owner GPU 才能
@@ -3773,6 +4027,86 @@ PG：两 pipeline 共享 RollResourceManagerProxy 的 shared PGs
     Test instrumentation is per-test concern (timestamp logger on
     coordinator + driver side); not part of production code path.
 
+(f) Router dispatch under 0-active-engine (M11.2 partial-alloc + own-train cycle):
+    Pipeline B is in (c) state — 1 active engine (engine 0 = overlap subset).
+    During B's own train cycle, engine 0 sleeps → router enabled set = ∅
+    (engine 1 stays in `shell` state, never in router worker list).
+    Background fully_async generation tasks issued before/during shrink hit
+    `_use_url`. **MUST suspend, NOT raise** (legit M11.2 status; see Feature 3
+    §7+§8+§9 spec).
+
+    Positive (suspend + resume) — explicit P1→P2→P3 ordering eliminates the
+    inject-vs-disable race (router runs as a separate FastAPI process; test
+    cannot read `self.enabled_workers` directly):
+
+    - **Step P1 (establish empty active set FIRST)**: Trigger `_before_training`
+      and observe completion through the router's HTTP surface. The router runs
+      in its own FastAPI process. Test-only diagnostic endpoint:
+      `GET /admission_state` returning `{"enabled": [...], "dead": [...],
+      "registered": [...]}` (gated behind `MILES_ROUTER_TEST_HOOKS=1` env flag;
+      production deployments leave it off so the surface area is unchanged).
+      Poll until `enabled == [] and dead == []` AND engine 1 still in `shell`
+      state (verified via `coordinator.get_active_engines()`). This is the
+      barrier — without precise state visibility, "wait some seconds and hope"
+      is exactly the race the barrier is meant to eliminate.
+      **Production-only fallback** (no diagnostic hook): poll `GET
+      /list_workers` for the registered list, but recognize this does NOT prove
+      `enabled_workers` is empty (disable_worker keeps the URL registered).
+      Use diagnostic hook for Gate 4 (f).
+    - **Step P2 (now inject; dispatch MUST suspend)**: Once the diagnostic hook
+      confirms empty active set, inject background `/generate` via production
+      `miles.utils.http_utils.post` (must traverse the real router HTTP path,
+      NOT a stub). The request enters `_use_url` AFTER the active set is empty,
+      so it MUST suspend on `_workers_changed.wait_for(...)`.
+    - Verify in-flight `/generate` task is still pending after 1s
+      (asyncio timing assertion; suspension is real, not a busy-wait spin).
+    - **Step P3 (resume)**: Trigger `_after_training` → service.sync v=N →
+      expand engine 0 → `add_worker` / `enable_worker` notifies condition.
+    - Verify suspended task resumes, dispatches to engine 0, trajectory
+      completes; `worker_request_counts[engine_0_url]` returns to 0 after
+      `_finish_url` (counter visible via the same `/admission_state`
+      diagnostic, NOT through `self.worker_request_counts` direct access —
+      the test process and router process are separate).
+    - **Race-window note**: the "inject before disable" ordering is
+      intentionally forbidden here. If a future test variant injects first,
+      it MUST use a `disable_worker` hook (e.g., monkey-patched
+      `_disable_worker_internal` that holds an `asyncio.Event` the test
+      releases — same process boundary still applies, so the hook lives
+      INSIDE the router process, not the test process) to provably block
+      the dispatch attempt at `_use_url` until disable completes.
+
+    Negative (timeout → sentinel → EnginePreemptedError):
+    - Set `MILES_ROUTER_DISPATCH_WAIT_S=2` for the test process.
+    - Hold engine 0 sleeping for 3s.
+    - Verify client `_post` raises `EnginePreemptedError`
+      (NOT `httpx.HTTPStatusError`, NOT `RuntimeError`, NOT a 60-retry log).
+    - Verify response carried `status_code=503` + header
+      `X-Miles-Preempt: empty_active_set_timeout`. Retry budget NOT consumed.
+    - Verify fully_async `task_done_callback` sees `EnginePreemptedError`
+      → `_FatalError` queue sentinel → outer-loop dequeue raises;
+      OR multi_turn.py snapshot/restore fires turn-level redispatch
+      (depending on whether the call originated inside a multi_turn turn).
+
+    Counter accounting under suspend/resume (concurrency invariant):
+    - Two concurrent `/generate` tasks suspended at empty active set.
+    - Expand triggers; both resume.
+    - Verify each goes through the lock atomically: each gets +1 in
+      `_use_url`, -1 in `_finish_url`, net zero. No double-decrement,
+      no negative-count assert from `_finish_url`.
+
+    Distributed POST coverage (S1.6) — conditional, NOT a Gate 4 hard gate:
+    - M11.2 Gate 4 dev target is single-machine 4-GPU vast.ai; distributed POST
+      (`_distributed_post_enabled=True`) is typically OFF in this environment.
+      Run this sub-test ONLY in environments where distributed POST is actually
+      enabled in production config. Skip on local-only deployments — the local
+      path already exercises `_post`, which is the load-bearing translator.
+    - When run: repeat the negative test with `_distributed_post_enabled=True`
+      (Ray actor path); verify caller of `post()` receives `EnginePreemptedError`,
+      NOT `RayTaskError`, NOT a "Distributed POST failed, falling back to local"
+      log followed by another retry round-trip. Confirms `post()` exception
+      handler catches `RayTaskError`, unwraps `e.cause`, re-raises as
+      `EnginePreemptedError` BEFORE generic `except Exception` fallback.
+
 NOT a Gate 4 pass/fail criterion (M11.2-tagged follow-up, separate
 deliverables; on crash, manual `ray stop` is accepted recovery):
 admission_epoch race, orchestrator cleanup, graceful actor drain.
@@ -3790,7 +4124,8 @@ admission_epoch race, orchestrator cleanup, graceful actor drain.
 | `miles/ray/rollout.py` | F1, F2, F3, F9, F12 | `EngineInfo` dataclass (`state: Literal["shell", "active", "disabling", "offloaded", "loading"]`, **5 态** — 加 `shell` 表示 slot reserved/无 Ray actor/无 SGLang server/无 GPU; 字段 `handle` / `worker_url` / `server_group` 在 shell 状态下为 None, `bundle_index` / `gpu_ids` / `placement` 始终 populated; **取代 worker-local `is_engine_resident_on_gpu` flag**) + `RolloutManager.{offload,onload,onload_weights,onload_kv}(engine_indices=None)` 仅在 Manager 层 + `shrink_engines/expand_engines` 复合操作 (`expand_engines` 内部 dispatch on entry state: **`shell → loading`** lazy `_create_sglang_actor(engine_idx, placement)` + `onload()`, **`offloaded → loading`** existing `wake_up()`; 返回 engines in `loading` 状态, 不开 routing) + **`activate_routing(engine_indices)` method** (`loading → active` + open router; coordinator 在 service.sync_selected_workers 完成后调用) + abort-drain-sleep + `_routing_lock` compound 不变量 + worker registration with `engine_index` (F3 router metadata 数据源, **不注入 GenerateFnInput.preempt_state**, F3 改用 router-side classification) + progress callback hook (走 `RLixHooks` protocol, 不直接 import RLix 类型) + **`get_engine_count()` method** (返回 `len(self._engines)` == declared engine_count, 包含 shell; sanity check 用 `srv.engines` 不是 `srv.all_engines`) + **`set_weight_version(version, engine_indices=None)` method** (fan-out 到 per-engine `update_weight_version.remote`; 由 service.sync_selected_workers 内部调用, 不在 pipeline 直接调; engine_indices=None 退化到所有 active engines, shell engines 永远跳过) + **`get_engine_handles(engine_indices: Set[int]) -> dict[int, RayActorHandle]` method (Fix #5)** (read-only snapshot of per-engine SGLangEngineActor handles; raise if any engine_idx is in `shell` state; 由 `MilesModelUpdateService.sync_selected_workers` at sync entry 一次性 fetch — service 据此驱动 per-engine cpu_bucket / NCCL broadcast RPC, 不再每次 RPC 找 manager) + **`activate_routing(engine_indices)` method** (loading → active + add_worker to router; coordinator 在 service.sync_selected_workers 完成后调用, 是唯一的 add_worker 入口 — `shrink_engines` 是唯一的 remove/disable 入口; per-pipeline 独立 router port 在 `__init__` 内绑定 `args.sglang_router_port` from provider's port pool, 不 inherit peer pipeline 的 router port) + **`RolloutManager.__init__` 扩展接受 `all_engine_placements: list[WorkerPlacement]` (length engine_count, 全表) + `active_engine_indices: frozenset[int]` (active 子集; partial allocation 下是 strict subset of range(engine_count))** + 新增 `start_rollout_servers_from_worker_placements` (only iterates active engines per `active_engine_indices`; per-worker 节点级 PG + bundle_index=0 + capture_child_tasks + manual CUDA_VISIBLE_DEVICES + NOSET env + 显式 `base_gpu_id=0` (M9 — post-CVD local index, 不传 `wp.gpu_ids[0]` physical id) + 不 fallback `get_base_gpu_id`; shell engines 仅初始化 `EngineInfo` slot 持有 placement, 不 spawn Ray actor). **M4 self-cleanup**: `start_rollout_servers_from_worker_placements` ctor loop try/except — 中途失败 kill 已创建 SGLang engine actors. **M4 `RolloutManager.shutdown_hard()` MVP**: stop monitors (背景 task 取消) + `for h in self._engine_actors: ray.kill(h, no_restart=True)` (skip shell — `handle is None`); 不做 graceful drain / abort RPC / force-kill timeout (follow-up) | +320 |
 | `miles/ray/actor_group.py` | F4, F12 | `RayTrainGroup.__init__` 扩展接受 `worker_placements: list[WorkerPlacement] \| None` (替代 pg=三元组), 完整新签名 `(args, num_nodes, num_gpus_per_node, *, pg=None, worker_placements=None, num_gpus_per_actor=0.4 standalone / 0.01 RLix mode, role, with_ref)`; 必须 pg xor worker_placements 二选一. 每 actor 用对应 `WorkerPlacement.placement_group + bundle_index=0 + capture_child_tasks + CUDA_VISIBLE_DEVICES + NOSET_VISIBLE_DEVICES_ENV_VARS_LIST`. **RLix path 显式传 `local_rank=0` 给 `TrainRayActor.__init__`** (Fix #9 — fractional GPU + manual CVD 下 `ray.get_gpu_ids()` 不在 manual CVD 列表里, 既有 `get_local_gpu_id()` 会 ValueError 或设错 LOCAL_RANK; 1 actor 1 GPU 下 local_rank 永远 0). standalone path 不传, 走旧 fallback. **M4 self-cleanup**: `__init__` 包 try/except, ctor loop 中途失败 (任何 `TrainRayActor.options(...).remote(...)` 或 `init.remote()` raise) 时 `for h in self._actor_handles: ray.kill(h, no_restart=True)` + `self._actor_handles = []` + raise 透传. **M2 sender API**: 加 `build_cpu_bucket_cache(step)` fan-out + `collect_cache_owner_roles() -> list[(rank, is_owner, actor_handle)]` (worker rank ↔ actor handle 配对). **不引入 graceful shutdown method** (follow-up) | +115 |
 | `miles/ray/train_actor.py` (Fix #9) | F12 | `TrainRayActor.__init__` 加可选 `local_rank: int \| None = None` kwarg. None 时 fallback 到既有 `get_local_gpu_id()` (standalone parity); RLix path 由 RayTrainGroup 显式传 `local_rank=0` (1 actor 1 GPU under fractional + manual CVD, local rank 永远 0; 既有 `cvd.split(",").index(str(ray.get_gpu_ids()[0]))` 在 RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 + manual CVD 路径下不成立). 设 `os.environ["LOCAL_RANK"] = str(local_rank if local_rank is not None else get_local_gpu_id())`. 不改 `get_local_gpu_id()` 自身 (兼容 standalone) | +5 |
-| `miles/router/router.py` | F3 | `/disable_worker` / `/enable_worker` / `/remove_worker` endpoint + `/add_worker?engine_index=...` 扩展 + 4 个 router state (`worker_request_counts / worker_failure_counts / dead_workers / enabled_workers / worker_engine_index_map`) + 4 个 internal helper (`_add_worker_internal / _remove / _disable / _enable`) 完整 lifecycle 维护 (含 `setdefault` 避免 re-add 清零 + `add` 时 `dead_workers.discard` + `disable` reset failure_count) + `_use_url` 改用 `enabled_workers - dead_workers` (Critical Invariant: 不只 metadata) + `do_proxy` 内 mutate JSON body 注入 `meta_info["miles_engine_index", "miles_admission_disabled"]` (**仅 path == "generate"**, response 时刻读 `enabled_workers`; race window 边界见 F3 admission_disabled 语义边界段) + **header hardening**: `do_proxy` strip `Content-Encoding` (改 body 后旧 header 不能保留, 否则客户端解码崩); Content-Length 由 `build_proxy_response` 既有逻辑 strip + `JSONResponse` 重算 + `_health_check_loop` 只 probe `enabled_workers - dead_workers`. **不引入 admission_epoch race 防御** (turn retry 兜底; production 多 pipeline 高频 shrink/expand 触发再加, follow-up) | +135 |
+| `miles/router/router.py` | F3 (incl. M11.2 — C20) | `/disable_worker` / `/enable_worker` / `/remove_worker` endpoint + `/add_worker?engine_index=...` 扩展 + 4 个 router state (`worker_request_counts / worker_failure_counts / dead_workers / enabled_workers / worker_engine_index_map`) + 4 个 internal helper (`_add_worker_internal / _remove / _disable / _enable`, **stay sync `def`**) 完整 lifecycle 维护 (含 `setdefault` 避免 re-add 清零 + `add` 时 `dead_workers.discard` + `disable` reset failure_count) + `_use_url` 改用 `enabled_workers - dead_workers` (Critical Invariant: 不只 metadata) + `do_proxy` 内 mutate JSON body 注入 `meta_info["miles_engine_index", "miles_admission_disabled"]` (**仅 path == "generate"**, response 时刻读 `enabled_workers`; race window 边界见 F3 admission_disabled 语义边界段) + **header hardening**: `do_proxy` strip `Content-Encoding` (改 body 后旧 header 不能保留, 否则客户端解码崩); Content-Length 由 `build_proxy_response` 既有逻辑 strip + `JSONResponse` 重算 + `_health_check_loop` 只 probe `enabled_workers - dead_workers`. **不引入 admission_epoch race 防御** (turn retry 兜底; production 多 pipeline 高频 shrink/expand 触发再加, follow-up). **C20 (M11.2 — see §Feature 3 §7)**: `_use_url` becomes `async def` block-with-notify on empty active set; `_workers_changed: asyncio.Condition`; bounded timeout `MILES_ROUTER_DISPATCH_WAIT_S` (default 60s, env-tunable); `_RouterDispatchTimeout` local exception class; `do_proxy` MUST be updated to `await self._use_url()` and translate `_RouterDispatchTimeout` to HTTP 503 + `X-Miles-Preempt: empty_active_set_timeout` header response; `worker_request_counts[url] += 1` increment MUST stay INSIDE the condition lock so `_finish_url` accounting balances; every state-mutating async endpoint (`add_worker` / `enable_worker` / `disable_worker` / `remove_worker`) ends with `async with self._workers_changed: self._workers_changed.notify_all()` (helpers themselves stay sync); `_health_check_loop` notifies on dead/recovered transitions. **NEVER** raise generic `RuntimeError` from `_use_url`; **NEVER** raise `EnginePreemptedError` from inside the router process (HTTP serialization loses Python type — sentinel header is the contract). | +185 (F3 lifecycle ~135 + C20 router suspend ~50) |
+| `miles/utils/http_utils.py` | F3 (M11.2 — C20) | **Module-top guarded imports** (file header): `try: from ray.exceptions import RayTaskError; except ImportError: RayTaskError = ()` (Ray-absent envs; `except ()` matches nothing → branch is dead in non-Ray envs) AND `from miles.rollout.base_types import EnginePreemptedError` (verified cycle-free: `miles.rollout.base_types` does not import `http_utils`). Module-top import provides `EnginePreemptedError` in scope for BOTH `_post` AND `post()`; no per-function lazy import needed. **If a future cycle is introduced**, fall back to function-top imports — they MUST live at the top of EACH function that raises `EnginePreemptedError` (`_post` AND `post()`), NOT inside any `try` block (Python treats `from X import Y` as local binding; if exception fires before the import line, `except EnginePreemptedError:` raises `UnboundLocalError`). **`_post` body**: detect `X-Miles-Preempt` header BEFORE `raise_for_status()` and BEFORE generic retry loop; raise `EnginePreemptedError`; add `except EnginePreemptedError: raise` clause ABOVE the generic `except Exception` so propagation is intact. **`post()` body**: catch `RayTaskError`; unwrap `e.cause`; re-raise `EnginePreemptedError` BEFORE generic `except Exception` fallback (otherwise distributed POST falls back to local _post and wastes one round trip per preempt). Spec: §Feature 3 §8+§9. | +30 (~20 _post + ~10 post; module-top imports ≤5 lines, counted in _post) |
 | `miles/router/middleware_hub/radix_tree_middleware.py` | F3 | RLix mode 下不改成 pass-through；启动校验禁止加载 `RadixTreeMiddleware`，`partial_rollout + radix_tree` 留作 follow-up | +0 |
 | `miles/rollout/generate_hub/multi_turn.py` | F3 | 删除 `assert not args.partial_rollout`（line 29）+ 强制 `payload["stream"] = False`（router metadata 注入要求 JSON body）+ snapshot-then-retry turn loop（`MAX_TURN_REDISPATCH_ATTEMPTS = args.rollout_num_gpus // args.rollout_num_gpus_per_engine`, retry 用尽 raise `EnginePreemptedError` fail fast）+ `_is_scheduler_preempt(output, rlix_mode=DO_TIME_SHARING)` 判定 (RLix mode 缺 metadata raise `RLixRouterMetadataError`, **不读 GenerateFnInput.preempt_state**) | +70 |
 | `miles/rollout/base_types.py` | F3 | `class EnginePreemptedError(Exception)` + `class RLixRouterMetadataError(Exception)`. **不扩 GenerateFnInput** (避免改 sglang_rollout.py:266 / inference_rollout_common.py:82 两个构造点) | +5 |

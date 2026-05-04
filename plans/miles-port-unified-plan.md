@@ -14,6 +14,30 @@
 
 ---
 
+## Anti-regression invariants (must NOT be removed in any follow-up)
+
+The following invariants are MVP correctness or multi-machine prerequisites.
+They MUST NOT be removed by any follow-up trimming pass:
+
+1. Dynamic NCCL broadcast (per-sync CLASSIFY/CREATE/USE/DESTROY)
+2. Warmup allreduce on every NCCL group CREATE
+3. `is_group_exist` no-op guard on `destroy_collective_group`
+4. `master_port != 0` for NCCL TCP rendezvous
+5. SharedStorage `master_port` claim
+6. CPU bucket `cache_owner.run_sync_session(plan)` single composite RPC + `_cache_lock`
+7. `version=-1` runs the FULL CPU-bucket transport + finalize fan-out + `manager.set_weight_version(-1)`
+   (NOT a no-op shortcut — base bytes still travel through the same atomic unit)
+8. Post-sleep / post-offload VRAM assert (read SGLang `/server_info` `memory_usage` GB)
+9. fully_async `_FatalError` queue sentinel single-path
+10. Minimal hard cleanup — terminate tracked Ray actors AND SGLang server process tree
+    (CUDA context lives in SGLang server child processes; killing the Ray actor alone is NOT
+    sufficient); bounded wait for process termination; raise on timeout
+11. F10 topology / unsupported-feature fail-fast guards (`train_devices ⊂ infer_devices`,
+    `infer_engine_count >= 2`, contiguous mapping, EP/MoE forbidden, transport-mode boundary,
+    multi-machine NCCL precondition); **NOT** including any router-dispatch timeout assertion
+
+---
+
 ## 范围
 
 ### In Scope
@@ -51,7 +75,6 @@
 
 - ❌ PD disaggregation
 - ❌ `sglang_data_parallel_size > 1`
-- ❌ Selective P2P weight transfer（先做 broadcast / tensor subset sync）
 - ❌ Multi-LoRA / DPO / SFT
 - ❌ vLLM backend
 - ❌ Request-level deterministic migration（ROLL 的 `RequestScheduler` 路径不复刻 —
@@ -66,6 +89,96 @@
   当前 scope 不启用，留作 follow-up。它不是简单 flag：需要重新审计 expert / non-expert
   参数分组、bucket layout、cache owner 唯一性、version accounting 与 receiver load
   顺序。
+
+#### M11.1/M11.2 MVP — 8-category scope taxonomy
+
+**Refined standard** — distinguishes what MVP includes / excludes vs how each item is treated:
+
+- **Permanently Forbidden** = 引入双状态源 / 错误状态机 / 架构反向依赖,**未来也不该补**
+- **Scope Boundary** = 本 RLix port 不动,**别的 milestone 可能改**
+- **Defer Hardening** = 增加恢复 / 重试 / 容错 / 跨状态窗口归因 / 生产 timeout(M11.5 production)
+- **Trigger-Bound Future Work** = 等另一个解禁条件成熟才做,**non-time-bound**
+- **Not Needed / Already Covered** = 已被等价机制覆盖,**no follow-up planned**
+- **MVP Correctness Floor** = 必需,实现复杂度可能中等,边界极窄
+- **MVP Lightweight Defensive** = cheap fail-fast / invariant / hygiene
+- **Dev-only Tool** = env-flag-gated,不进 Gate 不扩 API
+
+Re-introducing any Layer 1 / Layer 2 item into MVP is forbidden by Anti-regression invariant #11.
+
+##### Layer 1 — Permanently Forbidden (architectural anti-patterns — no future milestone)
+
+- ❌ **A6** — fully_async `_fatal_error` flag dual-path. Queue `_FatalError` sentinel single-path is correct (Anti-regression invariant #9); queue↔flag dual-source = state-divergence bug surface. **No M11.5 follow-up — single-path is the final design.**
+- ❌ **A11** — Router internal retry / request queue / spillover / synthetic fallback worker selection. C20 model = empty active set `asyncio.Condition` suspend ONLY. Queue 不可观测;spillover 破坏 namespace + scheduler 账本.
+- ❌ **A19** — Re-promoting `_preempted_engines` to routing / dispatch / attribution / resize-safety state. **The responsibility is permanently re-scoped to `router.enabled_workers` (single source of truth).** The set may remain ONLY as `RolloutManager._abort_engines` internal abort-idempotency cache.
+- ❌ Splitting `cache_owner.run_sync_session(plan)` into multiple top-level Ray RPC — reintroduces lock-across-RPC anti-pattern.
+- ❌ Pipeline / coordinator directly calling `finalize_weight_update` / `manager.set_weight_version` outside the `MilesModelUpdateService.sync_selected_workers` atomic unit.
+- ❌ Putting `worker_request_counts[url] += 1` outside the condition lock — concurrent suspend/resume race → negative-count assert from `_finish_url`.
+- ❌ Raising `RuntimeError("no enabled live workers")` from router `_use_url` — must suspend with `_workers_changed` Condition (C20).
+- ❌ Mutating `os.environ['CUDA_VISIBLE_DEVICES']` after `import torch` / `import sglang` — CVD must be set before import.
+- ❌ Subclassing `PipelineCoordinator` for `MilesCoordinator` — coordinator goes through hook protocol, not inheritance.
+- ❌ Adding device-mapping CLI args — mapping must derive from RLix declared mapping.
+- ❌ Re-introducing per-request tracking (`_inflight_requests`) or worker-side `is_engine_resident_on_gpu` flag.
+- ❌ Re-using `load_format="flattened_bucket"` for cpu_serialize — incompatible with ROLL wire format.
+- ❌ Driver-level `ray.shutdown()` or top-level `try/except` in `run_miles_rlix.py` — cleanup uses `ray stop` CLI.
+- ❌ Making sync admission helpers (`_add_worker_internal` etc.) async — F3 design: helpers stay sync; only async endpoints + `_health_check_loop` carry `notify_all`.
+
+##### Layer 2 — Scope Boundary (this RLix port does not modify; other milestones may)
+
+- ❌ Modifying standalone path (`train_async.py` body, `RolloutManager.update_weights_from_distributed/tensor`, existing `_send_to_colocated_engine` cuda_ipc) — this port adds RLix-mode hooks only; standalone path is untouched.
+
+##### Layer 3 — Defer Hardening (M11.5 production hardening — changes recovery / retry / fault-tolerance semantics)
+
+- ❌ **A1** — C20 bounded `MILES_ROUTER_DISPATCH_WAIT_S` timeout + HTTP 503 `X-Miles-Preempt` sentinel + client `EnginePreemptedError` translation + `_RouterDispatchTimeout` + `RayTaskError` unwrap (M11.5 production SLA; MVP keeps unbounded `_workers_changed.wait_for(predicate)` suspend ONLY).
+- ❌ **A2** — `admission_epoch` start/end race defense (M11.5; MVP keeps 4-state worker lifecycle + `enabled_workers - dead_workers` check).
+- ❌ **A3** — Multi-pipeline orchestrator-driven selective namespace cleanup (M11.5; MVP recovery is manual `ray stop`, consistent with §6.2).
+- ❌ **A4** — Receiver crash tolerance / conditional port leak / periodic port GC (M11.5; MVP keeps EADDRINUSE retry → fail-fast per Anti-regression invariants #1–#5).
+- ❌ **A5** — NCCL `master_port` TIME_WAIT cooldown queue / port pool (M11.5; MVP keeps `get_free_port()` + SharedStorage claim per sync — see Layer 7 B3 default path).
+- ❌ **A10** — SGLang ingress 503 middleware / 5xx preempt sentinel synthesis (M11.5). **Affects only Case B 5xx-residual** (abort-drain race 漏出来的 5xx);**Case A router-metadata preempt path 不受影响**,继续走 multi_turn turn-level redispatch (F3 router admission 闭环). MVP trainer policy: 5xx-residual → trainer 既有 HTTP error path → group recycle (§3.2 B4 / Layer 6).
+- ❌ **A12** — Plasma true zero-copy `cpu_serialize` adapter (M11.5; F4 spec does NOT promise zero-copy in M11.1).
+- ❌ **A13** — `args.async_save` support / `maybe_finalize_async_save(blocking=True)` + `cuda.synchronize()` (M11.5; F10 still fail-fasts on `async_save=True`).
+- ❌ **A14** — Train-side post-offload VRAM assert via `torch.cuda.memory_allocated()` (M11.5; DISTINCT from Anti-regression invariant #8 SGLang server-side `/server_info` `memory_usage` assert — that IS kept).
+- ❌ **A15** — Engine-level overlap `non_overlap_engines >= 1` set-intersection assert in F10 (M11.5; F10 already has `infer_engine_count >= 2` C2 fail-fast — stricter check is redundant in MVP).
+- ❌ **A16 (recovery feature 部分)** — `enable_worker` resurrects dead worker + Gate 4 dead-recovery as pass criterion (M11.5). KEEP/DEFER split — see Layer 7 for cheap hygiene part.
+- ❌ **A17** — Router `do_proxy except` broadening to `(KeyError, AttributeError, TypeError, JSONDecodeError)` (M11.5; MVP keeps narrow `JSONDecodeError, KeyError` only).
+- ❌ Graceful actor drain / cleanup daemon / 30s+force-fallback / abort RPC (M11.5; MVP keeps minimal hard cleanup — see Layer 6 B2).
+
+##### Layer 4 — Trigger-Bound Future Work (conditional, non-time-bound)
+
+- ❌ **A7** — F12 `infer_device_mapping` runtime round-trip identity self-check / scheduler allocation cross-check (**conditionally deferred — bound to A18 unblock**; first-build contiguous mapping makes it a dead assert; scheduler cross-check additionally requires RLix `scheduler.get_allocation()` public API which doesn't exist).
+- ❌ **A18** — Non-contiguous / custom-ordered `infer_device_mapping` adapter / full reverse mapping `scheduler_dp_rank → engine_index → gpu_ids` (**use-case-triggered** — cross-node engine or custom GPU ordering; NOT a milestone-bound task; **unblocks A7 when activated**; F12 keeps C6 contiguous-mapping fail-fast in MVP).
+
+##### Layer 5 — Not Needed / Already Covered (no follow-up planned)
+
+- ❌ **A8** — Coordinator-side NCCL teardown ack verification (**Not needed — already covered by `ReloadableProcessGroup.destroy/reload` (sync) + Gate 2.5 destroy/reload cycle ≥3 steps**). If destroy didn't actually complete, next CREATE would hit port collision and fail immediately. **No M11.5 follow-up planned.**
+
+##### Layer 6 — MVP Correctness Floor (active in M11.1/M11.2 — required, narrow boundary)
+
+- ✅ **B2** — Minimal hard cleanup (terminate tracked Ray actors AND SGLang server process tree, bounded wait, raise on timeout). Implementation complexity moderate but **required** — CUDA context lives in SGLang server child processes; killing the Ray actor alone leaves CUDA context = next pipeline OOM. **Strict boundary**: forbidden graceful drain RPC / abort RPC / 30s+force-fallback dual-protocol / cleanup daemon / VRAM-threshold gate (those are Layer 3 deferred).
+- ✅ **B4** — 5xx residual trainer policy (documented MVP behavior — not new hardening). Case A router-metadata preempt → multi_turn turn-level redispatch (~99%, group preserved); only Case B 5xx-residual → existing trainer HTTP error → group recycle. A10 ingress 503 middleware (Layer 3) is M11.5; MVP does NOT distinguish preempt-driven 5xx vs engine-crash 5xx.
+
+##### Layer 7 — MVP Lightweight Defensive (active in M11.1/M11.2 — cheap fail-fast / invariant / hygiene)
+
+- ✅ **A16 (cheap hygiene 部分)** — `dead_workers.discard(url)` in `_add_worker_internal` (1 line — invariant: re-registering same URL must not carry old `dead` poisoning) + `worker_failure_counts[url] = 0` reset in `_disable_worker_internal` (1 line — invariant: sleep must not poison failure count). DEFER part is dead-worker recovery feature (Layer 3).
+- ✅ **X3 boundary** — `MilesCoordinator._active_engines_bootstrapped` bool for double-bootstrap detection. `bootstrap_active_engines` accepts an empty set as legitimate first call; set's truthiness alone cannot distinguish "first call with empty set" from "second call with empty set"; flag makes the invariant violation detectable.
+- ✅ **B1** — Test-side timeout wrapper (`asyncio.wait_for(test_coro, 60)` for Gate 4 (f) sub-tests; production router stays unbounded). Catches buggy implementations at CI fast — not a production safeguard.
+- ✅ **B3 default path** — `master_port != 0` + SharedStorage `MASTER_ADDR_PORT:*` claim per sync + EADDRINUSE retry exhausted → fail fast. **No port pool** (that is A5 Layer 3 deferred).
+- ✅ **F10 startup fail-fast guards** — topology / transport / contiguous mapping / EP/MoE forbidden / multi-machine NCCL precondition. Fails early at startup; doesn't let misconfiguration silently produce wrong results.
+- ✅ **Anti-regression invariant #2** — Warmup allreduce on every NCCL group CREATE.
+- ✅ **Anti-regression invariant #3** — `is_group_exist` no-op guard on `destroy_collective_group`.
+- ✅ **Anti-regression invariant #8** — Post-sleep / post-offload VRAM assert via SGLang `/server_info` `memory_usage` (server-side, distinct from A14 train-side which is Layer 3).
+
+##### Layer 8 — Dev-only Tool (env-flag-gated, NOT in Gate criteria)
+
+- ✅ **A9** — `verify_model` debug validation kept as `MILES_DEBUG_VERIFY_MODEL=1` env-flag-gated dev tool. **NOT a Gate 2.5 pass criterion**; Gate verification = per-bucket barrier + warmup allreduce (Anti-regression invariant #2). Does not extend production receiver API surface.
+
+##### Special — Boundary kept (NOT classified as Layer 1-8)
+
+- **X1** — `mode` / `adapter_id` nullable fields in `begin_progress_batch` (Feature 9 / fully_async_rollout.py). **Protocol forward-compat** — wire-protocol shape, NOT a debug safeguard. Removing now and re-adding in M11.4 LoRA breaks `RLixHooks` protocol signature for standalone `NoOpRLixHooks` callers. Zero runtime cost.
+- **X2** — `MilesCoordinator.register_model_update_resources(*, cache_owner_actor, rollout_manager)` ctor handle injection (M2 P0-1). **Architecture ownership boundary** — service body must NOT look up via `ray.get_actor` (that's Layer 1 Forbidden). Not optimization, not debug.
+
+##### Special — Evidence-based pending
+
+- **C1** — `MilesPipeline` actor `max_concurrency`. Decision deferred to execution phase: Phase 1 enumerates inbound RPC surface in plan + TLDR; Phase 2 re-confirms post-implementation. Both audit checkboxes start unchecked. See §7 Audit Checkpoints.
 
 #### MoE / EP note（为什么不在当前 scope）
 
@@ -136,24 +249,25 @@ semantics; M11.2-M11.6 按 milestone 完成 production parity (见各 feature �
 
 **M11.2-M11.6 后续 milestone** (见各 feature 段 milestone 标签):
 - M11.2 unified-plan scope (Gate 4 happy path):
-    • shell partial GENERATION allocation
-    • RolloutManager shell → loading → active lazy ctor path
-    • coordinator expand sync with base version -1 (v=-1 short-circuit, Fix #13)
-      and later step versions
-    • Fix #14 F10 startup fail-fast on resume args (M11.2 不支持 resume; CPU-only
-      base sync 是 M11.2 follow-up)
+    • full high-priority INIT for all SGLang engines, followed by offload
+      (drop weights/KV/graph from GPU) before normal GENERATION scheduling
+    • RolloutManager offloaded → loading → active wake path for generation grants
+    • coordinator expand sync with base version -1 from trainer CPU bucket (same
+      `sync_selected_workers` atomic unit as later step versions; no checkpoint
+      equivalence shortcut)
     • Gate 4 happy-path dual MILES pipeline acceptance:
-        (c) Pipeline B init under contention gets partial allocation
-        (d) expand-before-first-after_training uses base version -1
-            (no transport, no finalize, just set_weight_version)
+        (c) Pipeline B init under contention waits for full INIT allocation,
+            initializes all SGLang engines, then offloads all without routing or sync
+        (d) expand-before-first-after_training uses base version -1 from the
+            init-built CPU bucket, then finalize + set_weight_version
         (e) donor shrink before receiver expand/add ordering is verified
 
-  M11.2-tagged but **NOT in unified-plan implementation scope** (各自 follow-up
-  deliverables, 同 milestone hardening 层, 不是 Gate 4 landing criteria;
-  crash 时手动 `ray stop` 是 accepted recovery):
-    • admission_epoch race defense (follow-up L3618)
-    • multi-pipeline orchestrator-driven cleanup (follow-up L3618)
-    • graceful actor drain replacing ray.kill (follow-up L3631)
+  M11.5 production hardening (Layer 3 Defer Hardening — see §3.1), **NOT Gate 4
+  landing criteria** (各自 follow-up deliverables, crash 时手动 `ray stop` 是
+  accepted recovery):
+    • admission_epoch race defense (see "router admission_epoch race 防御" row in §Implementation follow-up)
+    • multi-pipeline orchestrator-driven cleanup (see "多 pipeline orchestrator-driven selective namespace cleanup" row in §Implementation follow-up)
+    • graceful actor drain replacing ray.kill (see "MilesPipeline graceful actor drain" row in §Implementation follow-up)
 - M11.3 (skipped — cross-node rollout engine not supported; multi-node DP capability rolled into M11.1)
 - M11.4: LoRA + multi-stream aggregation impl
 - M11.5: ingress 503 + 5xx synthesis (preempt sentinel) + cleanup daemon + NCCL port hardening (port cooldown queue, receiver crash tolerance / conditional port leak / periodic port GC)
@@ -193,6 +307,26 @@ M11.1 最终 e2e gate 只在 F4-F6 weight refresh、F7-F11 control plane、F12 p
   attribution 过渡窗口；refresh 完成后 engine 必须发布
   `_current_weight_version == _cache_ready_step`，trajectory `weight_versions` 必须能被
   `--max-weight-staleness` 可靠消费。
+- **B2 — Pipeline cleanup MUST minimize hard cleanup, NOT graceful drain** (M11.1/M11.2 hard
+  constraint): cleanup MUST terminate tracked Ray actors AND SGLang server process tree
+  (CUDA context lives in SGLang server child processes; killing the Ray actor alone is NOT
+  sufficient), wait best-effort for process termination with bounded timeout, then raise
+  on timeout. **Forbidden in MVP**: graceful drain RPC, abort RPC, 30s+force-fallback dual-
+  protocol, cleanup daemon, VRAM-threshold gate (VRAM is environment-noisy, not a
+  correctness signal). Graceful drain → M11.5 follow-up. Matches Anti-regression invariant
+  #10.
+- **B4 — 5xx residual trainer policy** (M11.1/M11.2 hard constraint): the **primary**
+  preempt path is router-metadata-based turn-level redispatch (F3 router admission 闭环
+  + multi_turn `_is_scheduler_preempt(output)`) — handles ~99% of preempts and does
+  **NOT** recycle group; completed turns are preserved, only the current turn redispatches
+  to a different engine. Only **abort-drain race residual 5xx** (rare: SGLang 直接返回 5xx,
+  router metadata 没机会注入) falls through to the existing trainer HTTP error path →
+  group recycle. MVP 接受 5xx-residual 的 group recycle 代价(happy path 发生率低), 不
+  区分 preempt-driven 5xx vs engine-crash 5xx。M11.5 A10 (SGLang ingress 503 middleware
+  + sentinel header) 加一层 ingress 分类把 5xx-residual 中的 preempt 部分也拉回 turn
+  redispatch。Cross-link from §6.2 stop conditions: turn-level redispatch covers Case A
+  preempts; group recycle covers Case B 5xx-residual + Case C tool errors (既有 MILES
+  路径).
 
 ---
 
@@ -332,13 +466,16 @@ buffer 释放由 [miles/utils/reloadable_process_group.py](external/miles/miles/
    长度恒等 `engine_count`，shell 也占 slot）。文档可保留字段说明，但实现层不要拆 5 个
    并行 map（容易状态漂移）。
 
-   **`shell` 语义 (M11.2 Gate 4 partial GENERATION allocation)**: slot 已声明拓扑
+   **`shell` 语义 (construction-only / pre-init transient)**: slot 已声明拓扑
    (engine_idx + declared `WorkerPlacement` + declared gpu_ids), 但 **没有 Ray actor,
-   没有 SGLang server process, 没有 GPU**. 唯一合法转换:
-   - `shell → loading → active` — 第一次 expand 时 `_create_sglang_actor(engine_idx, placement)`
-     lazy 创建 + `onload()` + 由 coordinator 调 service.sync_selected_workers + activate_routing
-   - `shell` 是 shrink 的终点: 不允许 `active → shell` (shrink 只到 offloaded; offloaded
-     engine 仍持 Ray actor + GPU)
+   没有 SGLang server process, 没有 GPU**. 在 M11.2 Gate 4 中, shell 不再表示
+   "init 后未分配到的 partial GENERATION slot"; init 任务由 RLix scheduler 统一当
+   high-priority INIT 处理, 必须全量初始化所有 SGLang engines. 合法转换:
+   - `shell → loading → offloaded` — init phase 内全量 `_create_sglang_actor`
+     + `onload()`; init 完成后立即 offload/drop GPU memory, 不做 weight sync、不 open routing
+     的 engines 进入 `offloaded`
+   - shrink 的终点是 `offloaded`, 不允许 `active → shell` (offloaded engine 仍持
+     Ray actor / SGLang server metadata, 但 weights/KV/graph GPU memory 已释放)
 
    **SGLang TP fan-out 行为**：MILES 的 1 个 SGLang engine = 1 个 head HTTP server
    process（[sglang_engine.py:60-68](external/miles/miles/backends/sglang_utils/sglang_engine.py#L60)），
@@ -367,7 +504,6 @@ buffer 释放由 [miles/utils/reloadable_process_group.py](external/miles/miles/
                assert self._engines[idx].state == "active"
                self._engines[idx].state = "disabling"
            self._active_engine_indices -= set(engine_indices)
-           self._preempted_engines |= set(engine_indices)
        # lock 外执行慢操作；dispatch 只允许选择 state == "active" 的 engine
        # 每个 engine 内部 abort all running requests，走 SGLang /abort_request
        # endpoint with abort_all=True（[http_server.py:1402](external/sglang/python/sglang/srt/entrypoints/http_server.py#L1402)）
@@ -385,20 +521,13 @@ buffer 释放由 [miles/utils/reloadable_process_group.py](external/miles/miles/
                self._engines[idx].state = "offloaded"
    ```
 
-   **`_preempted_engines` 不是 `EngineInfo.state` 的冗余缓存——它是 preempt 归因窗口**：
+   **`_preempted_engines` 在 M11.2 MVP 仅作为 `_abort_engines` 内部 idempotency cache, 不参与 routing / attribution / resize-safety**(A19 — `_preempted_engines` permanently re-scoped to `router.enabled_workers` — 见 §3.1 Layer 1):
 
-   - `EngineInfo.state` 反映 engine 当前生命周期阶段（shell / active / disabling / offloaded /
-     loading），是**瞬时**值
-   - `_preempted_engines` 标记"该 engine 在本次 generation 周期内被 scheduler preempt
-     过"，跨越 disabling → offloaded → loading → active 多个状态阶段都保留
-   - 仅靠 `state` 在 wake/activate 边界会误判：engine 已切回 `active` 但实际处于
-     "刚 wake 完，前一轮 abort 的尾部异常还在 caller 侧未消费"窗口；此时 `state == "active"`
-     但异常应归类为 preempt（让 multi_turn turn-level redispatch 触发），不是普通 abort
-   - **set/clear 时机**：`sleep_partial` 第 1 步 set（admission close 前置）；
-     `wake_up_partial` 完成后 clear（[miles/ray/rollout.py](external/miles/miles/ray/rollout.py)
-     的 partial wake 路径返回前）。clear 时机晚于 `state = "active"` 的恢复，覆盖刚 wake
-     的过渡窗口
-   - 维护成本是单个 `set`，换错误分类语义稳定；不与 `state` 合并
+   - **MVP 路由 / dispatch 决策**: 由 `router.enabled_workers - dead_workers` 单一来源决定 (router-side state); manager 侧不再 set/clear `_preempted_engines` 作为 routing input
+   - **MVP attribution / preempt 判定**: `multi_turn` 不再读 `_preempted_engines`. 5xx → trainer 走既有 HTTP error path → group recycle (见 §3.2 B4 trainer policy); router metadata 缺失 raise `RLixRouterMetadataError` (既有路径)
+   - **MVP resize safety**: 由 `_active_engine_indices` + `router.enabled_workers` 双向交集决定; `_preempted_engines` 不参与 resize safety invariant
+   - **允许保留的唯一用途**: `RolloutManager._abort_engines` 内部 idempotency check — 同一轮 abort 内多次 trigger 同一 engine 时跳过重复 abort RPC. set/clear 完全在 `_abort_engines` 内部, 不 leak 出 method 边界
+   - **deferred 到 M11.5**: scheduler-driven preempt vs engine-crash 分类需要 sentinel header (A10) + 跨 disabling→offloaded→loading→active 状态窗口的 attribution; 整套是 production hardening, 不是 Gate 4 pass criterion
 
 4. **Drain 机制：worker-side `is_idle()` API（必须读 `/v1/loads`，不是 `/server_info`）**：
    - **重要**：SGLang `/server_info` 的 `internal_states` 来自
@@ -455,18 +584,31 @@ buffer 释放由 [miles/utils/reloadable_process_group.py](external/miles/miles/
      高层方法
    - `shrink_engines` 封装 `admission_close + _abort_engines + drain + offload`
      (`active → disabling → offloaded`)
-   - `expand_engines` 内部 dispatch on entry state:
-     - `shell → loading`: lazy `_create_sglang_actor(engine_idx, placement)` +
-       `onload()` (M11.2 partial GENERATION allocation 路径; 见 F4 + Gate 4 (c))
-     - `offloaded → loading`: existing `wake_up()`
+  - `expand_engines` 内部 dispatch on entry state:
+    - `shell → loading`: only allowed during full INIT bootstrap, never as a
+      partial GENERATION allocation result
+    - `offloaded → loading`: normal runtime GENERATION grant path; existing `wake_up()`
      **不开 routing**; 返回 engines 在 `loading` 状态
-   - 新增 `activate_routing(engine_indices)`: `loading → active` + open router;
+  - 新增 `finish_init_offload(engine_indices)`: init-only `loading → offloaded`
+    + `release_memory_occupation(tags=None)`, **不** add_worker/open router. 用于 full
+    INIT 后立即 drop weights/KV/graph, 把所有 SGLang engines 留在可 wake 的 offloaded
+    状态
+  - 新增 `activate_routing(engine_indices)`: runtime `loading → active` + open router;
      由 coordinator 在 `service.sync_selected_workers` 完成后调用 (Fix #3 ownership
      split: manager 不调 service, service 不开 routing)
-   - Coordinator 编排顺序 (`_expand_workers`):
-     `manager.expand_engines(target)` → `service.sync_selected_workers(sync_id, target, version)`
-     → `manager.activate_routing(target)`. 不直接拼装 abort/drain/offload 序列
-     (避免漏 step 或顺序错位)
+   - Coordinator 编排顺序 (`_expand_workers`) — **dispatch on target entry state**:
+     - **INIT branch** (entry state == `shell`, fired from `Priority.INIT` Phase 5):
+       `manager.expand_engines(target)` → `manager.finish_init_offload(target)`.
+       **不调 service, 不调 activate_routing, 不更新 `_active_engine_indices`**.
+     - **Runtime GENERATION branch** (entry state == `offloaded`, fired from runtime
+       `resize_infer(add=…)`):
+       `manager.expand_engines(target)` → `service.sync_selected_workers(sync_id,
+       target, version=_cache_ready_step)` → `manager.activate_routing(target)` →
+       `_active_engine_indices |= set(target)`.
+     - 不直接拼装 abort/drain/offload 序列 (避免漏 step 或顺序错位)。
+     - 异构 entry state (target 内既有 shell 又有 offloaded) raise — 单次
+       `_expand_workers` 调用对应单个 RLix scheduler `resize_infer(add=…)` RPC,
+       每次 RPC 必属单一 phase (INIT 或 runtime GENERATION)
 
 改动量：~180 行（engine index map + subset API + abort-drain-sleep + shrink/expand_engines + activate_routing + shell lazy ctor 复合）
 
@@ -743,9 +885,12 @@ raise `EnginePreemptedError`; 函数本身在 RLix mode 缺 metadata 时 raise
 `continue` 重 dispatch. `RLixRouterMetadataError` **不 catch, 上抛 fully_async fatal
 sentinel** (router 闭环断不能 retry).
 
-(g) `_preempted_engines` set/clear 时机不再用作 multi_turn 判定 — 仅供
-`RolloutManager._abort_engines` 等内部 manager 路径使用. 实际 attribution 全由 router
-admission state (response 时刻 `worker_url not in self.enabled_workers`) 承担.
+(g) `_preempted_engines` 在 M11.2 MVP 仅作为 `RolloutManager._abort_engines` 内部
+idempotency cache (同一轮 abort 内多次 trigger 同一 engine 时跳过重复 RPC), set/clear
+完全 confined to `_abort_engines` method body 内部, 不 leak 出 method 边界. 实际
+attribution 全由 router admission state (response 时刻 `worker_url not in
+self.enabled_workers`) 承担. **不再用作 multi_turn 判定 / routing / dispatch /
+resize-safety state** (A19 — 责任 permanently re-scoped 到 `router.enabled_workers` — 见 §3.1 Layer 1).
 
 **Custom generate 签名前提：** `multi_turn.generate` 是
 `generate(input: GenerateFnInput) -> GenerateFnOutput` 新接口。若基于
@@ -877,7 +1022,9 @@ class _FatalError:  # sentinel, 不继承 Exception (避免被 outer try/except 
     def __init__(self, exc): self.exc = exc
 
 class AsyncRolloutWorker:
-    # 不新增 _fatal_error 字段 — queue sentinel 单路径已足够
+    # A6: queue sentinel single-path; do NOT add _fatal_error flag
+    # (Anti-regression invariant #9 — queue FIFO 已足够覆盖所有触发点,
+    # flag 路径会引入 "queue 与 flag 状态发散" 的 bug surface)
 
     def make_callback(self, gid):
         def task_done_callback(done_task):
@@ -943,12 +1090,12 @@ engine 常驻 active —— **但这是 declared-topology precondition, 仅在 s
 M11.1 覆盖整个 actor_infer 分配的前提下成立**。所有 shrink 操作只针对 overlap subset，
 永远不会出现 "全部 engines sleeping → collector 无处 dispatch" 的状态。
 
-**M11.2 0-active runtime state 是 legit status, 由 router suspend (下方 §7+§8+§9) 处理：**
-M11.2 partial-allocation 下, pipeline 的非重叠 engine slot 可能在 `shell` state
-(scheduler 没分到对应 GPU)，own-train cycle sleep overlap engine 后 runtime
-active engine count 真的会到 0。这不是异常状态、不是拓扑违规、不应该 crash —— 应当
-suspend background generation request 直到 expand/enable 唤醒。see §7 router
-`_use_url` block-with-notify + §8 HTTP sentinel + §9 client translation.
+**M11.2 0-active runtime state 是 legit status, 由 router suspend (下方 §7)
+处理：** RUNTIME GENERATION shrink (own-train cycle 或 peer pipeline contention)
+把所有 active engine drop 到 `offloaded` 后, runtime active engine count 真的
+会到 0。这不是 partial allocation, 不是 shell state, 不是拓扑违规, 不应该
+crash —— 应当 suspend background generation request 直到 expand/enable 唤醒。
+详细 source-of-truth 与 MVP scope 见 §7。
 
 **6. Retry safety 适用范围说明**
 
@@ -960,69 +1107,63 @@ success 模式。如未来引入 stateful tool / NeMo-Gym 风格的 mid-turn env
 idempotency key 才能启用 turn retry。这与 NeMo plan F3 的 retry safety invariant 是同
 一约束。
 
-**7. Router `_use_url` block-with-notify on empty active set (M11.2 — C20)**
+**7. Router `_use_url` block-with-notify on empty active set (M11.2 — C20, MVP scope)**
 
-M11.2 partial-allocation legit-status path. 当 `set(self.worker_request_counts) &
-self.enabled_workers - self.dead_workers` 为空时，`_use_url` 不能 raise (会被 retry
-loop 误当 transient 失败重试 60 次), 也不能 fail-fast crash (M11.2 own-train cycle
-正常会进入这个状态)。**必须 suspend dispatch 直到 add/enable 唤醒**, 由 bounded
-timeout 兜底防止 silent hang.
+**M11.2 active-set-empty 来源 (corrected design)**：M11.2 INIT 是 `Priority.INIT`
+**full** allocation —— scheduler 在 init 阶段 grant Pipeline B 全部声明的
+`actor_infer` GPU set；所有 engine 走完整 SGLang `_create_sglang_actor` +
+`onload(hf_checkpoint)` 然后**全部 offload** (release weights + KV cache + cuda_graph,
+GPU 释放回 scheduler)。Init 完成后：**router 为空, active set 为空, 所有 engine
+处于 `offloaded` 状态**。Runtime 阶段 scheduler 通过 `resize_infer(add=[...])`
+grant GENERATION 容量，engine `offloaded → loading → active`；
+`resize_infer(remove=[...])` 反向回 `offloaded`。Pipeline B 自己的 `_before_training`
+也通过 shrink 把所有 active engine 撤回 `offloaded` (让 train 占 GPU)。
+
+**因此 0-active 不是 partial allocation 也不是 shell state**，是 RUNTIME GENERATION
+shrink (own-train cycle 或 peer pipeline contention) 把所有 engine drop 到
+`offloaded` 时的合法运行态。当
+`set(self.worker_request_counts) & self.enabled_workers - self.dead_workers`
+为空时，`_use_url` 不能 raise (会被 retry loop 误当 transient 失败重试 60 次),
+也不能 fail-fast crash。**必须 suspend dispatch 直到下一次 `resize_infer(add)` →
+`add_worker` / `enable_worker` 触发 `notify_all`**。
+
+**MVP scope (本 milestone)**：仅做 unbounded suspend + `notify_all`。**Bounded
+timeout + HTTP 503 sentinel + 客户端 `EnginePreemptedError` 翻译推到 M11.5**
+production hardening — 与 M11.5 既有 follow-up "ingress 503 middleware" + "5xx
+→ preempt synthesis" 共享同一个 `X-Miles-Preempt` header 设计与 client-side
+translator (写一次, 复用两条路径)。M11.1/M11.2 happy path 验证 suspend 在 5–30s
+内通过 `notify_all` 唤醒；故障模式下的"silent hang"由 M11.5 的 timeout 兜底,
+M11.1/M11.2 阶段接受"manual `ray stop`"作为生产 recovery (与 §6.2 既有 recovery
+posture 一致).
 
 ```python
 # miles/router/router.py — replace synchronous _use_url with async block-with-notify
 
-import os
-
-class _RouterDispatchTimeout(Exception):
-    """Local marker — translated to HTTP 503 + X-Miles-Preempt by do_proxy.
-
-    NOT EnginePreemptedError — that type lives in miles.rollout.base_types
-    and would not survive serialization across the router's HTTP boundary.
-    Client-side _post translates the sentinel response to EnginePreemptedError
-    (see §8). Router process never imports miles.rollout.base_types.
-    """
-
-    def __init__(self, wait_s, enabled, dead, registered):
-        self.wait_s = wait_s
-        super().__init__(
-            f"router dispatch timed out after {wait_s}s with empty active set "
-            f"(enabled={len(enabled)}, dead={len(dead)}, registered={len(registered)})"
-        )
-
-
 class MilesRouter:
     def __init__(self, args, ...):
         ...
-        # M11.2 0-active suspend (C20):
+        # M11.2 0-active suspend (C20, MVP):
         # asyncio.Condition synchronizes _use_url waiters with state-mutating
         # endpoints. notify_all from add_worker / enable_worker / health-check
         # recover wakes all suspended dispatchers; each re-checks the predicate
         # under the lock and either dispatches or re-suspends.
         self._workers_changed = asyncio.Condition()
-        self._wait_timeout_s = float(os.environ.get("MILES_ROUTER_DISPATCH_WAIT_S", "60"))
 
     async def _use_url(self):
         """Select worker URL with min in-flight; suspend if active set empty.
 
-        M11.2 0-active is legit; suspend until add/enable. Bounded by
-        MILES_ROUTER_DISPATCH_WAIT_S (default 60s). On timeout, raise
-        _RouterDispatchTimeout — do_proxy converts to HTTP 503 + sentinel
-        header. **NEVER raise generic RuntimeError from this method** —
-        the previous "no enabled live workers" path swallowed the
-        legit-status signal as transient failure.
+        M11.2 0-active is a legit runtime status; suspend until add/enable.
+        **NEVER raise generic RuntimeError from this method** — the previous
+        "no enabled live workers" path swallowed the legit-status signal as
+        transient failure.
+
+        MVP scope: unbounded wait. M11.5 will add bounded timeout + 503
+        sentinel + client EnginePreemptedError translation.
         """
         async with self._workers_changed:
-            try:
-                await asyncio.wait_for(
-                    self._workers_changed.wait_for(
-                        lambda: bool(set(self.worker_request_counts) & self.enabled_workers - self.dead_workers)
-                    ),
-                    timeout=self._wait_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                raise _RouterDispatchTimeout(
-                    self._wait_timeout_s, self.enabled_workers, self.dead_workers, self.worker_request_counts
-                )
+            await self._workers_changed.wait_for(
+                lambda: bool(set(self.worker_request_counts) & self.enabled_workers - self.dead_workers)
+            )
             valid = set(self.worker_request_counts) & self.enabled_workers - self.dead_workers
             url = min(valid, key=self.worker_request_counts.get)
             # Load accounting MUST stay inside the lock so _finish_url's
@@ -1031,25 +1172,11 @@ class MilesRouter:
             return url
 ```
 
-`do_proxy` 必须 `await self._use_url()` (not `self._use_url()`), 并把
-`_RouterDispatchTimeout` 翻译成 HTTP 503 + sentinel header — **client side 据此
-raise `EnginePreemptedError`** (§8):
+`do_proxy` 必须 `await self._use_url()` (not `self._use_url()`):
 
 ```python
 async def do_proxy(self, request, path, body=None, headers=None) -> dict:
-    try:
-        worker_url = await self._use_url()           # was: self._use_url()
-    except _RouterDispatchTimeout as e:
-        return {
-            "request_body": body or b"",
-            "response_body": json.dumps({
-                "error": "router_preempt",
-                "reason": "empty_active_set_timeout",
-                "wait_s": e.wait_s,
-            }).encode(),
-            "status_code": 503,
-            "headers": {"X-Miles-Preempt": "empty_active_set_timeout"},
-        }
+    worker_url = await self._use_url()           # was: self._use_url()
     url = f"{worker_url}/{path}"
     ...   # rest unchanged
 ```
@@ -1080,117 +1207,17 @@ async def _health_check_loop(self):
 **理由**:
 - **Block, 不 503-then-retry**: caller 是 fully_async background generation tasks，
   应当在 router 内部 silent suspend，不应该跑 60-retry loop 累计 wall-clock。
-- **Bounded timeout**: 防 pipeline-stuck 无 expand 的死锁，60s 默认与
-  `ROLL_SELECTIVE_MODEL_UPDATE_TIMEOUT_S` 同 order；env-tunable。
-- **`_RouterDispatchTimeout` not `EnginePreemptedError`**: 后者位于
-  `miles.rollout.base_types`，router process import 它会引入循环依赖；HTTP
-  序列化也不保留 Python type，client-side 必须重新 raise。
+- **Unbounded MVP**: M11.1 single-pipeline 下 suspend 路径不触发 (C3 declared
+  topology 保证 ≥1 active). M11.2 Gate 4 happy path 下 suspend 通过 `notify_all`
+  在 5–30s 内被唤醒。Bounded timeout 是 M11.5 hardening 的范畴。
+- **NEVER raise generic `RuntimeError`**: 必须用 suspend 替代既有
+  `RuntimeError("no enabled live workers")`。
 
-**8. Client `_post` HTTP sentinel translation (M11.2 — C20)**
-
-`miles.utils.http_utils._post` 在 `raise_for_status()` 与 retry loop **之前**
-检测 `X-Miles-Preempt` header，把 router 503 sentinel 翻译成
-`EnginePreemptedError` (NOT `httpx.HTTPStatusError`, NOT generic `Exception`)，
-进入既有 `multi_turn.py` turn-redispatch + `fully_async` fatal-sentinel chain，
-**不消耗 60-retry budget**:
-
-```python
-# miles/utils/http_utils.py
-async def _post(client, url, payload, max_retries=60, action="post", headers=None):
-    # Lazy import at function TOP (NOT inside try). Python 把 function body
-    # 内的 `from ... import EnginePreemptedError` 视为 LOCAL binding; 如果
-    # 这行在 try 内、await 之前的语句 raise, `except EnginePreemptedError:`
-    # 会因 unbound local 抛 UnboundLocalError 替代真正的异常处理. 函数顶部
-    # import 一次, sys.modules 缓存让后续调用 O(1).
-    from miles.rollout.base_types import EnginePreemptedError
-
-    retry_count = 0
-    while retry_count < max_retries:
-        try:
-            if action in ("delete", "get"):
-                assert not payload
-                response = await getattr(client, action)(url, headers=headers)
-            else:
-                response = await getattr(client, action)(url, json=payload or {}, headers=headers)
-
-            # Sentinel detection BEFORE raise_for_status / retry — 否则 503
-            # 触发 raise_for_status -> generic except -> retry 60 次。
-            if response.status_code == 503 and response.headers.get("X-Miles-Preempt"):
-                raise EnginePreemptedError(
-                    f"router preempt sentinel "
-                    f"(reason={response.headers['X-Miles-Preempt']}, url={url})"
-                )
-
-            response.raise_for_status()
-            try:
-                output = response.json()
-            except json.JSONDecodeError:
-                output = response.text
-        except EnginePreemptedError:
-            # Propagate WITHOUT retry — reaches multi_turn.py redispatch /
-            # fully_async fatal sentinel through normal exception flow.
-            # Must come BEFORE generic `except Exception` clause.
-            raise
-        except Exception as e:
-            ...   # existing retry path, unchanged
-        break
-    return output
-```
-
-**Forward-compat note**: M11.5 follow-up "5xx → preempt synthesis"
-([§Implementation follow-up](#implementation-follow-up)) 可以复用同一个
-`X-Miles-Preempt` header 从 SGLang ingress 5xx 路径触发 — 同一个
-translator 处理，不需要额外 client 改动。
-
-**9. Distributed POST hot-path coverage (M11.2 — C20)**
-
-`miles.utils.http_utils.post()` 在 `_distributed_post_enabled` 时通过 Ray actor
-分发到 `_HttpPosterActor.do_post`，actor 内部仍调 `_post(...)` —— 所以 §8
-的 sentinel 检测在 actor 进程内自动覆盖, `EnginePreemptedError` 跨 Ray RPC
-被 wrap 成 `ray.exceptions.RayTaskError`. 当前 `post()` 的
-`except Exception → fall back to local _post` 是 harmless (local retry 命中同
-router 503 + sentinel 再翻译一次), **但浪费一次 RTT per preempt**. 为消除浪费,
-`post()` 必须 unwrap `RayTaskError.cause` 并 propagate `EnginePreemptedError`
-**before** generic fallback:
-
-```python
-# miles/utils/http_utils.py — module top, GUARDED import (Ray-absent 环境
-# 不能 break import; eager `import ray.exceptions` 会 break standalone /
-# CI 测试 / 单机 dev 环境)
-try:
-    from ray.exceptions import RayTaskError
-except ImportError:
-    RayTaskError = ()   # `except ()` matches nothing → branch is dead in non-Ray envs
-
-from miles.rollout.base_types import EnginePreemptedError
-
-async def post(url, payload, max_retries=60, action="post", headers=None):
-    if _distributed_post_enabled and _post_actors:
-        try:
-            actor = _next_actor()
-            if actor is not None:
-                return await actor.do_post.remote(url, payload, max_retries, action=action, headers=headers)
-        except RayTaskError as e:
-            # Unwrap Ray RPC wrapper; propagate preempt without local fallback.
-            # MUST come BEFORE generic `except Exception` so preempt is recognized.
-            if isinstance(e.cause, EnginePreemptedError):
-                raise EnginePreemptedError(str(e.cause)) from e
-            logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
-        except Exception as e:
-            logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
-    return await _post(_http_client, url, payload, max_retries, action=action, headers=headers)
-```
-
-**Implementer alternative**: import `RayTaskError` 改在
-`if _distributed_post_enabled and _post_actors:` branch 内 (lazy)。
-Module-top guarded form 更清晰，避免未来 call site 增加导致 `NameError`。
-
-改动量：~280 行 (router 4-state lifecycle + metadata 注入 ~50, routing lock + abort
+改动量：~245 行 (router 4-state lifecycle + metadata 注入 ~50, routing lock + abort
 触发口 ~20, turn snapshot/restore + redispatch loop + raise EnginePreemptedError
 ~80, _is_scheduler_preempt + RLixRouterMetadataError + fully_async fatal sentinel
 queue 单路径 ~30, **§7 router `_use_url` async + `_workers_changed` Condition +
-`_RouterDispatchTimeout` + endpoint notifies ~50, §8 client `_post` sentinel
-detection ~20, §9 client `post()` `RayTaskError` unwrap + guarded import ~10**)
+endpoint notifies, MVP unbounded ~15**)
 
 ---
 
@@ -1379,9 +1406,9 @@ def initialize_pipeline(self) -> ActionResponse:
         # ====================================================================
         # 这个外层 try/except 必须包住 Step 6.5 (cache_owner collection), Step 6.6
         # (manager pre-spawn + resource registration + base version publish +
-        # empty-set bootstrap), Step 7 (`_request_cluster_gpus` for infer; scheduler
-        # resize_infer(add) 在此期间 fire 到 coordinator), Step 7.1-7.3 (M1 subset
-        # assert + active subset compute + sanity check). 若不包住:
+        # empty-set bootstrap), Step 7 (full high-priority INIT for infer; scheduler
+        # resize_infer(add=all) 在此期间 fire 到 coordinator), Step 7.1-7.3
+        # (M1 full-allocation assert + active set compute + sanity check). 若不包住:
         #   - Step 6.5 RPC raise → actor_train 僵尸泄漏 (Phase 1 finally 已设
         #     `train_init_succeeded=True`, 没 kill train)
         #   - Step 6.6b RolloutManager ctor raise → actor_infer 半构造泄漏
@@ -1389,10 +1416,10 @@ def initialize_pipeline(self) -> ActionResponse:
         #   - Step 7 `_request_cluster_gpus` raise → scheduler 视 train GPU 已释放
         #     但 train actor 还在; 同时 coordinator._expand_workers 可能在请求中途
         #     raise (now harmless because manager+service are registered)
-        #   - M1 subset assert fire (allocated 不是 declared 的 subset) → 同上 +
+        #   - M1 full-allocation assert fire (allocated != declared) → 同上 +
         #     infer scheduler 已记账但 actor_infer 未活跃 → infer scheduler
-        #     allocation 永远不释放. (注意: M11.2 partial allocation 是 valid 路径,
-        #     不会触发 subset assert; assert fire 只在 scheduler 返回未声明 GPU 时)
+        #     allocation 永远不释放. (注意: init 阶段 partial allocation 不是 valid 路径;
+        #     scheduler 应把 init 统一当 high-priority full allocation 处理)
         #   - half-engine allocation 在 provider.get_active_engine_indices raise → 同上
         #   - Step 7.3 consistency assert fire → 极少见, 只在 coordinator/pipeline
         #     active set 派生不一致时触发, 同上清理
@@ -1462,88 +1489,74 @@ def initialize_pipeline(self) -> ActionResponse:
             ))
 
             # 6.6e: publish base-version `_cache_ready_step = -1`. Step 4 already
-            # built base CPU bucket cache (step=-1) on cache_owner_actor. With
-            # version published BEFORE Step 7, scheduler-driven _expand_workers
-            # can resolve `_cache_ready_step` (passes -1 to service.sync). The
-            # `version == -1` path is the no-transport short-circuit (Fix #13 +
-            # #15) — service skips run_sync_session, skips finalize, only calls
-            # `manager.set_weight_version(-1, target_engines)`. cache_owner GPU
-            # is not touched (Step 6 already released it to scheduler).
+            # built base CPU bucket cache (step=-1) on cache_owner_actor. This is
+            # metadata only for future runtime GENERATION expand before first
+            # after_training; INIT itself does not run service.sync or route.
             ray.get(coordinator.publish_cache_ready_step.remote(-1))
 
             # 6.6f: bootstrap coordinator's _active_engine_indices to the empty
-            # frozenset. Scheduler-driven _expand_workers will populate it during
-            # Step 7. The coordinator's `_active_engines_bootstrapped: bool` flag
-            # is set True by this call (regardless of set contents); empty bootstrap
-            # is the documented default and is distinguishable from "not yet
-            # bootstrapped" via the explicit flag (NOT via set truthiness).
+            # frozenset. Under the M11.2 full-INIT model, _expand_workers' INIT
+            # branch (Step 7 Phase 5 below) does NOT populate this field — it
+            # stays empty after init and is populated only by the first runtime
+            # GENERATION grant. The coordinator's `_active_engines_bootstrapped: bool`
+            # flag is set True by this call (regardless of set contents); empty
+            # bootstrap is the documented standard path for every M11.2 pipeline
+            # and is distinguishable from "not yet bootstrapped" via the explicit
+            # flag (NOT via set truthiness — see X3).
             ray.get(coordinator.bootstrap_active_engines.remote(frozenset()))
 
-            # ----- Step 7: actor_infer GENERATION allocation (long-lived) ------
-            # During this blocking call, scheduler executes
-            #   coordinator.resize_infer(dp_ranks_to_add=[<allocated dps>])
+            # ----- Step 7: actor_infer INIT allocation (full, high priority) ------
+            # RLix scheduler treats init uniformly as a high-priority full-allocation
+            # task. During this blocking call, scheduler executes
+            #   coordinator.resize_infer(dp_ranks_to_add=[all dps])
             # in Phase 5; coordinator's _expand_workers acquires _resize_sync_lock
             # and:
             #   - reads _cache_ready_step = -1 ✓ (6.6e)
             #   - reads _model_update_resources ✓ (6.6d)
             #   - manager.expand_engines(target): shell → loading lazy
             #     `_create_sglang_actor(engine_idx, placement)` + `onload()`
-            #   - service.sync_selected_workers(sync_id, target, version=-1):
-            #     v=-1 short-circuit — only `manager.set_weight_version(-1, target)`
-            #   - manager.activate_routing(target): loading → active + add_worker
-            #   - _active_engine_indices |= set(target)
+            #   - manager.finish_init_offload(target): loading → offloaded; no
+            #     trainer CPU-bucket sync and no router add_worker during INIT
+            #   - _active_engine_indices remains empty after init
+            #     weights+KV+cuda_graph; router remains closed until normal
+            #     GENERATION scheduling wakes a subset and syncs from trainer bucket.
             # Phase 6 then signals the waiter; Step 7 returns with allocated_gpus.
-            # M1 (relaxed for M11.2 Gate 4): allocated 必须是 declared 的 subset
-            # (`⊆`, 不是 `==`). RLix scheduler 在 contention 下返回 partial allocation
-            # (full_finetune_pipeline.py:712-726 已有同样 pattern). Pipeline B 在
-            # Gate 4 双 pipeline 下可能拿 2/4 GPU; 余下 engine 维持 shell, 等后续
-            # expand 时 lazy 创建.
+            # M1: init allocation 必须是 full declared set (`==`, not subset). Runtime
+            # GENERATION resize can later grant subsets, but init cannot.
             allocated_actor_infer_gpus = self._request_cluster_gpus(
                 cluster_id=self._actor_infer_cluster_id,
-                priority=Priority.GENERATION,
+                priority=Priority.INIT,
                 global_step=init_global_step,
             )
             actor_infer_allocated = True  # M4: gate scheduler release on alloc success
 
-            # ----- Step 7.1: M1 subset assert + log partial flag ------
-            assert set(allocated_actor_infer_gpus).issubset(set(self._infer_device_mapping)), (
-                f"allocated actor_infer GPUs must be subset of declared infer_device_mapping; "
+            # ----- Step 7.1: M1 full-allocation assert ------
+            assert set(allocated_actor_infer_gpus) == set(self._infer_device_mapping), (
+                f"init actor_infer GPUs must exactly equal declared infer_device_mapping; "
                 f"got {allocated_actor_infer_gpus}, declared {self._infer_device_mapping}"
             )
-            is_partial_allocation = (
-                len(allocated_actor_infer_gpus) < len(self._infer_device_mapping)
-            )
-            if is_partial_allocation:
-                logger.warning(
-                    "PARTIAL allocation detected for actor_infer — got %d/%d GPUs. "
-                    "Pipeline starts with active subset; remaining engines stay in "
-                    "shell state until later scheduler-driven expand.",
-                    len(allocated_actor_infer_gpus),
-                    len(self._infer_device_mapping),
-                )
 
             # ----- Step 7.2: pipeline-side derive active_engine_indices ------
-            # Validates half-engine allocation (raises if any engine has only some
-            # of its tp_size GPUs allocated).
+            # Init starts every engine once, then offloads all without weight sync.
+            # The active set after init is empty; normal GENERATION scheduling later
+            # wakes subsets from `offloaded`.
             active_engine_indices: frozenset[int] = (
-                self._placement_provider.get_active_engine_indices(
-                    allocated_gpus=allocated_actor_infer_gpus,
-                    tp_size=args.rollout_num_gpus_per_engine,
-                )
+                frozenset()
             )
             self._actor_infer_gpu_ids = allocated_actor_infer_gpus
             self._active_engine_indices = active_engine_indices
 
             # ----- Step 7.3: consistency check vs coordinator state ------
-            # _expand_workers populated coordinator._active_engine_indices during
-            # Step 7. Pipeline-side computation must match.
+            # After INIT, _active_engine_indices stays frozenset() on both the
+            # coordinator (INIT branch of _expand_workers does not populate it)
+            # and the pipeline (Step 7.2 derives frozenset()). This assert
+            # guards against a regression that re-introduces the old "INIT
+            # populates _active_engine_indices" path.
             coord_active = ray.get(coordinator.get_active_engines.remote())
             assert coord_active == active_engine_indices, (
-                f"coordinator/_expand_workers populated {coord_active}, but "
-                f"pipeline derived {active_engine_indices} from allocated GPUs "
-                f"{allocated_actor_infer_gpus} + declared {self._infer_device_mapping}; "
-                f"this indicates a wiring bug between scheduler dp_ranks and "
-                f"MILES engine indices (M11.2 first build assumes identity)"
+                f"coordinator post-INIT active set is {coord_active}, but "
+                f"pipeline derived {active_engine_indices} (expected frozenset()); "
+                f"INIT branch of _expand_workers must NOT populate _active_engine_indices"
             )
         except Exception:
             # M4 — Phase 2 hard cleanup on failure (kill order: train actors first,
@@ -1784,8 +1797,9 @@ receiver-side guard:
    时也必须在自己的 method body 内持同一把锁 (与 `run_sync_session` 互斥).
    **禁止只锁 cache lookup 或只锁 pointer swap 的半截实现** (对齐 ROLL
    `megatron_strategy.py:2095-2099`). 正常路径不变量 3 已经够; `_cache_lock`
-   是抗超时与异常恢复的最后一道. **`version == -1` 路径不进 `run_sync_session`,
-   不持 `_cache_lock`** (Fix #13 — service 短路, 只 publish version label).
+   是抗超时与异常恢复的最后一道. **`version == -1` base sync 也必须进入
+   `run_sync_session` 并持 `_cache_lock`**, 因为它读取的是 init Step 4 写入的
+   CPU bucket cache, 不是 checkpoint-equivalence label shortcut.
 
 **Bucket payload 格式：colocate 双 transport + non-colocate broadcast**
 
@@ -2158,29 +2172,31 @@ ephemeral port 后, 其它 rank 只看到 "port 0" 无法连. EADDRINUSE 时 ret
 | 路径 | Engine 状态 | Trigger | 内部机制 |
 |---|---|---|---|
 | **Active refresh** | 非重叠 active engines | training loop（`after_training` hook） | pipeline → `coordinator.sync_base_weights_to_active(step)` (**显式传 step**, coordinator 在 `_resize_sync_lock` 内同步更新 `_cache_ready_step`, 避免 stale version label inversion) → `service.sync_selected_workers(sync_id, active_engines, step)` |
-| **Expand sync** | 重叠 slept/woken engines（含 shell→active lazy ctor; 见 F4） | scheduler（`resize_infer(add=...)`） | coordinator `_expand_workers()` → manager `expand_engines` (lazy ctor + onload) → `service.sync_selected_workers(sync_id, woken_engines, version)` → manager `activate_routing` |
+| **INIT expand** | All targets in `shell` (Phase 5 of `Priority.INIT` Step 7) | scheduler（`resize_infer(add=all_dps)`）at init time | coordinator `_expand_workers()` INIT branch → manager `expand_engines` (shell→loading lazy ctor + onload) → manager `finish_init_offload` (loading→offloaded). **No `service.sync`, no `activate_routing`, no `set_weight_version`.** `_active_engine_indices` stays empty. |
+| **Runtime GENERATION expand** | All targets in `offloaded` (runtime grant) | scheduler（`resize_infer(add=...)`）at runtime | coordinator `_expand_workers()` Runtime branch → manager `expand_engines` (offloaded→loading wake_up) → `service.sync_selected_workers(sync_id, woken_engines, _cache_ready_step)` (full atomic unit including `version=-1` from init-built CPU bucket) → manager `activate_routing` (loading→active + add_worker) → `_active_engine_indices \|= target`. |
 
 **不变量：** 所有已 active 的 engine 由 training loop 刷新；所有后续被激活的 engine 由
 expand 刷新。两条路径共享同一份 CPU bucket cache（单 cache owner）。
 
-**Atomic unit (两条路径共用):** `MilesModelUpdateService.sync_selected_workers(sync_id, target_engines, version)`
-内部对 `version >= 0` 完成: (a) per-bucket transport (per-bucket payload
+**Atomic unit (两条路径共用, 包括 base `version == -1`):** `MilesModelUpdateService.sync_selected_workers(sync_id, target_engines, version)`
+内部完成: (a) per-bucket transport from the trainer/cache-owner CPU bucket (per-bucket payload
 **不携带 weight_version** — version inversion guard, Fix #3) + (b) per-engine
 `finalize_weight_update.remote()` fan-out + (c)
 `rollout_manager.set_weight_version(version, engine_indices=target_engines)`
 一次性 publish version label. 返回 version.
 
-**`version == -1` short-circuit (Fix #13 + #15)**: 跳过 (a) per-bucket
-transport, 跳过 (b) finalize fan-out, 跳过 `cache_owner_actor.run_sync_session`.
-**只跑 (c) `manager.set_weight_version(-1, target_engines)`**. 因为 v=-1 的
-target engines 已经在 `manager.expand_engines` lazy ctor 里通过 SGLang 自身的
-`onload()` 从 `args.hf_checkpoint` 加载了 base weights (post-load hook
-`process_weights_after_loading` 已经跑过), 不需要再 transport 字节, 也不需要
-再 finalize. 跳过 transport 是必需的, 因为 base sync 可能在 `actor_train`
-allocation 已被 release 给 scheduler 之后跑 (Fix #1+#2 init Step 6 Phase 1
-finally), cache_owner GPU 可能已被别的 pipeline / actor_infer 占用 → broadcast
-H2D staging 会 OOM 或非法并发. 跳过 finalize 是因为没有 pending bucket update
-要 finalize (Fix #15).
+**`version == -1` base sync (Fix #13 revised)**: 不再从 `args.hf_checkpoint`
+等价性推导免传输路径. `version == -1` 表示 init Step 4
+`build_cpu_bucket_cache(step=-1)` 产出的 base CPU bucket。expand-before-first-
+after_training 时, target engine 的 lazy `onload()` 只把 SGLang 进程带到可接收
+权重的 loading 状态；authoritative weights 仍由
+`service.sync_selected_workers(sync_id, target_engines, -1)` 从 trainer/cache-owner
+CPU bucket 推入, 然后 finalize + `set_weight_version(-1)`. Colocate receiver 走
+`cpu_serialize`; non-colocate receiver 复用正常 dynamic NCCL broadcast path (sender
+H2D staging + temporary TCP-rendezvous NCCL group) under the same timeout and
+cache lock. 因此 resume / non-equivalent `args.load` 不会因为 rollout 侧先从
+`args.hf_checkpoint` onload 而服务 stale weights: routing only opens after bucket
+sync + finalize + version label publish.
 
 Pipeline 不直接调用 `finalize_weight_update` 或 manager-level `set_weight_version`.
 Coordinator 是 expand 的唯一 orchestrator. `RolloutManager` 不调 service.
@@ -2271,15 +2287,13 @@ roundtrip 到 coordinator。如果不显式 bootstrap, 首次 `sync_base_weights
 ```python
 # rlix/pipeline/miles_coordinator.py
 def bootstrap_active_engines(self, engine_indices: Set[int]) -> None:
-    """Set initial active engine set after actor_infer GENERATION allocation.
+    """Mark active-engine bootstrap complete after actor_infer INIT.
 
-    Called exactly once by MilesPipeline.initialize_pipeline() Step 10 after
-    actor_infer creation succeeds. `engine_indices` is the *initially-active*
-    set: under M11.2 partial GENERATION allocation (Gate 4 contention),
-    this is a strict subset of `range(engine_count)` — remaining engines are
-    in `shell` state on `RolloutManager` and will activate via subsequent
-    `resize_infer(add=...)` flowing through `_expand_workers`. Subsequent
-    updates flow through `resize_infer`.
+    Called exactly once by MilesPipeline.initialize_pipeline() Step 6.6f before
+    the full high-priority INIT request. It may be empty: init will create all
+    SGLang engines and then offload them without trainer CPU-bucket sync, so
+    normal GENERATION scheduling later wakes subsets through `resize_infer`
+    and syncs before routing opens.
     """
     with self._resize_sync_lock:
         if self._active_engines_bootstrapped:
@@ -2293,8 +2307,8 @@ def bootstrap_active_engines(self, engine_indices: Set[int]) -> None:
 
 **`_active_engines_bootstrapped: bool` flag (硬约束)**: 必须用显式 flag 而非
 `if self._active_engine_indices:` 真值检查. 原因: M11.2 init 流程下
-bootstrap 入参可能是 `frozenset()` (空集) — coordinator 等 `_expand_workers`
-在 Step 7 期间填充. 若用真值检查, 空集 bootstrap 与 "未 bootstrap" 在状态
+bootstrap 入参是 `frozenset()` (空集) — init 完成后所有 SGLang engines 已创建但
+offloaded, active set 仍为空. 若用真值检查, 空集 bootstrap 与 "未 bootstrap" 在状态
 上不可区分, 第二次 bootstrap 会静默覆盖空集 (真实的 ordering bug 漏报).
 
 按 F4 init bootstrap Step 6.6f 调用 — 在 Step 7 之前. 重复调用 fail fast
@@ -2306,8 +2320,8 @@ bootstrap 入参可能是 `frozenset()` (空集) — coordinator 等 `_expand_wo
 
 ```
 Pipeline init (initialize_pipeline Step 6.6 - 7.3):
-  # CRITICAL: scheduler executes coordinator.resize_infer(add) RPC in
-  # Phase 5 BEFORE signaling pending GEN waiter in Phase 6. Therefore
+  # CRITICAL: scheduler executes coordinator.resize_infer(add=all) RPC in
+  # Phase 5 BEFORE signaling pending INIT waiter in Phase 6. Therefore
   # everything _expand_workers needs (manager, service resources, base
   # cache_ready_step, bootstrap'd active set, empty router) MUST be in
   # place at coordinator BEFORE Step 7 fires.
@@ -2326,32 +2340,30 @@ Pipeline init (initialize_pipeline Step 6.6 - 7.3):
   │       rollout_manager=self.actor_infer))
   │     # service ctor args cached; lazy-create on first sync
   ├── ray.get(coordinator.publish_cache_ready_step.remote(-1))
-  │     # base version label; v=-1 short-circuit (Fix #13/#15) won't actually
-  │     # touch cache bytes, but version label MUST be available before
-  │     # _expand_workers reads it
+  │     # base version label for future runtime expand-before-first-after_training;
+  │     # INIT itself does not call service.sync or open routing.
   └── ray.get(coordinator.bootstrap_active_engines.remote(frozenset()))
         # _active_engines_bootstrapped flag flips True; _active_engine_indices
-        # remains frozenset() until _expand_workers populates during Step 7.
+        # remains frozenset() through INIT (INIT branch of _expand_workers does
+        # not populate it). The first runtime GENERATION grant later populates
+        # it via the Runtime branch of _expand_workers.
 
-  # ----- Step 7: actor_infer GENERATION request -----
-  └── allocated = self._request_cluster_gpus(actor_infer, GENERATION, ...)
+  # ----- Step 7: actor_infer INIT request (full, high priority) -----
+  └── allocated = self._request_cluster_gpus(actor_infer, INIT, ...)
         # During this blocking call:
-        # scheduler.run_phase5: coordinator.resize_infer(add=[<dps>]) →
+        # scheduler.run_phase5: coordinator.resize_infer(add=[all dps]) →
         #   coordinator._expand_workers([<dps>]):
-        #     - reads _cache_ready_step = -1 ✓
         #     - reads _model_update_resources ✓
         #     - manager.expand_engines: shell→loading lazy ctor + onload
-        #     - service.sync_selected_workers(sync_id, dps, version=-1):
-        #         v=-1 short-circuit — only manager.set_weight_version(-1, dps)
-        #         (NO run_sync_session, NO finalize, NO cache_owner GPU touch)
-        #     - manager.activate_routing(dps): loading→active + add_worker to router
-        #     - _active_engine_indices |= set(dps)
+        #     - manager.finish_init_offload(dps): loading→offloaded, no
+        #       trainer CPU-bucket sync, no set_weight_version, no router add_worker
+        #     - _active_engine_indices remains empty after init
         # scheduler.run_phase6: signal waiter; allocated returns to pipeline.
 
   # ----- Step 7.1-7.3: post-request validation -----
-  ├── M1 subset assert: set(allocated) ⊆ set(declared); log is_partial
-  ├── active = provider.get_active_engine_indices(allocated, tp_size)
-  │     # half-engine raise; pipeline-side derivation
+  ├── M1 full assert: set(allocated) == set(declared)
+  ├── active = frozenset()
+  │     # all engines initialized and then offloaded; no routing is open
   └── coord_active = ray.get(coordinator.get_active_engines.remote())
         assert coord_active == active   # consistency: _expand_workers ↔ provider
 
@@ -2391,16 +2403,39 @@ Coordinator actor (resize_infer, scheduler-driven, no pipeline callback):
         if self._cache_ready_step is None:
             raise RuntimeError("expand before publish_cache_ready_step")
             # init bootstrap 已发布 -1, 不该到这里; 防御 ordering bug.
-        ray.get(rollout_manager.expand_engines.remote(target_engines))
-            # manager: shell→loading (lazy ctor + onload) 或 offloaded→loading (wake_up).
-            # 不调 service.
-        sync_id = make_sync_id(pipeline_id, "expand", step)
-        ray.get(model_update_service.sync_selected_workers.remote(
-            sync_id, target_engines, self._cache_ready_step))
-            # 同 atomic unit; finalize + set_weight_version 内含.
-        ray.get(rollout_manager.activate_routing.remote(target_engines))
-            # manager: loading→active + open routing.
-        self._active_engine_indices |= set(target_engines)
+        entry_states = ray.get(rollout_manager.get_engine_states.remote(target_engines))
+            # snapshot under our lock; manager state mutation goes through
+            # expand_engines / finish_init_offload / activate_routing under
+            # _routing_lock — read here is monotonic w.r.t. our own writes.
+        states = set(entry_states.values())
+        if states == {"shell"}:
+            # ---------- INIT branch (Priority.INIT Phase 5) ----------
+            ray.get(rollout_manager.expand_engines.remote(target_engines))
+                # manager: shell→loading (lazy ctor + onload from args.hf_checkpoint).
+            ray.get(rollout_manager.finish_init_offload.remote(target_engines))
+                # manager: loading→offloaded + release_memory_occupation(tags=None).
+            # NO service.sync_selected_workers — INIT does not push trainer bucket.
+            # NO activate_routing — router stays empty until first runtime grant.
+            # NO _active_engine_indices update — runtime grants populate it.
+        elif states == {"offloaded"}:
+            # ---------- Runtime GENERATION branch ----------
+            ray.get(rollout_manager.expand_engines.remote(target_engines))
+                # manager: offloaded→loading (wake_up).
+            sync_id = make_sync_id(pipeline_id, "expand", self._cache_ready_step)
+            ray.get(model_update_service.sync_selected_workers.remote(
+                sync_id, target_engines, self._cache_ready_step))
+                # atomic unit (a)+(b)+(c); for first runtime grant before any
+                # after_training, _cache_ready_step=-1 → service runs the full
+                # transport from init-built CPU bucket (no equivalence shortcut).
+            ray.get(rollout_manager.activate_routing.remote(target_engines))
+                # manager: loading→active + add_worker (router.notify_all).
+            self._active_engine_indices |= set(target_engines)
+        else:
+            raise RuntimeError(
+                f"_expand_workers: heterogeneous entry states {entry_states}; "
+                f"each resize_infer(add) RPC must correspond to a single phase "
+                f"(INIT or runtime GENERATION)"
+            )
         release _resize_sync_lock
 ```
 
@@ -2509,21 +2544,36 @@ resize_infer(dp_ranks_to_remove=[0,1], dp_ranks_to_add=[])
                                     self._current_weight_version = 3   (本地)
                                     self._notify_release_cluster_gpus(cluster_id="actor_train", ...)
 
-resize_infer(dp_ranks_to_remove=[], dp_ranks_to_add=[0,1])
+resize_infer (INIT Phase 5, dp_ranks_to_add=[0,1,2,3]):
 ─────────────────>   lock
                      guard: _cache_ready_step is not None  (init 已发布 -1)
+                     ───────────>   _expand_workers([0,1,2,3]):
+                                    entry_states = {0..3: "shell"}     ── INIT branch
+                                    ── manager.expand_engines: shell→loading
+                                       (lazy ctor + onload from args.hf_checkpoint)
+                                    ── manager.finish_init_offload: loading→offloaded
+                                       (release_memory_occupation(tags=None))
+                                    ── _active_engine_indices unchanged (still ∅)
+                     unlock
+                     router worker list: ∅ (still closed)
+
+resize_infer (runtime GENERATION grant, dp_ranks_to_add=[0,1]):
+─────────────────>   lock
+                     guard: _cache_ready_step is not None
                      ───────────>   _expand_workers([0,1]):
-                                    ── manager.expand_engines([0,1])
-                                       ├── shell→loading: lazy ctor + onload (Fix #4)
-                                       └── offloaded→loading: wake_up         ⏳  ⏳  ●v3 ●v3
+                                    entry_states = {0,1: "offloaded"}  ── Runtime branch
+                                    ── manager.expand_engines: offloaded→loading
+                                       (wake_up)                       ⏳  ⏳  ●v3 ●v3
                                     ── service.sync_selected_workers(sync_id, [0,1],
                                                                      v=_cache_ready_step=3)
                                        atomic: sync + finalize_weight_update.remote(0,1)
                                                + rollout_manager.set_weight_version(3, [0,1])
                                                                           ✓v3 ✓v3 ●v3 ●v3
                                     ── manager.activate_routing([0,1])  ●v3 ●v3 ●v3 ●v3
+                                    ── _active_engine_indices |= {0,1}
                      _active={0,1,2,3}
                      unlock
+                     router worker list: {0,1}
 ```
 
 #### Edge cases
@@ -2533,13 +2583,12 @@ resize_infer(dp_ranks_to_remove=[], dp_ranks_to_add=[0,1])
    engines on wake。**正确**。
 2. **无重叠（所有 engines 非重叠）**：不发生 shrink/expand。`sync_base_weights_to_active()`
    in-flight sync 所有 engines。**正确**。
-3. **Init 后首步 (v=-1 short-circuit)**：CPU cache 含 base weights
+3. **Init 后首步 (base `version=-1`)**：CPU cache 含 base weights
    （`_cache_ready_step = -1`，由 init Step 6.6e bootstrap 提供）。Active refresh /
-   expand 路径 **不推送 bytes** (Fix #13+#15) — target SGLang engines 已通过
-   `manager.expand_engines` lazy ctor 内的 `onload()` 从 `args.hf_checkpoint` 加载
-   base, 仅需 `manager.set_weight_version(-1, target_engines)` publish version 标签.
-   service `sync_selected_workers(version=-1)` 跳过 `cache_owner_actor.run_sync_session`
-   + 跳过 finalize fan-out, 不触碰 cache_owner GPU (init Step 6 已 release train).
+   expand 路径照常推送 bytes: target SGLang engines 先通过
+   `manager.expand_engines` lazy ctor 进入 loading, 随后
+   `service.sync_selected_workers(version=-1)` 从 init-built CPU bucket transport +
+   finalize fan-out + `manager.set_weight_version(-1, target_engines)`.
    **正确**。
 
 #### Version accounting（修复 double-bump）
@@ -2579,10 +2628,14 @@ version = ray.get(coordinator.sync_base_weights_to_active.remote(3))
 self._current_weight_version = version   # = 3, pipeline 本地
 
 # Expand path (scheduler-driven, 无 pipeline callback):
-# Coordinator._expand_workers(target_engines):
+# Coordinator._expand_workers(target_engines) — Runtime branch
+# (target entry state == "offloaded"):
 #   under _resize_sync_lock, 用 self._cache_ready_step (= 3, 因 active refresh
 #   已发布) 调 service.sync_selected_workers(sync_id, target_engines, 3).
 #   service 内部同样跑 (a)+(b)+(c) atomic unit, version 不 bump.
+# (INIT branch — entry state == "shell" — 不进入此 path: _expand_workers 走
+#  manager.expand_engines + manager.finish_init_offload, 不调 service, 不开
+#  routing, 不更新 _active_engine_indices.)
 ```
 
 MILES 已在 [miles/utils/types.py](external/miles/miles/utils/types.py) `Sample` 上有
@@ -2601,7 +2654,7 @@ handle (init bootstrap Step 6.5 已 collect, 见 §F4 init bootstrap), 后续 sy
 |---|---|---|---|
 | `build_cpu_bucket_cache(step) -> None` | RayTrainGroup fan-out | — | init bootstrap Step 4 + 每 train_step 后; cache owner rank 真存, 其它 rank 参与 collective gather 但丢弃结果 |
 | `report_cache_owner_role() -> tuple[int, bool]` | RayTrainGroup `collect_cache_owner_roles()` | — | init bootstrap Step 6.5; 返回 `(global_rank, is_cache_owner)` (基于 `_is_distributed_src_rank`) |
-| **`run_sync_session(plan: SyncSessionPlan) -> None`** (Fix #6) | MilesModelUpdateService | composite (cpu_serialize per-engine RPC + NCCL broadcast group setup/per-bucket/teardown all-in-one) | per-sync, only when `version >= 0` (v=-1 short-circuit skips this entirely per Fix #13). cache_owner 在该 method 内 acquire `_cache_lock` (单 method 单临界区, 不跨 RPC), snapshot bucket list + `_cache_ready_step`, dispatch per-bucket transport (cpu_serialize 走 `engine.update_weights_from_cpu_bucket.remote(payload_ref, ...)` per target via `plan.target_handles`; NCCL broadcast 走 TCP-rendezvous group setup + per-bucket `dist.broadcast(src=cache_owner_global_rank, group=tmp_group)` + group destroy), 最后释放 `_cache_lock`. **不返回 ObjectRef bytes; 调用结束 = 所有 buckets 已被所有 targets load 完成.** |
+| **`run_sync_session(plan: SyncSessionPlan) -> None`** (Fix #6) | MilesModelUpdateService | composite (cpu_serialize per-engine RPC + NCCL broadcast group setup/per-bucket/teardown all-in-one) | every sync, including `version == -1` base sync. cache_owner 在该 method 内 acquire `_cache_lock` (单 method 单临界区, 不跨 RPC), snapshot bucket list + `_cache_ready_step`, dispatch per-bucket transport (cpu_serialize 走 `engine.update_weights_from_cpu_bucket.remote(payload_ref, ...)` per target via `plan.target_handles`; NCCL broadcast 走 TCP-rendezvous group setup + per-bucket `dist.broadcast(src=cache_owner_global_rank, group=tmp_group)` + group destroy), 最后释放 `_cache_lock`. **不返回 ObjectRef bytes; 调用结束 = 所有 buckets 已被所有 targets load 完成.** |
 | ~~`get_bucket_count`~~ / ~~`serialize_bucket_to_objref`~~ / ~~`setup_collective_group`~~ / ~~`broadcast_bucket`~~ / ~~`destroy_collective_group`~~ | (旧 split RPCs) | — | **Fix #6 降级为 cache_owner 内部 helpers**, 不再是 top-level Ray methods. `run_sync_session` 在自己 method body 内顺序调用. 这样消除 "service 跨 5 个 RPC 持 actor 锁" 的不可实现矛盾. |
 | ~~`serialize_bucket_cuda_ipc(bucket_idx) -> list[str]`~~ | M11.6 milestone | M11.1 不实现 (vast.ai 受限容器无 IPC 能力). M11.6 production cluster 加. |
 
@@ -2615,7 +2668,7 @@ handle (init bootstrap Step 6.5 已 collect, 见 §F4 init bootstrap), 后续 sy
 @dataclass(frozen=True)
 class SyncSessionPlan:
     sync_id: str
-    version: int                      # >= 0 (v=-1 short-circuit doesn't reach here)
+    version: int                      # -1 for init-built base bucket, >= 0 for train steps
     group_name: str                   # NCCL / TCP rendezvous group name
     master_addr: str
     master_port: int
@@ -2649,15 +2702,11 @@ holding both `cache_owner_actor` and `rollout_manager` handles, so service
 must build the full plan upfront.
 
 **M11.2 Gate 4 happy path 范围**: Gate 4 (c)/(d)/(e) acceptance 在
-**cpu_serialize-only 拓扑**下验证 (4 GPU + tp=2, 所有 receiver 都是 colocate
-or走 cpu_serialize). M11.2 不新增 transport 工作 — NCCL broadcast 路径
+**cpu_serialize + NCCL broadcast 已由 M11.1 提供**的前提下验证. M11.2 不新增 transport 工作 — NCCL broadcast 路径
 (`broadcast_local_ranks` + `comm_ranks` 字段 + `dist.broadcast` per-bucket)
 是 M11.1 已 land 的 load-bearing 工作 (Gate 2.5 验证), M11.2 透传不动.
-SyncSessionPlan 为 future-proof 保留全部字段; 但 **M11.2 acceptance 的
-shell engine sync 默认 cpu_serialize**, broadcast-path partial allocation
-扩展是 follow-up (only 在 partial allocation × non-colocate 同时出现且实测
-吞吐成瓶颈时才考虑). M11.2 实现者可以认为: 新代码路径不接触 broadcast 字段;
-所有 cache_owner ↔ shell engine sync 走 cpu_serialize.
+SyncSessionPlan 字段在 M11.2 继续透传; runtime GENERATION grant 唤醒的是
+`offloaded` engines, 不是 init 后残留的 shell engines.
 
 #### Receiver-side：target engine API surface
 
@@ -2674,7 +2723,7 @@ dynamic NCCL broadcast；不能先降级成 tp=1-only 路径。
 | `update_weights_from_cpu_bucket(payload_bytes, load_format, flush_cache, cpu_serialize_local_ranks)` | ModelUpdateService | Ray ObjectRef bytes (top-level auto-deref → `bytes`) | colocate **新增**，仅 cpu_serialize 路径调用. **NO `weight_version` parameter** — per-sync version publish is the atomic unit's step (c) `manager.set_weight_version(version, target_engines)`, NOT per-bucket per-engine (Fix #3) |
 | `broadcast_parameter(group_name, names, dtypes, shapes, broadcast_local_ranks)` | ModelUpdateService | NCCL | 动态 group |
 | `destroy_collective_group(group_name)` | ModelUpdateService | NCCL | sync 完后；colocate-only ranks（不论 cuda_ipc 还是 cpu_serialize）必须有 `is_group_exist` no-op guard |
-| `finalize_weight_update()` | ModelUpdateService (per-engine fan-out, atomic unit 内部) | — | Called by service ONLY when version >= 0 (i.e., after bucket transport). **Skipped for v=-1 path** (Fix #13 + Fix #15) — SGLang's own onload-time post-load hook (`process_weights_after_loading`) covers initial activation; calling finalize again on already-loaded weights is redundant. pipeline 不直接调用 |
+| `finalize_weight_update()` | ModelUpdateService (per-engine fan-out, atomic unit 内部) | — | Called by service after bucket transport for every sync, including `version == -1` base sync. SGLang's own onload-time post-load hook is not the authoritative weight-refresh step; pipeline 不直接调用 |
 
 **`verify_model` 不在本 milestone receiver API surface**：传输健壮性由 per-bucket
 barrier + warmup allreduce 保证；权重错误更可能从 trajectory reward 异常 / 模型行为
@@ -3144,30 +3193,6 @@ if DO_TIME_SHARING:
         f"cuda_ipc colocate adapter = M11.6 later milestone (production cluster)."
     )
 
-    # Fix #14: M11.2 Gate 4 happy path requires fresh-base equivalence between
-    # train cache_owner build_cpu_bucket_cache(-1) bytes AND SGLang
-    # `args.hf_checkpoint` onload bytes. Resume / non-equivalent ref_load
-    # would diverge them — and Fix #13's v=-1 no-transport short-circuit
-    # would then serve stale weights on rollout side. CPU-only base sync
-    # for resume is M11.2 follow-up; for now fail-fast.
-    assert args.load is None or args.load == args.hf_checkpoint, (
-        f"M11.2 Gate 4 happy path requires `args.load` to be either None or "
-        f"equal to `args.hf_checkpoint` (got load={args.load!r}, "
-        f"hf_checkpoint={args.hf_checkpoint!r}). Resume from Megatron "
-        f"checkpoint is M11.2 follow-up — CPU-only base sync at v=-1 not "
-        f"yet implemented; without it, Fix #13 v=-1 no-transport path would "
-        f"serve stale rollout weights."
-    )
-    assert (
-        getattr(args, "ref_load", None) is None
-        or args.ref_load == args.hf_checkpoint
-    ), (
-        f"M11.2 Gate 4 happy path requires `args.ref_load` to be either None "
-        f"or equal to `args.hf_checkpoint` (got ref_load={args.ref_load!r}, "
-        f"hf_checkpoint={args.hf_checkpoint!r}). Non-equivalent ref_load is "
-        f"M11.2 follow-up."
-    )
-
 # M11.1 forbids cross-node rollout engine, not multi-node DP (Cut 1').
 # Dev gate runs on single-machine 4-GPU, but architecture must remain multi-node-compatible
 # at placement / data-structure level. M11.1 OK: node0 train [0,1] + infer engines [0,1] [2,3];
@@ -3187,24 +3212,17 @@ assert not getattr(args, "rollout_force_stream", False), (
     "RLix mode requires non-streaming generate; metadata injection requires JSON body"
 )
 
-# NOTE: this validation block assumes module-level `import os` (already
-# present for adjacent `os.path.isdir`, `os.environ.get` calls in F10).
-
-# C20: M11.2 0-active-engine generation-path is a legit runtime status — router
-# `_use_url` 必须 block-with-notify on empty active set (不能 raise generic
-# RuntimeError, 不能 fail-fast crash). M11.1 single-pipeline 下因为 declared-
-# topology 已保证 ≥1 active, suspend 路径不会触发; 但代码 / 配置在 M11.1 就要
-# present 以避免 M11.2 时实施漂移. Bounded by MILES_ROUTER_DISPATCH_WAIT_S
-# (default 60s); timeout returns HTTP 503 + X-Miles-Preempt header (sentinel),
-# client `miles.utils.http_utils._post` 必须翻译成 EnginePreemptedError 进入
-# turn-redispatch / fatal-sentinel chain — 不能跑 60-retry HTTP loop.
-# 实现 spec 见 §Feature 3 §7+§8+§9. Enforcement 由 router/client 单元测试 +
-# Gate 4 (f) 保证, 不在此处加 startup assert (timeout default 来自 env, 拓扑
-# 不可静态校验).
-_router_wait_s = float(os.environ.get("MILES_ROUTER_DISPATCH_WAIT_S", "60"))
-assert _router_wait_s > 0, (
-    "MILES_ROUTER_DISPATCH_WAIT_S must be positive (router suspend bounded timeout)"
-)
+# C20 (MVP scope): M11.2 RUNTIME GENERATION shrink/expand cycle (after full
+# INIT+offload) reaches active-set-empty as a legit runtime status. Router
+# `_use_url` MUST block-with-notify on empty active set (不能 raise generic
+# RuntimeError, 不能 fail-fast crash); next add_worker / enable_worker triggers
+# notify_all → suspended dispatchers wake. M11.1 single-pipeline 下 C3 declared-
+# topology 保证 ≥1 active, suspend 路径不会触发; 但代码在 M11.1 就要 present
+# 以避免 M11.2 时实施漂移. **Spec: §Feature 3 §7 (MVP unbounded suspend).
+# Bounded timeout + 503 sentinel + client EnginePreemptedError translation
+# 推到 M11.5 follow-up — 不在 M11.2 startup assert.** Enforcement 由 router
+# unit test + Gate 4 (f) positive + counter sub-tests 保证, 不在此处加 startup
+# assert.
 
 # S2: Bucket size GPU 上界 check 仅在 NCCL broadcast (non-colocate receiver) 存在时
 # 触发. M11.1 cpu_serialize colocate path 不需要 sender GPU staging. NCCL broadcast
@@ -3384,7 +3402,9 @@ fallback**。这是 MILES 相对 NeMo 的最大省工。
 
 **Resize safety story 自述：** MILES 在 RLix 模式下的 resize safety **不依赖**任何
 admission control event，由 generation 层 routing-state 变更（`_active_engine_indices`
-/ `_preempted_engines`）+ abort-drain-sleep 保证（Feature 2 + Feature 3）。
++ `router.enabled_workers` 双向交集）+ abort-drain-sleep 保证（Feature 2 + Feature 3）。
+**`_preempted_engines` 不参与 resize safety invariant** (A19 — `_preempted_engines` permanently re-scoped to `router.enabled_workers`,§3.1 Layer 1; manager 侧
+仅保留 `_abort_engines` idempotency cache 用途).
 **routing-state 自身的并发安全见 Feature 2 第 5 条 `_routing_lock` compound operation
 不变量**。等价 NeMo F11 中 "RLix resize safety 不依赖 `_refit_pause_cleared`" 的自述。
 
@@ -3522,13 +3542,13 @@ class MilesPlacementProvider:
 
     def get_all_rollout_engine_placements(self) -> list[WorkerPlacement]:
         """**Length == engine_count**, derived from declared `infer_device_mapping`.
-        Independent of `allocated_actor_infer_gpus`.  Used by `RolloutManager.__init__`
-        to populate every `EngineInfo.placement` at construction (active AND shell).
+        Independent of runtime GENERATION grants. Used by `RolloutManager.__init__`
+        to populate every `EngineInfo.placement` before full INIT creates all engines.
 
         Fix #8: replaces old `get_rollout_workers()` which conflated "declared
-        full table" with "active subset".  Pipeline init Step 6.6a calls this;
-        Pipeline init Step 7.2 separately calls `get_active_engine_indices` to
-        derive which engines are active in the current allocation.
+        full table" with "active subset". Pipeline init Step 6.6a calls this;
+        runtime resize paths separately call `get_active_engine_indices` to
+        derive which engines are active in a GENERATION grant.
         """
         if self._all_rollout_placements is None:
             tp = self._args.rollout_num_gpus_per_engine
@@ -3560,8 +3580,10 @@ class MilesPlacementProvider:
 
         Half-engine allocation (an engine with only some of its `tp_size` GPUs
         allocated) raises `RuntimeError` — RLix scheduler must allocate at
-        engine boundary. Non-contiguous mapping support is M11.2 follow-up
-        (would need `scheduler_dp_rank ↔ miles_engine_index` lookup table).
+        engine boundary. Non-contiguous mapping support is **trigger-bound future
+        work** (use-case-triggered: cross-node engine / 自定义 GPU ordering — A18
+        Layer 4; unblocks A7 round-trip identity self-check when activated). Would
+        need `scheduler_dp_rank ↔ miles_engine_index` lookup table.
         """
         by_engine: dict[int, set[int]] = {}
         for g in allocated_gpus:
@@ -3647,9 +3669,9 @@ Ray-managed CVD) 不传, 走旧 fallback.
 
 现有 `RolloutManager.__init__(args, pg)` 三元组路径保留供 standalone 用. RLix mode
 走新增路径 (Fix #8 — `worker_placements` 老 API 替换为 `all_engine_placements +
-active_engine_indices` 双参数 — 前者是 declared 全表 length=engine_count, 后者是
-active 子集 frozenset; partial allocation 下 active 是 strict subset, 余下 engine
-进入 shell 状态):
+active_engine_indices` 双参数 — 前者是 declared 全表 length=engine_count, 后者在
+M11.2 init bootstrap 传 `frozenset()`；constructor 只建 shell metadata slots,
+不创建 SGLang actors):
 ```python
 # miles/ray/rollout.py
 class RolloutManager:
@@ -3664,23 +3686,25 @@ class RolloutManager:
         ...
         if all_engine_placements is not None:
             # RLix mode: per-worker placement, 节点级 PG + capture_child_tasks.
-            # `all_engine_placements` is declared full table (length engine_count);
-            # `active_engine_indices` is the subset that gets a Ray/SGLang actor.
-            # Engines NOT in active_engine_indices stay in `shell` state — slot
-            # reserved (placement preserved on EngineInfo), but no Ray actor / no
-            # SGLang server / no GPU.
+            # `all_engine_placements` is declared full table (length engine_count).
+            # In M11.2 init bootstrap, active_engine_indices is frozenset(); all
+            # engines start as metadata-only shell slots. Full INIT later calls
+            # expand_engines(all) to create/onload all SGLang actors, then
+            # finish_init_offload(all) leaves them offloaded.
             assert active_engine_indices is not None, (
                 "RLix mode requires both all_engine_placements and active_engine_indices"
             )
-            # Pre-allocate EngineInfo slot for every engine_idx; active subset
-            # immediately spawn SGLang server, rest stay shell.
+            # Pre-allocate EngineInfo slot for every engine_idx; no SGLang server
+            # is spawned by constructor in RLix mode.
             self._engines = self._init_shell_slots(all_engine_placements)
             # Bind per-pipeline empty Miles router (Fix #1+#2 (g)): allocate router
             # port from provider's pool, set self._args.sglang_router_ip/port,
             # start router with empty worker list. activate_routing is the SOLE
             # add_worker entry point.
             self._start_empty_router()
-            # Spawn SGLang servers ONLY for active engines.
+            # Do not spawn SGLang servers here. INIT and runtime grants both go
+            # through expand_engines(...), then either finish_init_offload(...)
+            # or service.sync_selected_workers(...) + activate_routing(...).
             self._spawn_active_servers(args, active_engine_indices)
         elif pg is not None:
             # standalone mode: 单 PG + bundle_indices 三元组 (现状; 不变)
@@ -3784,8 +3808,8 @@ assert len(all_placements) == args.rollout_num_gpus // args.rollout_num_gpus_per
 for engine_index, wp in enumerate(all_placements):
     assert len(wp.gpu_ids) == args.rollout_num_gpus_per_engine
     assert wp.gpu_ids == sorted(wp.gpu_ids)  # first build identity 拓扑
-# active subset 取决于 partial allocation; assert 不依赖 allocation 状态.
-# get_active_engine_indices(allocated_gpus, tp_size) 在 init Step 7 派生.
+# Runtime active subset depends on GENERATION grants; this structural assert
+# is independent of allocation state. INIT Step 7 separately asserts full set.
 ```
 
 NeMo 之所以要 `RayVirtualCluster`-shape adapter 是因为 `VllmGeneration` /
@@ -3852,8 +3876,10 @@ turn-level redispatch。
 7. fullasync round-robin 恢复
 
 新增 invariant 验证：
-(a) `_preempted_engines` 在 `sleep_partial(engine_indices)` 后含目标 engine_index；
-    `wake_up_partial` 完成后清空
+(a) `engine_index not in router.enabled_workers` after `sleep_partial(engine_indices)`；
+    `engine_index in router.enabled_workers` again after `wake_up_partial` (router-side
+    admission state is the single source of truth — A19 cascade; `_preempted_engines` 不再
+    用作 routing/attribution/resize-safety state, 见 §3.1)
 (b) post-sleep `assert_post_sleep_memory_below_threshold` 必须通过
 (c) first-build 拓扑约束生效：非排序连续 `infer_device_mapping` fail fast；
     `RadixTreeMiddleware` 在 RLix mode fail fast 禁用
@@ -3906,6 +3932,19 @@ turn-level redispatch。
       dual-mask (`cpu_serialize_local_ranks` + `broadcast_local_ranks`) + Megatron NCCL
       lifecycle。M11.6 加 cuda_ipc 路径 Gate (`ipc_local_ranks` mask 同步加回). 省下
       NeMo Gate 2.5 的 fallback rule — MILES 直接复用 ReloadableProcessGroup.
+
+**B3 — NCCL `master_port` MVP policy** (NOT router HTTP port — distinct concept):
+(a) **Default path (MVP)** — `MilesModelUpdateService` uses `get_free_port()` +
+    `SharedStorage MASTER_ADDR_PORT:*` claim per sync; no port pool sizing required;
+    EADDRINUSE retry exhausted → fail fast (Anti-regression invariants #4/#5).
+(b) **If a future implementation introduces a bounded master-port pool** (NOT in MVP) —
+    pool size MUST be ≥ Gate 2.5 destroy/reload-cycle count × tp_size + safety margin.
+    M11.1/M11.2 MVP path is (a). TIME_WAIT cooldown queue → M11.5 (A5).
+
+**A9 — `verify_model` is dev-flag only, NOT in Gate 2.5 pass criteria**: per-bucket
+barrier + warmup allreduce (Gate 2.5 (c)) is the actual MVP verification. `verify_model`
+debug validation is gated behind `MILES_DEBUG_VERIFY_MODEL=1` env flag and is NOT a
+Gate 2.5 pass dependency.
 ```
 
 ### Gate 3: 单 pipeline 端到端 fullasync GRPO (partial overlap)
@@ -3961,54 +4000,55 @@ PG：两 pipeline 共享 RollResourceManagerProxy 的 shared PGs
 (b) 两 pipeline 各自的 selective sync 不互相干扰；master_port 在两个 pipeline 间
     通过 `SharedStorage` 原子 claim 不冲突（happy path 验证；receiver crash 容错
     超出本 milestone）
-(c) Pipeline B init under contention (partial allocation main path):
-    - Pipeline A holds 4 GPU as actor_infer (engines [0,1] active and serving).
+(c) Pipeline B init under contention (full INIT main path):
+    - Pipeline A may hold GPU as actor_infer/training while B is waiting. RLix
+      scheduler treats init uniformly as high-priority full allocation; B init
+      does not accept a partial GENERATION allocation.
     - Pipeline B `initialize_pipeline()` runs Step 1 → Step 6.6f
       (all-shell RolloutManager registered with empty Miles router on its own
       port; coordinator `_cache_ready_step=-1` published; bootstrap_active_engines
       called with frozenset() and `_active_engines_bootstrapped=True`).
-    - Pipeline B Step 7 `_request_cluster_gpus(actor_infer, GENERATION)` blocks
-      pending donor-shrink (see (e)).
-    - Scheduler returns partial allocation (e.g., 2 of 4 GPU).
+    - Pipeline B Step 7 `_request_cluster_gpus(actor_infer, INIT)` blocks until
+      the full declared inference GPU set is available.
+    - Scheduler returns full allocation (e.g., all 4/4 GPU).
     - Verify ALL of:
         - Pipeline B `initialize_pipeline()` returns SUCCESS (no raise, no
           engine_count assertion fire).
-        - `coordinator.get_active_engines()` returns the active subset
-          (e.g., {0}); engine 1 stays in `shell` state on RolloutManager
-          (handle is None, server not started, GPU not held).
-        - Pipeline B Miles router's worker list contains exactly the active
-          engine subset; shell engine URLs never appear; no generation
-          traffic dispatched to shell engines.
-        - M1 subset assert (`set(allocated) ⊆ set(declared)`) passed;
-          `is_partial_allocation=True` was logged.
+        - All declared SGLang engines were created during init and init
+          finished by `release_memory_occupation(tags=None)` / offload:
+          engine handles exist, states are `offloaded`, weights/KV/graph GPU
+          memory is dropped, and no trainer CPU-bucket sync / version publish /
+          router activation happened during INIT.
+        - Pipeline B Miles router worker list is empty after init; no generation
+          traffic is routed until a later runtime GENERATION grant wakes engines.
+        - M1 full-allocation assert (`set(allocated) == set(declared)`) passed.
         - Pipeline B Step 7.3 consistency assert
-          (`coordinator.get_active_engines() == active_engine_indices`) passed.
+          (`coordinator.get_active_engines() == frozenset()`) passed.
 
-(d) Expand-before-first-after_training (base-version no-transport path):
-    - Pipeline B is in (c) state (1 active + 1 shell), BEFORE its first
+(d) Expand-before-first-after_training (base-version CPU-bucket sync path):
+    - Pipeline B is in (c) state (all engines initialized + offloaded), BEFORE its first
       after_training completes. So `coordinator._cache_ready_step == -1`
       from init Step 6.6e.
-    - A subsequent `resize_infer(add=[shell_idx])` is triggered (e.g.,
+    - A subsequent runtime `resize_infer(add=[engine_idx])` is triggered (e.g.,
       Pipeline A finishes a train_step and shrinks).
     - Verify ALL of:
         - `_expand_workers` does NOT raise on the
           `_cache_ready_step is not None` guard (init Step 6.6e took
           care of it).
-        - `manager.expand_engines([shell_idx])` lazy-creates the SGLang
-          Ray actor + onload from `args.hf_checkpoint` (state shell → loading).
-        - `service.sync_selected_workers(sync_id, [shell_idx], -1)` enters
-          the **`version == -1` short-circuit** (Fix #13 + #15): runs ONLY
-          `manager.set_weight_version(-1, [shell_idx])`. Verify neither
-          `cache_owner_actor.run_sync_session` nor
-          `engine.finalize_weight_update` is called for the expand
-          (instrumented call counters stay at pre-expand values).
-        - `manager.activate_routing([shell_idx])` flips loading → active,
-          adds worker to router; router worker list now contains both
-          original active engine AND newly-activated former-shell engine.
-        - Engine's reported version after sync = -1 (base label, equivalent
-          to `args.hf_checkpoint` weights from onload; under Fix #14
-          fail-fast `args.load`/`args.ref_load` ⊆ {None, hf_checkpoint}
-          guarantees train and rollout base weights are equivalent).
+        - `manager.expand_engines([engine_idx])` wakes the existing offloaded
+          SGLang engine to a loading, weight-receivable state.
+        - `service.sync_selected_workers(sync_id, [engine_idx], -1)` enters
+          the same atomic unit as normal sync: `cache_owner_actor.run_sync_session`
+          transports the init-built base CPU bucket, `engine.finalize_weight_update`
+          runs, then `manager.set_weight_version(-1, [engine_idx])`.
+          Instrumented call counters MUST increase by exactly one sync/finalize
+          cycle for the expanded engine.
+        - `manager.activate_routing([engine_idx])` flips loading → active,
+          adds worker to router; router worker list now contains the newly
+          activated engine.
+        - Engine's reported version after sync = -1 (base label from
+          `build_cpu_bucket_cache(step=-1)`, not an `args.hf_checkpoint`
+          equivalence shortcut).
     - Pipeline B 后续 train_step 完成 → `sync_base_weights_to_active(0)` 在
       `_resize_sync_lock` 内把 `coordinator._cache_ready_step` 从 -1 翻新到 0 +
       service.sync_selected_workers atomic unit (a)+(b)+(c) 推到 active engines
@@ -4018,55 +4058,74 @@ PG：两 pipeline 共享 RollResourceManagerProxy 的 shared PGs
     Required: T1 < T2 < T3 strict —
     - T1: A.coordinator.resize_infer(remove=[0]) returns (A engine[0]
       reaches `offloaded`, GPUs released from A's view).
-    - T2: B.coordinator.resize_infer(add=[0]) starts (B's shell engine[0]
+    - T2: B.coordinator.resize_infer(add=[0]) starts (B's offloaded engine[0]
       → loading).
-    - T3: B's pending Step 7 `_request_cluster_gpus` returns to driver.
-    Failure prevented: B spawning Ray/SGLang actor on GPUs 0,1 while A
-    still holds them. T2 < T3 specifically prevents Step 7.3 sanity from
+    - T3: B's pending runtime GENERATION request returns to driver.
+    Failure prevented: B waking/activating SGLang GPU memory on GPUs 0,1 while A
+    still holds them. T2 < T3 specifically prevents sanity checks from
     observing transient mismatch on `coordinator.get_active_engines()`.
     Test instrumentation is per-test concern (timestamp logger on
     coordinator + driver side); not part of production code path.
 
-(f) Router dispatch under 0-active-engine (M11.2 partial-alloc + own-train cycle):
-    Pipeline B is in (c) state — 1 active engine (engine 0 = overlap subset).
-    During B's own train cycle, engine 0 sleeps → router enabled set = ∅
-    (engine 1 stays in `shell` state, never in router worker list).
-    Background fully_async generation tasks issued before/during shrink hit
-    `_use_url`. **MUST suspend, NOT raise** (legit M11.2 status; see Feature 3
-    §7+§8+§9 spec).
+(f) Router dispatch under 0-active-engine (M11.2 runtime GENERATION shrink/expand
+    after full INIT+offload):
+
+    **Setup (corrected design)**: Pipeline B has completed init —
+    `Priority.INIT` full allocation, all engines went through
+    `_create_sglang_actor + onload(hf_checkpoint) → finish_init_offload` so all
+    are in `offloaded` state, router is empty, active set is empty. Then
+    Pipeline B receives a runtime GENERATION grant via
+    `coordinator.resize_infer(add=[engine_0])`; engine 0 transitions
+    `offloaded → loading → active`, router gains its URL via `add_worker`. B is
+    now in steady state with one active engine.
+
+    **Trigger condition**: B's own-train cycle. `_before_training` calls
+    `coordinator.resize_infer(remove=[engine_0])` driving engine 0
+    `active → disabling → offloaded`; router receives `disable_worker` /
+    `remove_worker` and the enabled set drops to ∅. Background fully_async
+    generation tasks issued during this window hit `_use_url`. **MUST suspend,
+    NOT raise** (legit runtime status; see Feature 3 §7 MVP suspend spec).
+
+    **MVP scope**: only suspend + `notify_all` resume. Bounded timeout +
+    sentinel + client translation deferred to M11.5. Test wrapping uses
+    `asyncio.wait_for` on the test side to fail CI fast on a buggy
+    implementation (Refinement R1 below); the router itself remains unbounded.
 
     Positive (suspend + resume) — explicit P1→P2→P3 ordering eliminates the
     inject-vs-disable race (router runs as a separate FastAPI process; test
-    cannot read `self.enabled_workers` directly):
+    cannot read `self.enabled_workers` directly). **Wrap entire sub-test body
+    in `asyncio.wait_for(test_coro(), timeout=60)` (R1) — buggy
+    implementation fails CI fast at the awaited boundary, NOT silent CI hang**:
 
-    - **Step P1 (establish empty active set FIRST)**: Trigger `_before_training`
-      and observe completion through the router's HTTP surface. The router runs
-      in its own FastAPI process. Test-only diagnostic endpoint:
+    - **Step P1 (establish empty active set FIRST via runtime shrink)**:
+      Trigger B's `_before_training` and observe completion through the
+      router's HTTP surface. Test-only diagnostic endpoint:
       `GET /admission_state` returning `{"enabled": [...], "dead": [...],
       "registered": [...]}` (gated behind `MILES_ROUTER_TEST_HOOKS=1` env flag;
       production deployments leave it off so the surface area is unchanged).
-      Poll until `enabled == [] and dead == []` AND engine 1 still in `shell`
-      state (verified via `coordinator.get_active_engines()`). This is the
-      barrier — without precise state visibility, "wait some seconds and hope"
-      is exactly the race the barrier is meant to eliminate.
-      **Production-only fallback** (no diagnostic hook): poll `GET
-      /list_workers` for the registered list, but recognize this does NOT prove
-      `enabled_workers` is empty (disable_worker keeps the URL registered).
-      Use diagnostic hook for Gate 4 (f).
-    - **Step P2 (now inject; dispatch MUST suspend)**: Once the diagnostic hook
+      Poll until `enabled == [] AND dead == []`; verify all engines are in
+      `offloaded` state via test-only coordinator active-set snapshot. This is
+      the barrier — without precise state visibility, "wait some seconds and
+      hope" is exactly the race the barrier is meant to eliminate.
+    - **Step P2 (now inject; dispatch MUST suspend)**: Once the diagnostic
       confirms empty active set, inject background `/generate` via production
       `miles.utils.http_utils.post` (must traverse the real router HTTP path,
-      NOT a stub). The request enters `_use_url` AFTER the active set is empty,
-      so it MUST suspend on `_workers_changed.wait_for(...)`.
+      NOT a stub). The request enters `_use_url` AFTER the active set is
+      empty, so it MUST suspend on `_workers_changed.wait_for(predicate)`
+      (unbounded — production code; the test wrapper above is what bounds CI
+      runtime, not the router).
     - Verify in-flight `/generate` task is still pending after 1s
       (asyncio timing assertion; suspension is real, not a busy-wait spin).
-    - **Step P3 (resume)**: Trigger `_after_training` → service.sync v=N →
-      expand engine 0 → `add_worker` / `enable_worker` notifies condition.
-    - Verify suspended task resumes, dispatches to engine 0, trajectory
-      completes; `worker_request_counts[engine_0_url]` returns to 0 after
-      `_finish_url` (counter visible via the same `/admission_state`
-      diagnostic, NOT through `self.worker_request_counts` direct access —
-      the test process and router process are separate).
+    - **Step P3 (resume via runtime expand)**: Trigger B's `_after_training`
+      → `coordinator.resize_infer(add=[engine_0])` →
+      `manager.expand_engines([engine_0])` brings engine_0 `offloaded →
+      loading`; service.sync runs CPU-bucket cache load; activate_routing
+      flips `loading → active` and calls `add_worker` →
+      `_workers_changed.notify_all()` wakes suspended dispatchers.
+    - Verify suspended task resumes, dispatches to engine_0, trajectory
+      completes; counter returns to 0 (visible via the same
+      `/admission_state` diagnostic, NOT through `self.worker_request_counts`
+      direct access — the test process and router process are separate).
     - **Race-window note**: the "inject before disable" ordering is
       intentionally forbidden here. If a future test variant injects first,
       it MUST use a `disable_worker` hook (e.g., monkey-patched
@@ -4075,37 +4134,21 @@ PG：两 pipeline 共享 RollResourceManagerProxy 的 shared PGs
       INSIDE the router process, not the test process) to provably block
       the dispatch attempt at `_use_url` until disable completes.
 
-    Negative (timeout → sentinel → EnginePreemptedError):
-    - Set `MILES_ROUTER_DISPATCH_WAIT_S=2` for the test process.
-    - Hold engine 0 sleeping for 3s.
-    - Verify client `_post` raises `EnginePreemptedError`
-      (NOT `httpx.HTTPStatusError`, NOT `RuntimeError`, NOT a 60-retry log).
-    - Verify response carried `status_code=503` + header
-      `X-Miles-Preempt: empty_active_set_timeout`. Retry budget NOT consumed.
-    - Verify fully_async `task_done_callback` sees `EnginePreemptedError`
-      → `_FatalError` queue sentinel → outer-loop dequeue raises;
-      OR multi_turn.py snapshot/restore fires turn-level redispatch
-      (depending on whether the call originated inside a multi_turn turn).
+    Counter accounting under suspend/resume (concurrency invariant) — wrap in
+    `asyncio.wait_for(test_coro(), timeout=30)`:
 
-    Counter accounting under suspend/resume (concurrency invariant):
     - Two concurrent `/generate` tasks suspended at empty active set.
-    - Expand triggers; both resume.
+    - Expand triggers; both resume on the same `notify_all`.
     - Verify each goes through the lock atomically: each gets +1 in
-      `_use_url`, -1 in `_finish_url`, net zero. No double-decrement,
-      no negative-count assert from `_finish_url`.
+      `_use_url`, -1 in `_finish_url`, net zero. No double-decrement, no
+      negative-count assert from `_finish_url`.
 
-    Distributed POST coverage (S1.6) — conditional, NOT a Gate 4 hard gate:
-    - M11.2 Gate 4 dev target is single-machine 4-GPU vast.ai; distributed POST
-      (`_distributed_post_enabled=True`) is typically OFF in this environment.
-      Run this sub-test ONLY in environments where distributed POST is actually
-      enabled in production config. Skip on local-only deployments — the local
-      path already exercises `_post`, which is the load-bearing translator.
-    - When run: repeat the negative test with `_distributed_post_enabled=True`
-      (Ray actor path); verify caller of `post()` receives `EnginePreemptedError`,
-      NOT `RayTaskError`, NOT a "Distributed POST failed, falling back to local"
-      log followed by another retry round-trip. Confirms `post()` exception
-      handler catches `RayTaskError`, unwraps `e.cause`, re-raises as
-      `EnginePreemptedError` BEFORE generic `except Exception` fallback.
+    **Sub-tests deferred to M11.5** (production hardening, NOT M11.2 Gate 4):
+    - Negative test (`MILES_ROUTER_DISPATCH_WAIT_S` timeout → 503 sentinel →
+      client `EnginePreemptedError` translation) — depends on bounded
+      timeout + sentinel + client translation, all deferred to M11.5.
+    - Distributed POST `RayTaskError` unwrap test — depends on `post()`
+      patching, deferred to M11.5.
 
 NOT a Gate 4 pass/fail criterion (M11.2-tagged follow-up, separate
 deliverables; on crash, manual `ray stop` is accepted recovery):
@@ -4121,18 +4164,17 @@ admission_epoch race, orchestrator cleanup, graceful actor drain.
 | 文件 | Feature | 改动 | 行数 |
 |---|---|---|---|
 | `miles/backends/sglang_utils/sglang_engine.py` | F1, F2, F5+6 | **M11.1**: post-sleep VRAM assertion (走 `/server_info` `memory_usage` GB 单位 + `args.miles_post_sleep_vram_threshold_gb`, 不读 actor `torch.cuda`) + `is_idle()` worker method (走 `/v1/loads` `slot["num_total_reqs"]`, **不是 `/server_info` 的 `num_running_reqs` (后者不存在)**, 带 timeout + raise_for_status) + `abort_all_requests()` (POST `/abort_request {"abort_all": true}`) + receiver-side 方法: **新增 `update_weights_from_cpu_bucket(payload_bytes, cpu_serialize_local_ranks, ...)`** (**`payload_bytes` 不是 `payload_ref` — Ray auto-deref top-level ObjectRef**; **wrapper tmpfs cleanup owner = `try/finally os.unlink(/dev/shm/miles_cpu_bucket_{uuid}.pt)`**, 见 §F4 §B tmpfs file lifecycle invariant) + setup/destroy_collective_group with `is_group_exist` no-op guard + broadcast_parameter + finalize_weight_update. **M11.6 加**: 既有 `update_weights_from_tensor` 扩展 `ipc_local_ranks` 参数 (tp>1 dual-mask, 对齐 ROLL `vllm_strategy.py:685`). **不引入 F1 coordinator ack publish flag** (actor.py:58 已无条件挂 monkey patch) | M11.1: +180; M11.6: +30 |
-| `miles/ray/rollout.py` | F1, F2, F3, F9, F12 | `EngineInfo` dataclass (`state: Literal["shell", "active", "disabling", "offloaded", "loading"]`, **5 态** — 加 `shell` 表示 slot reserved/无 Ray actor/无 SGLang server/无 GPU; 字段 `handle` / `worker_url` / `server_group` 在 shell 状态下为 None, `bundle_index` / `gpu_ids` / `placement` 始终 populated; **取代 worker-local `is_engine_resident_on_gpu` flag**) + `RolloutManager.{offload,onload,onload_weights,onload_kv}(engine_indices=None)` 仅在 Manager 层 + `shrink_engines/expand_engines` 复合操作 (`expand_engines` 内部 dispatch on entry state: **`shell → loading`** lazy `_create_sglang_actor(engine_idx, placement)` + `onload()`, **`offloaded → loading`** existing `wake_up()`; 返回 engines in `loading` 状态, 不开 routing) + **`activate_routing(engine_indices)` method** (`loading → active` + open router; coordinator 在 service.sync_selected_workers 完成后调用) + abort-drain-sleep + `_routing_lock` compound 不变量 + worker registration with `engine_index` (F3 router metadata 数据源, **不注入 GenerateFnInput.preempt_state**, F3 改用 router-side classification) + progress callback hook (走 `RLixHooks` protocol, 不直接 import RLix 类型) + **`get_engine_count()` method** (返回 `len(self._engines)` == declared engine_count, 包含 shell; sanity check 用 `srv.engines` 不是 `srv.all_engines`) + **`set_weight_version(version, engine_indices=None)` method** (fan-out 到 per-engine `update_weight_version.remote`; 由 service.sync_selected_workers 内部调用, 不在 pipeline 直接调; engine_indices=None 退化到所有 active engines, shell engines 永远跳过) + **`get_engine_handles(engine_indices: Set[int]) -> dict[int, RayActorHandle]` method (Fix #5)** (read-only snapshot of per-engine SGLangEngineActor handles; raise if any engine_idx is in `shell` state; 由 `MilesModelUpdateService.sync_selected_workers` at sync entry 一次性 fetch — service 据此驱动 per-engine cpu_bucket / NCCL broadcast RPC, 不再每次 RPC 找 manager) + **`activate_routing(engine_indices)` method** (loading → active + add_worker to router; coordinator 在 service.sync_selected_workers 完成后调用, 是唯一的 add_worker 入口 — `shrink_engines` 是唯一的 remove/disable 入口; per-pipeline 独立 router port 在 `__init__` 内绑定 `args.sglang_router_port` from provider's port pool, 不 inherit peer pipeline 的 router port) + **`RolloutManager.__init__` 扩展接受 `all_engine_placements: list[WorkerPlacement]` (length engine_count, 全表) + `active_engine_indices: frozenset[int]` (active 子集; partial allocation 下是 strict subset of range(engine_count))** + 新增 `start_rollout_servers_from_worker_placements` (only iterates active engines per `active_engine_indices`; per-worker 节点级 PG + bundle_index=0 + capture_child_tasks + manual CUDA_VISIBLE_DEVICES + NOSET env + 显式 `base_gpu_id=0` (M9 — post-CVD local index, 不传 `wp.gpu_ids[0]` physical id) + 不 fallback `get_base_gpu_id`; shell engines 仅初始化 `EngineInfo` slot 持有 placement, 不 spawn Ray actor). **M4 self-cleanup**: `start_rollout_servers_from_worker_placements` ctor loop try/except — 中途失败 kill 已创建 SGLang engine actors. **M4 `RolloutManager.shutdown_hard()` MVP**: stop monitors (背景 task 取消) + `for h in self._engine_actors: ray.kill(h, no_restart=True)` (skip shell — `handle is None`); 不做 graceful drain / abort RPC / force-kill timeout (follow-up) | +320 |
+| `miles/ray/rollout.py` | F1, F2, F3, F9, F12 | `EngineInfo` dataclass (`state: Literal["shell", "active", "disabling", "offloaded", "loading"]`, **5 态** — `shell` 只表示 construction/pre-init slot reserved: 无 Ray actor/无 SGLang server/无 GPU, 但 `bundle_index` / `gpu_ids` / `placement` 始终 populated; INIT 后不再留下 shell partial slots) + `RolloutManager.{offload,onload,onload_weights,onload_kv}(engine_indices=None)` 仅在 Manager 层 + `shrink_engines/expand_engines` 复合操作 (`expand_engines` 内部 dispatch on entry state: **`shell → loading`** lazy `_create_sglang_actor(engine_idx, placement)` + `onload()` for full INIT only, **`offloaded → loading`** existing `wake_up()` for runtime GENERATION grant; 返回 engines in `loading` 状态, 不开 routing) + **`finish_init_offload(engine_indices)` method** (`loading → offloaded`, `release_memory_occupation(tags=None)`, no trainer CPU-bucket sync, no `set_weight_version`, no router add_worker) + **`activate_routing(engine_indices)` method** (`loading → active` + open router; coordinator 在 service.sync_selected_workers 完成后调用) + abort-drain-sleep + `_routing_lock` compound 不变量 + worker registration with `engine_index` (F3 router metadata 数据源, **不注入 GenerateFnInput.preempt_state**, F3 改用 router-side classification) + progress callback hook (走 `RLixHooks` protocol, 不直接 import RLix 类型) + **`get_engine_count()` method** (返回 `len(self._engines)` == declared engine_count, 包含 shell; sanity check 用 `srv.engines` 不是 `srv.all_engines`) + **`set_weight_version(version, engine_indices=None)` method** (fan-out 到 per-engine `update_weight_version.remote`; 由 service.sync_selected_workers 内部调用, 不在 pipeline 直接调; engine_indices=None 退化到所有 active engines, shell engines 永远跳过) + **`get_engine_handles(engine_indices: Set[int]) -> dict[int, RayActorHandle]` method (Fix #5)** (read-only snapshot of per-engine SGLangEngineActor handles; raise if any engine_idx is in `shell` state; 由 `MilesModelUpdateService.sync_selected_workers` at sync entry 一次性 fetch — service 据此驱动 per-engine cpu_bucket / NCCL broadcast RPC, 不再每次 RPC 找 manager) + **`get_engine_states(engine_indices: Set[int]) -> dict[int, str]` method** (read-only entry-state snapshot — sibling to `get_engine_handles`; returns each engine's current `EngineInfo.state`. Used by coordinator `_expand_workers` to dispatch INIT branch (states == {`shell`}) vs Runtime GENERATION branch (states == {`offloaded`}); raise on heterogeneous entry states upstream) + **`RolloutManager.__init__` 扩展接受 `all_engine_placements: list[WorkerPlacement]` (length engine_count, 全表) + `active_engine_indices: frozenset[int]` (M11.2 init 传空集, 只建 metadata slots; runtime grant 通过 `expand_engines` 唤醒 offloaded engines)**. **M4 self-cleanup**: init/expand ctor loop try/except — 中途失败 kill 已创建 SGLang engine actors. **M4 `RolloutManager.shutdown_hard()` MVP**: stop monitors (背景 task 取消) + `for h in self._engine_actors: ray.kill(h, no_restart=True)` (skip shell — `handle is None`); 不做 graceful drain / abort RPC / force-kill timeout (follow-up) | +320 |
 | `miles/ray/actor_group.py` | F4, F12 | `RayTrainGroup.__init__` 扩展接受 `worker_placements: list[WorkerPlacement] \| None` (替代 pg=三元组), 完整新签名 `(args, num_nodes, num_gpus_per_node, *, pg=None, worker_placements=None, num_gpus_per_actor=0.4 standalone / 0.01 RLix mode, role, with_ref)`; 必须 pg xor worker_placements 二选一. 每 actor 用对应 `WorkerPlacement.placement_group + bundle_index=0 + capture_child_tasks + CUDA_VISIBLE_DEVICES + NOSET_VISIBLE_DEVICES_ENV_VARS_LIST`. **RLix path 显式传 `local_rank=0` 给 `TrainRayActor.__init__`** (Fix #9 — fractional GPU + manual CVD 下 `ray.get_gpu_ids()` 不在 manual CVD 列表里, 既有 `get_local_gpu_id()` 会 ValueError 或设错 LOCAL_RANK; 1 actor 1 GPU 下 local_rank 永远 0). standalone path 不传, 走旧 fallback. **M4 self-cleanup**: `__init__` 包 try/except, ctor loop 中途失败 (任何 `TrainRayActor.options(...).remote(...)` 或 `init.remote()` raise) 时 `for h in self._actor_handles: ray.kill(h, no_restart=True)` + `self._actor_handles = []` + raise 透传. **M2 sender API**: 加 `build_cpu_bucket_cache(step)` fan-out + `collect_cache_owner_roles() -> list[(rank, is_owner, actor_handle)]` (worker rank ↔ actor handle 配对). **不引入 graceful shutdown method** (follow-up) | +115 |
 | `miles/ray/train_actor.py` (Fix #9) | F12 | `TrainRayActor.__init__` 加可选 `local_rank: int \| None = None` kwarg. None 时 fallback 到既有 `get_local_gpu_id()` (standalone parity); RLix path 由 RayTrainGroup 显式传 `local_rank=0` (1 actor 1 GPU under fractional + manual CVD, local rank 永远 0; 既有 `cvd.split(",").index(str(ray.get_gpu_ids()[0]))` 在 RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 + manual CVD 路径下不成立). 设 `os.environ["LOCAL_RANK"] = str(local_rank if local_rank is not None else get_local_gpu_id())`. 不改 `get_local_gpu_id()` 自身 (兼容 standalone) | +5 |
-| `miles/router/router.py` | F3 (incl. M11.2 — C20) | `/disable_worker` / `/enable_worker` / `/remove_worker` endpoint + `/add_worker?engine_index=...` 扩展 + 4 个 router state (`worker_request_counts / worker_failure_counts / dead_workers / enabled_workers / worker_engine_index_map`) + 4 个 internal helper (`_add_worker_internal / _remove / _disable / _enable`, **stay sync `def`**) 完整 lifecycle 维护 (含 `setdefault` 避免 re-add 清零 + `add` 时 `dead_workers.discard` + `disable` reset failure_count) + `_use_url` 改用 `enabled_workers - dead_workers` (Critical Invariant: 不只 metadata) + `do_proxy` 内 mutate JSON body 注入 `meta_info["miles_engine_index", "miles_admission_disabled"]` (**仅 path == "generate"**, response 时刻读 `enabled_workers`; race window 边界见 F3 admission_disabled 语义边界段) + **header hardening**: `do_proxy` strip `Content-Encoding` (改 body 后旧 header 不能保留, 否则客户端解码崩); Content-Length 由 `build_proxy_response` 既有逻辑 strip + `JSONResponse` 重算 + `_health_check_loop` 只 probe `enabled_workers - dead_workers`. **不引入 admission_epoch race 防御** (turn retry 兜底; production 多 pipeline 高频 shrink/expand 触发再加, follow-up). **C20 (M11.2 — see §Feature 3 §7)**: `_use_url` becomes `async def` block-with-notify on empty active set; `_workers_changed: asyncio.Condition`; bounded timeout `MILES_ROUTER_DISPATCH_WAIT_S` (default 60s, env-tunable); `_RouterDispatchTimeout` local exception class; `do_proxy` MUST be updated to `await self._use_url()` and translate `_RouterDispatchTimeout` to HTTP 503 + `X-Miles-Preempt: empty_active_set_timeout` header response; `worker_request_counts[url] += 1` increment MUST stay INSIDE the condition lock so `_finish_url` accounting balances; every state-mutating async endpoint (`add_worker` / `enable_worker` / `disable_worker` / `remove_worker`) ends with `async with self._workers_changed: self._workers_changed.notify_all()` (helpers themselves stay sync); `_health_check_loop` notifies on dead/recovered transitions. **NEVER** raise generic `RuntimeError` from `_use_url`; **NEVER** raise `EnginePreemptedError` from inside the router process (HTTP serialization loses Python type — sentinel header is the contract). | +185 (F3 lifecycle ~135 + C20 router suspend ~50) |
-| `miles/utils/http_utils.py` | F3 (M11.2 — C20) | **Module-top guarded imports** (file header): `try: from ray.exceptions import RayTaskError; except ImportError: RayTaskError = ()` (Ray-absent envs; `except ()` matches nothing → branch is dead in non-Ray envs) AND `from miles.rollout.base_types import EnginePreemptedError` (verified cycle-free: `miles.rollout.base_types` does not import `http_utils`). Module-top import provides `EnginePreemptedError` in scope for BOTH `_post` AND `post()`; no per-function lazy import needed. **If a future cycle is introduced**, fall back to function-top imports — they MUST live at the top of EACH function that raises `EnginePreemptedError` (`_post` AND `post()`), NOT inside any `try` block (Python treats `from X import Y` as local binding; if exception fires before the import line, `except EnginePreemptedError:` raises `UnboundLocalError`). **`_post` body**: detect `X-Miles-Preempt` header BEFORE `raise_for_status()` and BEFORE generic retry loop; raise `EnginePreemptedError`; add `except EnginePreemptedError: raise` clause ABOVE the generic `except Exception` so propagation is intact. **`post()` body**: catch `RayTaskError`; unwrap `e.cause`; re-raise `EnginePreemptedError` BEFORE generic `except Exception` fallback (otherwise distributed POST falls back to local _post and wastes one round trip per preempt). Spec: §Feature 3 §8+§9. | +30 (~20 _post + ~10 post; module-top imports ≤5 lines, counted in _post) |
+| `miles/router/router.py` | F3 (incl. M11.2 — C20 MVP) | `/disable_worker` / `/enable_worker` / `/remove_worker` endpoint + `/add_worker?engine_index=...` 扩展 + 4 个 router state (`worker_request_counts / worker_failure_counts / dead_workers / enabled_workers / worker_engine_index_map`) + 4 个 internal helper (`_add_worker_internal / _remove / _disable / _enable`, **stay sync `def`**) 完整 lifecycle 维护 (含 `setdefault` 避免 re-add 清零 + `add` 时 `dead_workers.discard` + `disable` reset failure_count) + `_use_url` 改用 `enabled_workers - dead_workers` (Critical Invariant: 不只 metadata) + `do_proxy` 内 mutate JSON body 注入 `meta_info["miles_engine_index", "miles_admission_disabled"]` (**仅 path == "generate"**, response 时刻读 `enabled_workers`; race window 边界见 F3 admission_disabled 语义边界段) + **header hardening**: `do_proxy` strip `Content-Encoding` (改 body 后旧 header 不能保留, 否则客户端解码崩); Content-Length 由 `build_proxy_response` 既有逻辑 strip + `JSONResponse` 重算 + `_health_check_loop` 只 probe `enabled_workers - dead_workers`. **不引入 admission_epoch race 防御** (turn retry 兜底; production 多 pipeline 高频 shrink/expand 触发再加, follow-up). **C20 MVP (M11.2 — see §Feature 3 §7)**: `_use_url` becomes `async def` block-with-notify on empty active set; `_workers_changed: asyncio.Condition`; **unbounded `wait_for(predicate)`** (no timeout in MVP); `do_proxy` MUST `await self._use_url()`; `worker_request_counts[url] += 1` increment MUST stay INSIDE the condition lock so `_finish_url` accounting balances; every state-mutating async endpoint (`add_worker` / `enable_worker` / `disable_worker` / `remove_worker`) ends with `async with self._workers_changed: self._workers_changed.notify_all()` (helpers themselves stay sync); `_health_check_loop` notifies on dead/recovered transitions. **NEVER** raise generic `RuntimeError` from `_use_url`. **Bounded timeout + 503 sentinel + client `EnginePreemptedError` translation 推到 M11.5** (see Implementation follow-up). **Forbidden Responsibility (M11.2 router path)**: internal request queue, retry loop, spillover, synthetic fallback worker selection. Empty active set = `asyncio.Condition` suspend ONLY (per A11 + Anti-regression invariant #11). | +150 (F3 lifecycle ~135 + C20 MVP suspend ~15) |
 | `miles/router/middleware_hub/radix_tree_middleware.py` | F3 | RLix mode 下不改成 pass-through；启动校验禁止加载 `RadixTreeMiddleware`，`partial_rollout + radix_tree` 留作 follow-up | +0 |
 | `miles/rollout/generate_hub/multi_turn.py` | F3 | 删除 `assert not args.partial_rollout`（line 29）+ 强制 `payload["stream"] = False`（router metadata 注入要求 JSON body）+ snapshot-then-retry turn loop（`MAX_TURN_REDISPATCH_ATTEMPTS = args.rollout_num_gpus // args.rollout_num_gpus_per_engine`, retry 用尽 raise `EnginePreemptedError` fail fast）+ `_is_scheduler_preempt(output, rlix_mode=DO_TIME_SHARING)` 判定 (RLix mode 缺 metadata raise `RLixRouterMetadataError`, **不读 GenerateFnInput.preempt_state**) | +70 |
 | `miles/rollout/base_types.py` | F3 | `class EnginePreemptedError(Exception)` + `class RLixRouterMetadataError(Exception)`. **不扩 GenerateFnInput** (避免改 sglang_rollout.py:266 / inference_rollout_common.py:82 两个构造点) | +5 |
 | `miles/rollout/generate_utils/generate_endpoint_utils.py` | F3 | `_snapshot_turn_state` / `_restore_turn_state` 辅助 | +40 |
 | `miles/backends/megatron_utils/update_weight/cpu_bucket_cache.py` (**新增**) | F4 | CPU bucket build + lookup + `_cache_ready_step` 单槽指针 | +180 |
 | `miles/backends/megatron_utils/actor.py` | F4 (M2 sender API) | `MegatronTrainRayActor` 加 `build_cpu_bucket_cache(step)` (HF gather, cache_owner rank 真存; 其它 rank 参与 collective gather 但丢弃结果, 见 F4 §1 HF-format invariant; method 内 `with self._cache_lock` 持锁) + `report_cache_owner_role() -> tuple[int, bool]` (基于 `_is_distributed_src_rank`) + **`run_sync_session(plan: SyncSessionPlan) -> None`** (cache_owner 实现, 其它 rank raise; Fix #6 composite RPC — `with self._cache_lock` 单 method 单临界区: snapshot bucket list + `_cache_ready_step`, classify cpu_serialize vs broadcast targets via `plan.target_handles` + `plan.cpu_serialize_local_ranks` + `plan.broadcast_local_ranks`, per-bucket dispatch (cpu_serialize: `engine.update_weights_from_cpu_bucket.remote(payload_ref, ...)` — payload **不携带 weight_version**, Fix #3; broadcast: TCP-rendezvous group setup via `init_process_group(init_method='tcp://master_addr:master_port', ...)` + per-bucket `dist.broadcast(src=cache_owner_global_rank, group=tmp)` + `dist.destroy_process_group(tmp)`, Fix #7), 整段在锁内, 调用结束 = 所有 buckets 已被所有 targets load 完成). **不**: `get_bucket_count` / `serialize_bucket_to_objref` / `setup_collective_group` / `broadcast_bucket` / `destroy_collective_group` 不再是 top-level Ray methods, 全部降级为 `run_sync_session` 内部 helpers (Fix #6 — 解决跨 RPC 持锁矛盾). **M11.6 加**: `run_sync_session` 内部 cuda_ipc adapter (CPU cache → H2D staging → IPC handle, ~50-80 行) for cuda_ipc transport classification | +180 |
-| `miles/ray/placement_provider.py` (**新增**) | F12 | `MilesPlacementProvider` 真实 adapter — 接收注入的 `RollResourceManagerProxy` (**不自建**, 从 coordinator 传入) + 接收注入的 `train_device_mapping` / `infer_device_mapping` (**与 F8 driver `register_pipeline` 时声明的 `cluster_device_mappings[role]` 同源**, 不在 provider 内 `list(range(...))` 重新派生 — 防止多 pipeline 场景下 Pipeline B 注册 `[4,5,6,7]` 时 provider 仍申请 `[0,1,2,3]` 与 Pipeline A 冲突) + `WorkerPlacement` dataclass (`placement_group / node_rank / gpu_ids / bundle_index`, per-worker view of ROLL `List[List[Dict]]`; **multi-node-compatible structural invariant** per Cut 1' — node-local gpu_ids, 不假设 global GPU id == local id, dev gate 单机 4 卡不堵死多机部署) + **`get_all_rollout_engine_placements() -> list[WorkerPlacement]`** (length `engine_count`, 从 declared `infer_device_mapping` 派生, **independent of `allocated_actor_infer_gpus`**; F4 partial GENERATION allocation 下 shell engine slot 仍持有声明的 placement) + **`get_active_engine_indices(allocated_gpus, tp_size) -> frozenset[int]`** (从 declared mapping `infer_device_mapping.index(g) // tp_size` 派生; 验证 each engine 的 tp_size GPU 全分配或全没分配, half-engine raise) + `get_train_workers()` 调 `proxy.allocate_placement_group(world_size, device_mapping=declared_mapping)` 切成 per-worker view + 启动期 structural assert (`len(all_engine_placements) == engine_count`, `len(wp.gpu_ids) == tp`, `wp.gpu_ids == sorted(...)` 验证 first build contiguous; **不做 identity scheduler_to_engine round-trip** — first build 拓扑下永远 pass, 是 dead assert; **不做 `scheduler.get_allocation` cross-check** — RLix 没此 public API; 二者都留 follow-up) | +130 |
+| `miles/ray/placement_provider.py` (**新增**) | F12 | `MilesPlacementProvider` 真实 adapter — 接收注入的 `RollResourceManagerProxy` (**不自建**, 从 coordinator 传入) + 接收注入的 `train_device_mapping` / `infer_device_mapping` (**与 F8 driver `register_pipeline` 时声明的 `cluster_device_mappings[role]` 同源**, 不在 provider 内 `list(range(...))` 重新派生 — 防止多 pipeline 场景下 Pipeline B 注册 `[4,5,6,7]` 时 provider 仍申请 `[0,1,2,3]` 与 Pipeline A 冲突) + `WorkerPlacement` dataclass (`placement_group / node_rank / gpu_ids / bundle_index`, per-worker view of ROLL `List[List[Dict]]`; **multi-node-compatible structural invariant** per Cut 1' — node-local gpu_ids, 不假设 global GPU id == local id, dev gate 单机 4 卡不堵死多机部署) + **`get_all_rollout_engine_placements() -> list[WorkerPlacement]`** (length `engine_count`, 从 declared `infer_device_mapping` 派生, **independent of runtime allocated_actor_infer_gpus**; full INIT 用全表创建所有 engines, runtime GENERATION grant 只唤醒 subset while others remain `offloaded`) + **`get_active_engine_indices(allocated_gpus, tp_size) -> frozenset[int]`** (从 declared mapping `infer_device_mapping.index(g) // tp_size` 派生; 验证 each engine 的 tp_size GPU 全分配或全没分配, half-engine raise) + `get_train_workers()` 调 `proxy.allocate_placement_group(world_size, device_mapping=declared_mapping)` 切成 per-worker view + 启动期 structural assert (`len(all_engine_placements) == engine_count`, `len(wp.gpu_ids) == tp`, `wp.gpu_ids == sorted(...)` 验证 first build contiguous; **不做 identity scheduler_to_engine round-trip** — first build 拓扑下永远 pass, 是 dead assert; **不做 `scheduler.get_allocation` cross-check** — RLix 没此 public API; 二者都留 follow-up) | +130 |
 | `miles/ray/placement_group.py` | F12 | `create_placement_groups(args, *, external_provider=None)` | +20 |
 | `miles/utils/arguments.py` | F1, F4, F10 | 新增 RLix-mode tuning args (3 个 new): `args.miles_model_update_bucket_size_mb` (默认 512), `args.miles_post_sleep_vram_threshold_gb` (默认 1.0), `args.model_update_transport` (默认 `"cuda_ipc"`; **M11.1 RLix mode F10 强制 `cpu_serialize`** — vast.ai 受限容器无 IPC; M11.6 加 cuda_ipc 选项 + smoke-test capability check). **不新增 device_mapping args** (派生路径). `args.offload_train` 既有, F10 fail-fast 强制 True | +30 |
 | `examples/fully_async/fully_async_rollout.py` | F2, F3, F9 | abort 触发口 + 接受 `rlix_hooks` 参数 (standalone 走 `NoOpRLixHooks`) + `begin_progress_batch(target_weight_version, step_target_groups, initial_completed, mode=None, adapter_id=None)` (M11 hook signature; **M11.5 forward-compat 字段 `mode/adapter_id` nullable 保留**) / `bump_completed(target_weight_version=...)` / `end_progress_batch()` 包裹 wait window (**只调 hook 抽象, 不 import RLix 类型, 不 `ray.get_actor` coordinator**) + **`initial_completed = 0` semantics**: `begin_progress_batch` 在 wait window 之前调用, 此时 `data = []` (caller-local), output_queue 内已 queued 的 group 在 while 循环首次 iter 通过 `worker.get_completed_groups()` → `bump_completed` 流转. **不读 worker 内部** — `AsyncRolloutWorker` 没有 `worker.buffer` / `g.is_ready` / `g.target_weight_version` 字段; 任何 worker-side scan 路径都是 fake. 不引入 `_completed_count_by_step` / `count_ready_groups_for_step` 兜底. `bump_completed` 用 caller-local `current_weight_version` 作 `target_weight_version` (group 单元自身没这个字段, Sample.weight_versions 才是 per-decision). + **`_FatalError` sentinel + `task_done_callback` catch `(EnginePreemptedError, RLixRouterMetadataError)` 走 queue sentinel + 主循环 dequeue 检测 `isinstance(result, _FatalError)` raise** (queue 单路径已足够) | +50 |
@@ -4144,9 +4186,9 @@ admission_epoch race, orchestrator cleanup, graceful actor drain.
 
 | 文件 | Feature | 改动 | 行数 |
 |---|---|---|---|
-| `rlix/pipeline/miles_pipeline.py` (**新增**) | F5+6, F8, F10, F11, F12 | `MilesPipeline` actor — registration + validation (F10 含 single_updateable / EP fail-fast / stream / bucket-size / **`assert args.offload_train`** / **`rollout_num_gpus % rollout_num_gpus_per_engine == 0`** / **M11.1 RLix mode 强制 `model_update_transport == "cpu_serialize"`** (vast.ai 受限容器, cuda_ipc → M11.6). **M11.1 forbids cross-node rollout engine, not multi-node DP** — 既有 M3 assert `rollout_num_gpus_per_engine <= num_gpus_per_node` (按 rollout engine 总 GPU 数计, 与 sharding 形式 TP/EP 无关; train 侧 Megatron actor 不在此 assert 范围内) 已正确表达 "rollout engine fit within one node"; multi-node DP (rollout engines 跨节点, 每个 node-local) M11.1 OK; cross-node rollout engine (intra-engine sharding 跨节点拼) **not in scope (no later milestone re-enables it)**. 不引入冗余 `actor_num_nodes == 1` assert / **M7 `assert not args.async_save`**) + resize_infer + expand+selective sync + `_before_training(step)` hook (`_request_cluster_gpus(actor_train, ACTOR_TRAINING, global_step=step)` + `actor_train.onload()`; 每 step 必调一次, 包括 step 0 — init 末尾已 offload, ROLL strategy auto-wake 在 MILES `RayTrainGroup` 不存在; partial actor_train allocation INVALID, fail-fast `set(allocated)==set(declared)`) + `_after_training(step)` hook (调用 `version = ray.get(coordinator.sync_base_weights_to_active.remote(step))` **显式传 step**, coordinator 在 `_resize_sync_lock` 内同步更新 `_cache_ready_step` 与 service.sync 是同一原子操作, 避免 stale version label → `self._current_weight_version = version` → `notify_release_cluster_gpus(actor_train)`; **不再调 `publish_cache_ready_step`** (sync_base_weights_to_active 已在 lock 内更新 coordinator state); **不直接调用 `_finalize_weight_update` / `rollout_manager.set_weight_version`** — service.sync_selected_workers atomic unit 内含, 见 F5+6 ownership 表 + Sequence diagram) + `_init_lock: threading.Lock` 字段 + init bootstrap **sync def + `run(coro)`** (不 async, 避免半 async/sync 阻塞 event loop) **新顺序 (RLix scheduler 在 Phase 5 执行 `resize_infer(add)` RPC 早于 Phase 6 signal pending GEN waiter; 因此 RolloutManager + service resources + base version + bootstrap MUST 全部 6.6 完成于 Step 7 之前)** (Step 1 request train → Step 1b RayTrainGroup ctor with `worker_placements=` and `num_gpus_per_actor=0.01`, **RLix path 显式 `local_rank=0` per actor** → Step 2 `run(actor_train.init())` → Step 3 `run(actor_train.onload())` → Step 4 `run(actor_train.build_cpu_bucket_cache(step=-1))` (M2 fan-out, 不 driver-local) → Step 5 `run(actor_train.offload())` → **Phase 1 finally: `_notify_release_cluster_gpus(actor_train)`** (本地方法, NOT `.remote()`; 释放 scheduler-side allocation 让 Pipeline B Gate 4 拿得到 train) → Step 6.5 `run(actor_train.collect_cache_owner_roles())` 收 cache_owner_actor handle (M2) → **Step 6.6a `provider.get_all_rollout_engine_placements()`** (declared 全表, length engine_count, no scheduler interaction) → **Step 6.6b `RolloutManager.options(...).remote(args, all_engine_placements=..., active_engine_indices=frozenset())`** (all-shell ctor; **starts empty Miles router immediately**, binds per-pipeline `args.sglang_router_ip/port`; 不 spawn SGLang actors) → **Step 6.6c `get_engine_count()` sanity** (== len(declared), 包含 shell slots) → **Step 6.6d `coordinator.register_model_update_resources(cache_owner_actor, rollout_manager)`** (lazy service ctor args) → **Step 6.6e `coordinator.publish_cache_ready_step(-1)`** (init Step 4 已 build base cache; v=-1 short-circuit 路径不读 cache bytes 但需 version 标签; 必须在 Step 7 前发布) → **Step 6.6f `coordinator.bootstrap_active_engines(frozenset())`** (空集 bootstrap 合法; coordinator `_active_engines_bootstrapped: bool` flag 翻 True; `_active_engine_indices` 由 _expand_workers 在 Step 7 期间填充) → **Step 7 `_request_cluster_gpus(actor_infer, GENERATION)`** (期间 scheduler 调 `coordinator.resize_infer(dp_ranks_to_add=...)` 触发 `_expand_workers`: shell→loading lazy `_create_sglang_actor` + onload from `args.hf_checkpoint` → service.sync v=-1 short-circuit (no transport, no finalize, only `manager.set_weight_version(-1)`) → `manager.activate_routing` (loading→active + add_worker); 然后 Step 7 request 才返回) → **Step 7.1 M1 subset assert** `set(allocated) ⊆ set(declared)` + log `is_partial_allocation` (Gate 4 多 pipeline contention 必经路径) → **Step 7.2** `active_engine_indices = self._placement_provider.get_active_engine_indices(allocated_gpus, tp_size)` (frozenset, half-engine raise; provider 端 logic, 不在 pipeline 端复刻) → **Step 7.3 consistency assert** `coordinator.get_active_engines() == active_engine_indices` (验证 _expand_workers 填充与 pipeline 派生一致) → except (Phase 2 cleanup scope = Step 6.5 + Step 6.6a-f + Step 7 + Step 7.1-7.3): **M4 hard cleanup** order = `ray.kill` train actors (覆盖 Phase 1 finally 因 `train_init_succeeded=True` 而保留, 但 Phase 2 失败必须连带清) → `actor_infer.shutdown_hard.remote()` w/ 10s timeout + `ray.kill` actor_infer (manager 在 6.6b 后存在, 失败必须清) → conditional `_notify_release_cluster_gpus(infer)` (gated by `actor_infer_allocated` bool flag, 仅在 Step 7 successful return 后置 True) + raise) + `_get_coordinator_handle()` lazy resolver (复用 ROLL pattern) + bundle mapping consume `MilesPlacementProvider.get_train_workers` for actor_train + `get_all_rollout_engine_placements` (declared 全表) + `get_active_engine_indices(allocated_gpus, tp_size)` for actor_infer (active subset under partial allocation, frozenset) + **缓存 register_pipeline 时声明的 `train/infer_device_mapping`** (从 args 派生, 同时传给 scheduler `register_pipeline` + `MilesPlacementProvider.__init__`, 单一 source of truth, 不在 provider 内重新派生) + **F10 startup fail-fast (Fix #14)**: RLix mode `assert args.load is None or args.load == args.hf_checkpoint` AND `assert args.ref_load is None or args.ref_load == args.hf_checkpoint` (resume / 非等价 ref_load 会让 v=-1 no-transport 路径服 stale weights; 真正的 CPU-only base sync 是 follow-up) | +680 |
-| `rlix/pipeline/miles_coordinator.py` (**新增**) | F3, F5+6, F7, F9 | `class MilesCoordinator(Coordinator)` — **不 subclass `PipelineCoordinator`, 不 call super().__init__** (避免触发 ROLL `_validate_config_schema` / `_validate_cpu_only_reward` / `_validate_vllm_sleep_level` / `_validate_offload_nccl` 4 个吃 ROLL config 字段 validator, MILES args 没这些字段). **手动 init**: `_pipeline_id`, `_ray_namespace`, `_pipeline_env_vars`, `_resource_manager_proxy` (singleton, 注入给 placement provider), `_resize_sync_lock`, `_progress_lock`, `_scheduler_reports`, `_coord_progress_last_bucket`, `_active_engine_indices: Set[int]` (init = `set()`), **`_active_engines_bootstrapped: bool` (init = False; flips True on first `bootstrap_active_engines`, used to detect double-bootstrap including empty-set bootstrap)**, `_cache_ready_step: Optional[int]` (init = None), `_rlix_scheduler` actor handle, `_model_update_service` lazy slot, `_model_update_resources` (cache_owner_actor + rollout_manager handles). **复制并适配** (不继承): `report_progress_from_scheduler` / `clear_progress_stream` / `_aggregate_and_emit` / `_inject_pipeline_env_vars` 4 个 backend-neutral 方法. **必须实现 Coordinator ABC abstract `sync_lora_weights`** (LoRA out of scope, raise unsupported stub, 否则 ABC 实例化 TypeError). **新增**: `bootstrap_active_engines(engine_indices: Set[int])` (允许空集; 由 `_active_engines_bootstrapped` flag detect double-call, 不靠 set 真值), **`get_active_engines() -> frozenset[int]`** (read-only snapshot for pipeline Step 7.3 consistency check), **`publish_cache_ready_step(step: int)` — 仅 init bootstrap 用, 发布 base 版本 -1 (Pipeline B 在 first after_training 之前可能就被 expand). active refresh path 不再调用此 RPC, sync_base_weights_to_active 已在 lock 内更新 coordinator state**, **M2 P0-1 `register_model_update_resources(*, cache_owner_actor, rollout_manager)` — 缓存 sender Megatron actor handle + receiver RolloutManager handle 进 `_model_update_resources`, lazy-init `MilesModelUpdateService` 时取出 (避免 init bootstrap 多一次 ray.get 创建 service)**, **`sync_base_weights_to_active(step: int) -> int`** (**signature 必须显式接收 step, 否则 coordinator 用 stale `_cache_ready_step` 给 service 推 version inversion**; 在 `_resize_sync_lock` 内同步操作: `self._cache_ready_step = step` → `service.sync_selected_workers(sync_id, _active_engine_indices, step)` (lazy 构造 service 若未创建); 返回 step. 退化拓扑 active set 为空时也更新 `_cache_ready_step` 后短路返回, 保证 coordinator state 始终最新), `resize_infer` / `_expand_workers` (**guard: `_cache_ready_step is not None`, raise if violated**; first build identity 拓扑, scheduler dp_rank == MILES engine_index, 调 `manager.expand_engines(...)` → `service.sync_selected_workers(sync_id, target, version)` → `manager.activate_routing(...)`; 非连续 mapping 解禁时引入 `MilesPlacementProvider.scheduler_to_engine` 双向 lookup, follow-up), `create_pipeline_actor(*, pipeline_config)` 创建 `MilesPipeline` actor. **`_active_engine_indices` 字段类型: `Set[int]`** | +280 |
-| `rlix/pipeline/miles_model_update_service.py` (**新增**) | F4, F5+6 | 简化版 ModelUpdateService — **M11.1 实现一条 colocate transport `cpu_serialize`** (新 SGLang admin route `/update_weights_from_cpu_bucket` + tmpfs `/dev/shm` file path, 见 §F4 §B Case B) + **dynamic NCCL group 生命周期 (non-colocate broadcast, partial overlap 必需)** + 单槽 versioning + warmup allreduce + port claim 释放 (happy path 无条件回 pool; 不处理 receiver crash 容错) + **cache owner 由 init 阶段 worker `report_cache_owner_role.remote()` 上报, 不在 sync 路径运行时查询** + **M2: `__init__` 加 `cache_owner_actor` 参数 + `rollout_manager` 参数 (Megatron worker actor handle + RolloutManager handle), sender 走 single composite RPC `cache_owner_actor.run_sync_session(plan: SyncSessionPlan).remote()`** (Fix #6 — 替代之前的 5 个 split sender RPCs `serialize_bucket_to_objref / setup_collective_group / broadcast_bucket / destroy_collective_group / get_bucket_count`. 后者降级为 cache_owner 内部 helpers, 不再是 top-level Ray methods. `_cache_lock` 在 `run_sync_session` 单 method 内持有, 不跨 RPC.) + **`sync_selected_workers(sync_id, target_engines: Set[int], version: int) -> int` atomic unit**: 入口先 `handles = ray.get(rollout_manager.get_engine_handles.remote(target_engines))` (Fix #5 — service 调 manager 的 read-only entry, 拿 per-engine receiver handle); 然后 dispatch: **`if version == -1`** (Fix #13+#15): 跳过 (a)/(b)/run_sync_session, 只跑 (c) `manager.set_weight_version(-1, target_engines)` 后 return -1 (target engines 已通过 SGLang `onload()` 从 `args.hf_checkpoint` 加载 base, 无需 transport, 无需 finalize); **`else`**: build `SyncSessionPlan(sync_id, version, group_name, master_addr, master_port, timeout_s, target_handles=handles, cpu_serialize_local_ranks={…}, broadcast_local_ranks={…}, comm_ranks={…})` → 单次 `cache_owner_actor.run_sync_session(plan).remote()` 完成 (a) per-bucket transport (per-bucket payload **不携带 weight_version**, Fix #3) → 然后 service 跑 (b) `[h.finalize_weight_update.remote() for h in handles.values()]` fan-out → (c) `manager.set_weight_version.remote(version, engine_indices=target_engines)`; 整个 atomic unit wrap in 单次 `asyncio.wait_for(timeout=ROLL_SELECTIVE_MODEL_UPDATE_TIMEOUT_S)`, **不新增 MILES timeout env var**; pipeline / coordinator 不直接调 finalize 或 manager-level set_weight_version. **service-manager 关系**: service 调 manager 限于 `get_engine_handles` (read-only at sync entry) + `set_weight_version` (single write at sync exit); manager 从不调 service. + `master_port` 由 service `get_free_port()` + `SharedStorage MASTER_ADDR_PORT:*` claim 决定后传给 sender + 所有 receiver (禁 `master_port=0`) + `sync_id` 参数 + init bootstrap step=-1 path. **M11.6 加**: `cuda_ipc` colocate adapter (CPU cache → H2D staging → IPC handle), ~50-80 行 | +290 |
+| `rlix/pipeline/miles_pipeline.py` (**新增**) | F5+6, F8, F10, F11, F12 | `MilesPipeline` actor — registration + validation (F10 含 single_updateable / EP fail-fast / stream / bucket-size / **`assert args.offload_train`** / **`rollout_num_gpus % rollout_num_gpus_per_engine == 0`** / **M11.1 RLix mode 强制 `model_update_transport == "cpu_serialize"`** (vast.ai 受限容器, cuda_ipc → M11.6) / cross-node rollout-engine 拒收 / M7 `assert not args.async_save`) + resize_infer + expand+selective sync + `_before_training(step)` hook (`_request_cluster_gpus(actor_train, ACTOR_TRAINING, global_step=step)` + `actor_train.onload()`; partial actor_train allocation INVALID, fail-fast `set(allocated)==set(declared)`) + `_after_training(step)` hook (`coordinator.sync_base_weights_to_active(step)` 在 `_resize_sync_lock` 内同步更新 `_cache_ready_step` 与 service.sync; pipeline 不直接调用 finalize / `set_weight_version`) + `_init_lock: threading.Lock` 字段 + init bootstrap method: Step 1 request train → Step 2/3 init+onload → Step 4 `build_cpu_bucket_cache(step=-1)` → Step 5 train offload/release → Step 6.5 collect cache owner → Step 6.6 create all-shell RolloutManager + register resources + `publish_cache_ready_step(-1)` + empty active bootstrap → Step 7 request actor_infer full INIT; scheduler `resize_infer(add=all)` creates/onloads all SGLang engines then `finish_init_offload` drops weights/KV/graph; **no service.sync, no set_weight_version, no activate_routing during INIT**; Step 7.1 full assert, Step 7.2 active-empty derivation, Step 7.3 consistency assert; runtime GENERATION expand later runs `service.sync_selected_workers(..., version=-1)` before `activate_routing` if before first after_training; cleanup covers train + infer actors and scheduler release. No startup fail-fast tying `args.load/ref_load` to `args.hf_checkpoint`: base correctness comes from CPU bucket sync at runtime expand, not checkpoint equivalence. | +660 |
+| `rlix/pipeline/miles_coordinator.py` (**新增**) | F3, F5+6, F7, F9 | `class MilesCoordinator(Coordinator)` — **不 subclass `PipelineCoordinator`, 不 call super().__init__** (避免触发 ROLL `_validate_config_schema` / `_validate_cpu_only_reward` / `_validate_vllm_sleep_level` / `_validate_offload_nccl` 4 个吃 ROLL config 字段 validator, MILES args 没这些字段). **手动 init**: `_pipeline_id`, `_ray_namespace`, `_pipeline_env_vars`, `_resource_manager_proxy` (singleton, 注入给 placement provider), `_resize_sync_lock`, `_progress_lock`, `_scheduler_reports`, `_coord_progress_last_bucket`, `_active_engine_indices: Set[int]` (init = `set()`), **`_active_engines_bootstrapped: bool` (init = False; flips True on first `bootstrap_active_engines`, used to detect double-bootstrap including empty-set bootstrap)**, `_cache_ready_step: Optional[int]` (init = None), `_rlix_scheduler` actor handle, `_model_update_service` lazy slot, `_model_update_resources` (cache_owner_actor + rollout_manager handles). **复制并适配** (不继承): `report_progress_from_scheduler` / `clear_progress_stream` / `_aggregate_and_emit` / `_inject_pipeline_env_vars` 4 个 backend-neutral 方法. **必须实现 Coordinator ABC abstract `sync_lora_weights`** (LoRA out of scope, raise unsupported stub, 否则 ABC 实例化 TypeError). **新增**: `bootstrap_active_engines(engine_indices: Set[int])` (允许空集; 由 `_active_engines_bootstrapped` flag detect double-call, 不靠 set 真值), **`get_active_engines() -> frozenset[int]`** (read-only snapshot for pipeline Step 7.3 consistency check), **`publish_cache_ready_step(step: int)` — 仅 init bootstrap 用, 发布 base 版本 -1 (Pipeline B 在 first after_training 之前可能就被 expand). active refresh path 不再调用此 RPC, sync_base_weights_to_active 已在 lock 内更新 coordinator state**, **M2 P0-1 `register_model_update_resources(*, cache_owner_actor, rollout_manager)` — 缓存 sender Megatron actor handle + receiver RolloutManager handle 进 `_model_update_resources`, lazy-init `MilesModelUpdateService` 时取出 (避免 init bootstrap 多一次 ray.get 创建 service)**, **`sync_base_weights_to_active(step: int) -> int`** (**signature 必须显式接收 step, 否则 coordinator 用 stale `_cache_ready_step` 给 service 推 version inversion**; 在 `_resize_sync_lock` 内同步操作: `self._cache_ready_step = step` → `service.sync_selected_workers(sync_id, _active_engine_indices, step)` (lazy 构造 service 若未创建); 返回 step. 退化拓扑 active set 为空时也更新 `_cache_ready_step` 后短路返回, 保证 coordinator state 始终最新), `resize_infer` / `_expand_workers` (**guard: `_cache_ready_step is not None`, raise if violated**; first build identity 拓扑, scheduler dp_rank == MILES engine_index; **dispatch on target entry state read from `manager.get_engine_states`**: INIT branch (entry state `shell`) = `manager.expand_engines(...)` → `manager.finish_init_offload(...)`, no service / routing / active-set update; Runtime branch (entry state `offloaded`) = `manager.expand_engines(...)` → `service.sync_selected_workers(sync_id, target, version=_cache_ready_step)` → `manager.activate_routing(...)` → `_active_engine_indices |= set(target)`; 异构 entry state raise; 非连续 mapping 解禁时引入 `MilesPlacementProvider.scheduler_to_engine` 双向 lookup, follow-up), `create_pipeline_actor(*, pipeline_config)` 创建 `MilesPipeline` actor. **`_active_engine_indices` 字段类型: `Set[int]`** | +280 |
+| `rlix/pipeline/miles_model_update_service.py` (**新增**) | F4, F5+6 | 简化版 ModelUpdateService — **M11.1 实现一条 colocate transport `cpu_serialize`** (新 SGLang admin route `/update_weights_from_cpu_bucket` + tmpfs `/dev/shm` file path, 见 §F4 §B Case B) + **dynamic NCCL group 生命周期 (non-colocate broadcast, partial overlap 必需)** + 单槽 versioning + warmup allreduce + port claim 释放 (happy path 无条件回 pool; 不处理 receiver crash 容错) + **cache owner 由 init 阶段 worker `report_cache_owner_role.remote()` 上报, 不在 sync 路径运行时查询** + **M2: `__init__` 加 `cache_owner_actor` 参数 + `rollout_manager` 参数 (Megatron worker actor handle + RolloutManager handle), sender 走 single composite RPC `cache_owner_actor.run_sync_session(plan: SyncSessionPlan).remote()`** (Fix #6 — 替代之前的 5 个 split sender RPCs `serialize_bucket_to_objref / setup_collective_group / broadcast_bucket / destroy_collective_group / get_bucket_count`. 后者降级为 cache_owner 内部 helpers, 不再是 top-level Ray methods. `_cache_lock` 在 `run_sync_session` 单 method 内持有, 不跨 RPC.) + **`sync_selected_workers(sync_id, target_engines: Set[int], version: int) -> int` atomic unit**: 入口先 `handles = ray.get(rollout_manager.get_engine_handles.remote(target_engines))` (Fix #5 — service 调 manager 的 read-only entry, 拿 per-engine receiver handle); 然后 build `SyncSessionPlan(sync_id, version, group_name, master_addr, master_port, timeout_s, target_handles=handles, cpu_serialize_local_ranks={…}, broadcast_local_ranks={…}, comm_ranks={…})` → 单次 `cache_owner_actor.run_sync_session(plan).remote()` 完成 (a) per-bucket transport from CPU bucket (per-bucket payload **不携带 weight_version**, Fix #3; `version == -1` uses the init-built base bucket) → 然后 service 跑 (b) `[h.finalize_weight_update.remote() for h in handles.values()]` fan-out → (c) `manager.set_weight_version.remote(version, engine_indices=target_engines)`; 整个 atomic unit wrap in 单次 `asyncio.wait_for(timeout=ROLL_SELECTIVE_MODEL_UPDATE_TIMEOUT_S)`, **不新增 MILES timeout env var**; pipeline / coordinator 不直接调 finalize 或 manager-level set_weight_version. **service-manager 关系**: service 调 manager 限于 `get_engine_handles` (read-only at sync entry) + `set_weight_version` (single write at sync exit); manager 从不调 service. + `master_port` 由 service `get_free_port()` + `SharedStorage MASTER_ADDR_PORT:*` claim 决定后传给 sender + 所有 receiver (禁 `master_port=0`) + `sync_id` 参数 + init bootstrap step=-1 path. **M11.6 加**: `cuda_ipc` colocate adapter (CPU cache → H2D staging → IPC handle), ~50-80 行 | +290 |
 | `rlix/pipeline/miles_hooks.py` (**新增**) | F9 | `MilesRLixHooks` 实现 `RLixHooks` protocol — 把 `report_progress(collected, bucket, ...)` 等 plain kwargs 打包成 `ProgressReport(metrics={...})` fire-and-forget 给 `coordinator.report_progress_from_scheduler.remote(...)`; `clear_progress` 转 `coordinator.clear_progress_stream`. RLix-side import seam, MILES side 不依赖 | +50 |
 
 ### 测试
@@ -4160,7 +4202,7 @@ admission_epoch race, orchestrator cleanup, graceful actor drain.
 
 第八轮简化 pass 砍掉 ~335 行防御性工程:
 - F3 router admission_epoch race 防御 + epoch start/end 比对: -50 (follow-up)
-- fully_async _fatal_error flag 双路径 (queue sentinel 单路径已足够): -20
+- fully_async `_fatal_error` flag 双路径: -20 (forbidden per A6 — see §3.1 Layer 1; queue sentinel single-path is the final design, no future milestone re-introduces this)
 - F12 round-trip identity self-check (first build contiguous identity 永远 pass): -15
 - F1 coordinator-side NCCL teardown ack verification (actor.py:58 已无条件挂): -10
 - F4 cuda_ipc Case A 详细描述折叠到 follow-up (RLix mode 不走): -20
@@ -4226,9 +4268,10 @@ Week 3: Feature 8-12 — RLix 适配
 
 Week 4: 打磨 + post-MVP M11.2 happy path
   ├── Day 1-3: 文档、edge case、单 pipeline 稳定性回归
-  └── Day 4-5: M11.2 happy path Gate 4 (c) + (d) + (e) (双 pipeline shell partial
-              allocation; admission_epoch / cleanup safety / graceful drain 不在本
-              scope, 各自 follow-up)
+  └── Day 4-5: M11.2 happy path Gate 4 (c) + (d) + (e) + (f) (双 pipeline 全量 INIT
+              + offload, runtime GENERATION expand-with-bucket-sync, donor-shrink
+              ordering, router 0-active suspend; admission_epoch / cleanup safety /
+              graceful drain 不在本 scope, M11.5 follow-up)
 ```
 
 ---
@@ -4240,7 +4283,6 @@ Week 4: 打磨 + post-MVP M11.2 happy path
 - parity gate 绑定 `examples/fully_async` 外层 +
   `miles.rollout.generate_hub.multi_turn.generate` custom path +
   `--max-weight-staleness`；不再增加其他 example 作为当前 milestone gate。
-- selective P2P weight transfer 不在当前 milestone 内；已放入 Implementation follow-up。
 - 直接新建 `miles_coordinator.py`，不抽 `base_coordinator.py`；当第 3 个 backend 接入时
   再抽 backend-neutral base coordinator。
 - F3 router metadata：Miles Router 在 JSON response 的 `meta_info` 注入
@@ -4262,6 +4304,48 @@ Week 4: 打磨 + post-MVP M11.2 happy path
 - 是否创建 `rlops/miles` 社区 fork 作为 framework-side hook 落地位置。这是 repo
   ownership / 协作流程决策，不影响 implementation spec；默认先落在当前 MILES 工作树，
   最终归属由 repo owner 决定。
+
+### Audit Checkpoints (M8 actor concurrency — C1 evidence-based decision)
+
+C1 — `MilesPipeline` actor `max_concurrency` (tentatively `2`) is **NOT pre-decided**.
+F11 line ~3197-3208 describes a *risk model* (ring deadlock if inbound monitor RPC
+queues behind blocking main loop), but does not enumerate the actual inbound RPC surface
+nor prove the inbound methods are read-only and reentrancy-safe with the long-running
+control path. Pre-checking `max_concurrency=2` would freeze a possibly-imaginary
+concurrency requirement and create real reentrancy bug surface. Both checkboxes start
+unchecked; decision happens during execution:
+
+- [ ] **M8 actor concurrency — Phase 1 (plan-layer)**: surveyed source plan + TLDR for
+  `MilesPipeline` inbound RPC; verified (i) read-only + non-reentrant evidence OR
+  (ii) all-short-control evidence. Decision recorded:
+  ☐ keep `max_concurrency=2` (with read-only invariant doc)
+  / ☐ revert to `max_concurrency=1` (reclassify C1 as A20).
+- [ ] **M8 actor concurrency — Phase 2 (post-implementation)**: re-surveyed
+  `rlix/pipeline/miles_pipeline.py` actual code; either confirms Phase 1 OR surfaces
+  divergence requiring re-decision.
+
+### Examined-boundary candidates (X1–X3) — explicitly KEPT after audit
+
+These three items LOOK like over-engineering on a casual read but each is load-bearing
+or zero-cost. Recording them so future audit passes don't trim them by accident:
+
+- **X1 — `mode` / `adapter_id` nullable fields in `begin_progress_batch`** (Feature 9 /
+  fully_async_rollout.py): forward-compat with M11.4 LoRA multi-stream (V5); nullable
+  parameter is zero runtime cost; deleting now and re-adding in M11.4 breaks
+  `RLixHooks` protocol signature for standalone `NoOpRLixHooks` callers. Wire-protocol
+  form, not over-engineering.
+- **X2 — `MilesCoordinator.register_model_update_resources(*, cache_owner_actor,
+  rollout_manager)` lazy-init handle caching** (M2 P0-1): establishes service-manager
+  handle ownership boundary (handles passed in by ctor, NOT looked up via
+  `ray.get_actor` in service body). Architectural invariant, not perf optimization.
+- **X3 — `MilesCoordinator._active_engines_bootstrapped` flag for double-bootstrap
+  detection**: under the M11.2 full-INIT model, `bootstrap_active_engines` is
+  **always** called with `frozenset()` (every pipeline init publishes empty
+  active set; the runtime grant later populates `_active_engine_indices` via
+  `_expand_workers`). Set truthiness therefore has no signal at all —
+  `bool(self._active_engine_indices)` stays `False` after a legitimate first
+  bootstrap, indistinguishable from "never bootstrapped". The explicit flag is
+  the **sole** double-bootstrap detector. One bool's cost for one detectable bug.
 
 ### 主要风险
 
@@ -4350,14 +4434,13 @@ Week 4: 打磨 + post-MVP M11.2 happy path
 |---|---|
 | 抽 `rlix/pipeline/coordinator.py` 的 backend-neutral hook（base coordinator） | 当第 3 个 backend（NeMo / 新 framework）port 到位、共享逻辑足够清晰时 |
 | MoE / EP support — `get_expert_tensor_parallel_group()` 等 | 当业务方启用 MoE 模型且需要 RLix 调度时；预计是中等改动（~200-400 行 + 专门 MoE parity gate），不是当前 plan 的小补丁 |
-| Selective P2P weight transfer | 当 broadcast/tensor subset sync 成为吞吐瓶颈时 |
 | **M11.5** Receiver crash 容错（fault-tolerant port 管理 + conditional leak + 周期性 GC） | 当生产观察到 receiver crash 导致 master_port collision，或 selective sync 失败率非 zero 时 |
 | 非连续 / 自定义顺序 `infer_device_mapping` adapter | 当需要跨机/非连续 GPU 或自定义 engine ordering 时；实现 `scheduler_dp_rank -> miles_engine_index -> gpu_ids` 显式映射 |
 | `partial_rollout + radix_tree` compatibility | 当 RLix 主路径稳定后；需要 scheduler-preempt abort 透传、prefix-cache 污染防护与 sample 状态回滚 |
 | **M11.5** Cleanup API graceful path (`RolloutManager.shutdown` + `RayTrainGroup.shutdown` + `__init__` self-cleanup + 30s timeout + force-kill fallback + dispose finally) | 当 multi-pipeline 共节点 cleanup race 实际触发, 或单 pipeline 失败 cleanup 时长 unacceptable; ~150 行 |
-| **M11.2** 多 pipeline orchestrator-driven cleanup (Gate 4 dual-pipeline 同 milestone) | orchestrator 接管 pipeline-level 隔离, 单 pipeline crash 不影响别的; 需要 namespace-scoped actor enumeration + selective `ray.kill` (避免 `ray stop` 杀掉别的 healthy pipeline). M11.1 Gate 1-3 单 pipeline 用户 shell `ray stop` 即可 |
+| **M11.5** 多 pipeline orchestrator-driven selective namespace cleanup (production hardening, NOT Gate 4 pass criterion) | orchestrator 接管 pipeline-level 隔离, 单 pipeline crash 不影响别的; 需要 namespace-scoped actor enumeration + selective `ray.kill` (避免 `ray stop` 杀掉别的 healthy pipeline). M11.1/M11.2 Gate 1-4 recovery is manual `ray stop` (§6.2); minimal hard cleanup per §3.2 B2 |
 | **M11.6 cuda_ipc colocate adapter** (CPU cache → per-bucket H2D staging → IPC handle serialize, ~50-80 行) + smoke-test capability check (不写脆弱 heuristics) | M11.1 → M11.6 (production colocate transport, after M11.5 hardening) |
-| **M11.2** router `admission_epoch` race 防御 (start/end epoch 比对消除 disable→abort→enable race) | production 多 pipeline 高频 shrink/expand 触发 false negative; M11.1 turn retry 兜底, race window ms 级 single-pipeline 拓扑不发生 |
+| **M11.5** router `admission_epoch` race 防御 (start/end epoch 比对消除 disable→abort→enable race) | production 多 pipeline 高频 shrink/expand 触发 false negative; M11.1/M11.2 turn retry 兜底, race window ms 级 single-pipeline 拓扑不发生; 不是 Gate 4 pass criteria |
 | F12 identity round-trip self-check + dp_rank ↔ engine_index 双向 lookup table | 当解禁非连续 / 自定义顺序 `infer_device_mapping` 时; first build contiguous 拓扑下 identity 永远 pass, 是 dead assert |
 | Plasma true zero-copy adapter (cpu_serialize) | Receiver-side bucket copy 成 RAM 瓶颈 (chunk_size_mb 不足以兜住, 多 pipeline 多 receiver 累计); memoryview-backed file-like reader + `np.ndarray[uint8]` / `torch.ByteTensor` (避免 `.tobytes()` deep copy) + 实测验证 |
 | **M11.5** NCCL port cooldown queue / port pool TIME_WAIT mitigation | EADDRINUSE retry 仍频繁失败 (cluster 高频 resize); port pool + TIME_WAIT cooldown |
@@ -4368,6 +4451,5 @@ Week 4: 打磨 + post-MVP M11.2 happy path
 | Router `do_proxy except` 扩 (KeyError/AttributeError/TypeError) | router metadata parse 异常 (data 不是 dict 时 setdefault 抛 AttributeError); except clause 扩成 `(JSONDecodeError, KeyError, AttributeError, TypeError)` |
 | **M11.5** 5xx → preempt synthesis | engine crash mid-abort 实测 (router fail-fast 上抛 RLixRouterMetadataError 不够; scheduler 重排); 5xx 路径 synthesize preempt sentinel |
 | **M11.5** SGLang ingress 503 middleware | TCP/FastAPI race in abort-drain-sleep 实测复现; SGLang 端 ingress middleware 在 sleeping 状态返回 503, 替代 `assert is_fully_idle()` fail-fast 兜底 |
-| **M11.2** `MilesPipeline` graceful actor drain (替代 `ray.kill`) | multi-pipeline cleanup race (Gate 4 dual-pipeline 同 milestone); `actor.shutdown()` RPC + force-kill timeout 替代 hard `ray.kill` |
+| **M11.5** `MilesPipeline` graceful actor drain (替代 `ray.kill`) | production hardening, NOT Gate 4 pass criterion; M11.1/M11.2 MVP cleanup per §3.2 B2 = terminate tracked Ray actors AND SGLang server process tree, no graceful drain; M11.5 加 `actor.shutdown()` RPC + force-kill timeout |
 | Non-contiguous / 自定义 `infer_device_mapping` 下的 partial allocation 反推 | M11.2 first build assumes contiguous mapping (`infer_device_mapping.index(g) // tp_size` 派生 active engine_idx); 解禁非连续映射时需 `MilesPlacementProvider.scheduler_to_engine` 双向 lookup, 与 follow-up "非连续 / 自定义顺序 `infer_device_mapping` adapter" 同里程碑 |
-| **M11.2 follow-up**: CPU-only base sync at `version=-1` for resume / non-equivalent ref_load | M11.2 Gate 4 happy path 用 Fix #14 fail-fast 拒绝 resume 配置 (`args.load`/`args.ref_load` ⊆ {None, args.hf_checkpoint}). 解禁需 service `sync_selected_workers(..., -1)` 实现 CPU-only push from `build_cpu_bucket_cache(step=-1)` bytes through receiver `update_weights_from_cpu_bucket` (NOT NCCL broadcast — broadcast 仍需 sender GPU 而 init Step 6 已 release train); 所有 targets 强制走 cpu_serialize 不论 transport 配置. ~30 行 service spec 改动. 解锁后可 drop F10 fail-fast |

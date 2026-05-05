@@ -269,6 +269,21 @@ class MilesPipeline:
         # silently mis-route under multi-pipeline contention.
         from miles.ray.placement_group import _create_placement_group
 
+        # ROLL ResourceManagerProxy owns a node-PG that pins all GPUs at
+        # startup. Phase A's train actors are gone; the PG still holds the
+        # GPUs, so the next placement_group() call would block forever. Tell
+        # the coordinator to release it before we ask for the inference PG.
+        logger.info("[MilesPipeline] phaseB step2a: remove_resource_manager_node_pg start")
+        removed = bool(
+            ray.get(
+                self._coordinator_handle.remove_resource_manager_node_pg.remote()
+            )
+        )
+        logger.info(
+            "[MilesPipeline] phaseB step2a: remove_resource_manager_node_pg done removed=%s",
+            removed,
+        )
+
         logger.info("[MilesPipeline] phaseB step2: _create_placement_group start")
         pg, reordered_bundle_indices, reordered_gpu_ids = _create_placement_group(
             int(miles_args.rollout_num_gpus)

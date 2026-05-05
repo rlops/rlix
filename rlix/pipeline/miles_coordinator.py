@@ -492,6 +492,38 @@ class MilesCoordinator(Coordinator):
         with self._resize_sync_lock:
             self._active_engine_indices |= set(engine_indices)
 
+    def remove_resource_manager_node_pg(self) -> bool:
+        """Best-effort remove the ROLL ResourceManagerProxy's node-PG.
+
+        ROLL pins all GPUs on the node into a single-bundle PG at startup so
+        Phase A train-actor placements can be derived from it. After Phase A
+        releases its actors, the PG keeps holding the GPUs from Ray's view,
+        which blocks miles' Phase B `_create_placement_group` (which builds
+        a fresh per-GPU bundle PG against the "free" pool). Removing the
+        node-PG here unblocks Phase B; safe because train actors are gone.
+
+        Returns True if a PG was actually removed.
+        """
+        pg = self._resource_manager_node0_pg
+        if pg is None:
+            return False
+        try:
+            ray.util.remove_placement_group(pg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "remove_resource_manager_node_pg: ray.util.remove_placement_group "
+                "failed: %r",
+                exc,
+            )
+            return False
+        self._resource_manager_node0_pg = None
+        if self._resource_manager_proxy is not None:
+            try:
+                self._resource_manager_proxy.node2pg.pop(0, None)
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
     def create_pipeline_actor(self, *, pipeline_config: Any) -> Any:
         """Create / return the per-pipeline MilesPipeline actor."""
         if self._pipeline_actor is not None:
@@ -501,8 +533,21 @@ class MilesCoordinator(Coordinator):
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
         injected_config = self._inject_pipeline_env_vars(pipeline_config=pipeline_config)
+        # MILES_SKIP_NODE_PG_PIN=1 (smoke escape): when the ROLL ResourceManager
+        # owns the only node-PG and Phase B needs to remove it to free GPUs for
+        # the inference PG, the MilesPipeline must NOT be pinned to that PG —
+        # otherwise removing the PG would kill the pipeline mid-init. We also
+        # drop num_gpus to 0 in this mode because the node-PG is holding all
+        # GPUs and an unpinned actor with num_gpus=0.01 would block forever
+        # waiting for a free fractional slice.
+        import os as _os
+
         scheduling_strategy = None
-        if self._resource_manager_node0_pg is not None:
+        skip_pg_pin = _os.environ.get("MILES_SKIP_NODE_PG_PIN") == "1"
+        if (
+            self._resource_manager_node0_pg is not None
+            and not skip_pg_pin
+        ):
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=self._resource_manager_node0_pg,
             )
@@ -514,7 +559,7 @@ class MilesCoordinator(Coordinator):
             max_task_retries=0,
             max_concurrency=_MILES_PIPELINE_ACTOR_MAX_CONCURRENCY,
             runtime_env={"env_vars": self._pipeline_env_vars},
-            num_gpus=0.01,
+            num_gpus=0 if skip_pg_pin else 0.01,
         )
         if scheduling_strategy is not None:
             options["scheduling_strategy"] = scheduling_strategy

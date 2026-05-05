@@ -26,16 +26,18 @@ from typing import Any, Dict, List, Optional, Set, TypeVar
 import ray
 
 from rlix.protocol.coordinator import Coordinator
-from rlix.protocol.constants import (
+from rlix.protocol.types import (
+    ACTOR_TRAIN_CLUSTER_NAME,
+    ActionResponse,
+    GENERATION_CLUSTER_NAME,
     PIPELINE_ACTOR_NAME_PREFIX,
+    ProgressReport,
     RLIX_NAMESPACE,
     SCHEDULER_ACTOR_NAME,
-    SYSTEM_ENV_PIPELINE_ID,
-    SYSTEM_ENV_RAY_NAMESPACE,
     get_pipeline_namespace,
 )
-from rlix.protocol.types import ActionResponse, ProgressReport
 from rlix.protocol.validation import validate_pipeline_id
+from rlix.utils.env import pipeline_identity_env_vars
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
@@ -51,15 +53,16 @@ _MILES_PIPELINE_ACTOR_MAX_CONCURRENCY: int = 2
 
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
-    """Mirror PipelineCoordinator._build_pipeline_env_vars for MILES.
+    """Mirror PipelineCoordinator's pipeline_identity_env_vars for MILES.
 
-    Sets the system env vars the pipeline actor needs to inject into
-    every child Ray actor it creates (cluster, RolloutManager, etc.).
+    Sets the env vars the pipeline actor needs to inject into every
+    child Ray actor it creates (cluster, RolloutManager, etc.) via
+    runtime_env. Reads ``RLIX_CONTROL_PLANE`` from the environment so
+    actors inside an existing pipeline preserve the inherited value.
     """
-    return {
-        SYSTEM_ENV_PIPELINE_ID: str(pipeline_id),
-        SYSTEM_ENV_RAY_NAMESPACE: str(ray_namespace),
-    }
+    return pipeline_identity_env_vars(
+        pipeline_id=str(pipeline_id), ray_namespace=str(ray_namespace)
+    )
 
 
 class MilesCoordinator(Coordinator):
@@ -408,7 +411,9 @@ class MilesCoordinator(Coordinator):
                 self._shrink_workers(set(int(i) for i in dp_ranks_to_remove))
             if dp_ranks_to_add:
                 self._expand_workers(set(int(i) for i in dp_ranks_to_add))
-        return ActionResponse(success=True, message=None, payload={})
+        # rlix.protocol.types.ActionResponse is frozen=True/slots=True with
+        # one field (success: bool); do not pass message/payload kwargs.
+        return ActionResponse(success=True)
 
     def _shrink_workers(self, engine_indices: Set[int]) -> None:
         rollout_manager = self._model_update_resources.get("rollout_manager")

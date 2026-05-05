@@ -33,9 +33,17 @@ class RLixVirtualClusterAdapter:
         use_gpus: bool = True,
         max_colocated_worker_groups: int = 1,
         name: str = "",
+        sorted_bundle_indices: Optional[List[int]] = None,
+        device_mapping: Optional[List[int]] = None,
     ) -> None:
         self._placement_groups: List[Any] = list(placement_groups)
         self._bundle_ct_per_node_list: List[int] = list(bundle_ct_per_node_list)
+        self._sorted_bundle_indices: Optional[List[int]] = (
+            list(sorted_bundle_indices) if sorted_bundle_indices is not None else None
+        )
+        self.device_mapping: Optional[List[int]] = (
+            list(device_mapping) if device_mapping is not None else None
+        )
         self.num_gpus_per_node: int = num_gpus_per_node
         self.use_gpus: bool = use_gpus
         self.max_colocated_worker_groups: int = max_colocated_worker_groups

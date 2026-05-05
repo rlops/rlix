@@ -27,7 +27,8 @@ import asyncio
 import logging
 import os
 import threading
-from typing import Any, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import ray
 
@@ -48,6 +49,12 @@ from rlix.utils.ray import get_actor_or_raise
 logger = logging.getLogger(__name__)
 
 _BOOTSTRAP_CACHE_VERSION = -1
+
+
+def _config_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
 
 
 # ---------------------------------------------------------------------------
@@ -593,26 +600,237 @@ class NemoRLFullFinetunePipeline:
     def _setup_nemo_rl_objects(self) -> tuple:
         """Create NeMo RL runtime objects from pipeline_config.
 
-        In the full implementation this mirrors examples/run_grpo.py:
-          - Create Policy (Megatron backend) on shared PG from F12.
-          - Create VllmGeneration on shared PG from F12.
-          - Build dataloader, tokenizer, loss_fn, checkpointer.
-          - Return them for async_grpo_train.
-
-        Feature 12 dependency: Policy and VllmGeneration must be initialized
-        on placement groups obtained from RollResourceManagerProxy (shared PG),
-        not via RayVirtualCluster.create() which would conflict with ROLL workers
-        in mixed-deployment mode.
-
-        Raises:
-            NotImplementedError: Until Feature 12 (shared PG) is implemented
-                and wired into this method.
+        Mirrors ``examples/run_grpo.py`` through tokenizer, generation config,
+        response data, and ``grpo.setup()``. The only RLix-specific difference is
+        that training and inference clusters are injected as shared-PG backed
+        ``RLixVirtualClusterAdapter`` instances instead of letting NeMo RL create
+        standalone ``RayVirtualCluster`` placement groups.
         """
-        raise NotImplementedError(
-            "_setup_nemo_rl_objects requires Feature 12 (shared PlacementGroup) "
-            "to be implemented. In the meantime, call async_grpo_train directly "
-            "from your training script and pass rlix_hooks=NemoRLRLixHooks(pipeline)."
+        from omegaconf import OmegaConf
+
+        from nemo_rl.algorithms.grpo import setup as grpo_setup
+        from nemo_rl.algorithms.utils import get_tokenizer
+        from nemo_rl.data.utils import setup_response_data
+        from nemo_rl.models.generation import configure_generation_config
+        from nemo_rl.utils.config import (
+            load_config,
+            parse_hydra_overrides,
+            register_omegaconf_resolvers,
         )
+        from nemo_rl.utils.logger import get_next_experiment_dir
+
+        nemo_config_path = self._resolve_nemo_config_path()
+        register_omegaconf_resolvers()
+        cfg = load_config(nemo_config_path)
+
+        overrides = _config_get(self._pipeline_config, "nemo_config_overrides", None)
+        if overrides:
+            cfg = parse_hydra_overrides(cfg, list(overrides))
+
+        master_config = OmegaConf.to_container(cfg, resolve=True)
+        if not isinstance(master_config, dict):
+            raise RuntimeError(
+                f"NeMo config {nemo_config_path!s} did not resolve to a dict"
+            )
+
+        logger.info("[%s] Loaded NeMo RL config from %s", self._pipeline_id, nemo_config_path)
+
+        if bool(_config_get(self._pipeline_config, "nemo_increment_log_dir", True)):
+            master_config["logger"]["log_dir"] = get_next_experiment_dir(
+                master_config["logger"]["log_dir"]
+            )
+
+        tokenizer = get_tokenizer(master_config["policy"]["tokenizer"])
+        if master_config["policy"]["generation"] is None:
+            raise RuntimeError("NeMo RL GRPO requires policy.generation config")
+        has_refit_draft_weights = bool(master_config["policy"]["draft"]["enabled"])
+        master_config["policy"]["generation"] = configure_generation_config(
+            master_config["policy"]["generation"],
+            tokenizer,
+            has_refit_draft_weights=has_refit_draft_weights,
+        )
+
+        dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
+            tokenizer,
+            master_config["data"],
+            master_config["env"],
+        )
+
+        train_device_mapping = self._resolve_device_mapping(
+            master_config, "train_device_mapping"
+        )
+        infer_device_mapping = self._resolve_device_mapping(
+            master_config, "infer_device_mapping"
+        )
+        train_cluster = self._make_rlix_virtual_cluster(
+            name=f"{self._pipeline_id}_nemo_train",
+            device_mapping=train_device_mapping,
+            max_colocated_worker_groups=1,
+            sorted_bundle_indices=train_device_mapping,
+        )
+        infer_cluster = self._make_rlix_virtual_cluster(
+            name=f"{self._pipeline_id}_nemo_infer",
+            device_mapping=infer_device_mapping,
+            max_colocated_worker_groups=1,
+            sorted_bundle_indices=None,
+        )
+
+        (
+            policy,
+            policy_generation,
+            _clusters,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            nemo_logger,
+            checkpointer,
+            grpo_save_state,
+            master_config,
+        ) = grpo_setup(
+            master_config,
+            tokenizer,
+            dataset,
+            val_dataset,
+            external_train_cluster=train_cluster,
+            external_inference_cluster=infer_cluster,
+        )
+
+        if policy_generation is not None:
+            setattr(policy_generation, "_rlix_device_mapping", list(infer_device_mapping))
+
+        self._policy = policy
+        self._policy_generation = policy_generation
+        if self._model_update_service is None:
+            self._create_model_update_service()
+
+        async_cfg = master_config["grpo"]["async_grpo"]
+        return (
+            policy,
+            policy_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            nemo_logger,
+            checkpointer,
+            grpo_save_state,
+            master_config,
+            int(async_cfg["max_trajectory_age_steps"]),
+        )
+
+    def _resolve_nemo_config_path(self) -> Path:
+        raw_path = (
+            _config_get(self._pipeline_config, "nemo_config_path")
+            or _config_get(self._pipeline_config, "nemo_rl_config_path")
+            or _config_get(self._pipeline_config, "config")
+        )
+        if not raw_path:
+            raise RuntimeError(
+                "NemoRLFullFinetunePipeline requires pipeline_config.nemo_config_path"
+            )
+        path = Path(str(raw_path)).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.exists():
+            raise FileNotFoundError(f"NeMo RL config not found: {path}")
+        return path
+
+    def _resolve_device_mapping(self, master_config: Dict[str, Any], key: str) -> List[int]:
+        explicit = _config_get(self._pipeline_config, key)
+        if explicit is None:
+            explicit = (
+                master_config.get("rlix", {}).get(key)
+                if isinstance(master_config.get("rlix"), dict)
+                else None
+            )
+        if explicit is None:
+            raise RuntimeError(
+                f"Missing {key}; provide pipeline_config.{key} or "
+                f"nemo_config.rlix.{key}"
+            )
+        mapping = [int(x) for x in explicit]
+        if not mapping:
+            raise RuntimeError(f"{key} must be non-empty")
+        return mapping
+
+    def _make_rlix_virtual_cluster(
+        self,
+        *,
+        name: str,
+        device_mapping: List[int],
+        max_colocated_worker_groups: int,
+        sorted_bundle_indices: Optional[List[int]],
+    ) -> Any:
+        from rlix.pipeline.nemo_rl_virtual_cluster_adapter import RLixVirtualClusterAdapter
+
+        pg_alloc = self._allocate_shared_pg(device_mapping=device_mapping)
+        placement_groups = self._extract_placement_groups(pg_alloc)
+        bundle_ct_per_node_list = self._extract_bundle_counts(
+            pg_alloc=pg_alloc,
+            placement_groups=placement_groups,
+            device_mapping=device_mapping,
+        )
+        return RLixVirtualClusterAdapter(
+            placement_groups=placement_groups,
+            bundle_ct_per_node_list=bundle_ct_per_node_list,
+            num_gpus_per_node=int(_config_get(self._pipeline_config, "num_gpus_per_node", 1)),
+            use_gpus=True,
+            max_colocated_worker_groups=max_colocated_worker_groups,
+            name=name,
+            sorted_bundle_indices=sorted_bundle_indices,
+            device_mapping=device_mapping,
+        )
+
+    def _allocate_shared_pg(self, *, device_mapping: List[int]) -> Any:
+        from roll.distributed.scheduler.resource_manager import RollResourceManagerProxy
+
+        proxy = RollResourceManagerProxy(
+            num_gpus_per_node=int(_config_get(self._pipeline_config, "num_gpus_per_node", 1))
+        )
+        if hasattr(proxy, "allocate_placement_group"):
+            return proxy.allocate_placement_group(
+                world_size=len(device_mapping),
+                device_mapping=list(device_mapping),
+            )
+
+        if sorted(device_mapping) != list(range(len(device_mapping))):
+            raise RuntimeError(
+                "RollResourceManagerProxy has no allocate_placement_group(); "
+                "fallback node2pg mode only supports contiguous zero-based "
+                f"device mappings, got {device_mapping!r}"
+            )
+        return proxy
+
+    def _extract_placement_groups(self, pg_alloc: Any) -> List[Any]:
+        for attr in ("placement_groups", "pgs", "node_placement_groups"):
+            value = getattr(pg_alloc, attr, None)
+            if value:
+                return list(value.values()) if isinstance(value, dict) else list(value)
+        node2pg = getattr(pg_alloc, "node2pg", None)
+        if node2pg:
+            return [node2pg[k] for k in sorted(node2pg)]
+        if isinstance(pg_alloc, (list, tuple)):
+            return list(pg_alloc)
+        raise RuntimeError(
+            "Unable to extract placement groups from RollResourceManagerProxy allocation"
+        )
+
+    def _extract_bundle_counts(
+        self,
+        *,
+        pg_alloc: Any,
+        placement_groups: List[Any],
+        device_mapping: List[int],
+    ) -> List[int]:
+        for attr in ("bundle_ct_per_node_list", "bundle_counts", "workers_per_node"):
+            value = getattr(pg_alloc, attr, None)
+            if value:
+                return [int(x) for x in value]
+        if len(placement_groups) == 1:
+            return [len(device_mapping)]
+        return [int(getattr(pg, "bundle_count")) for pg in placement_groups]
 
     # ------------------------------------------------------------------
     # Phase helpers — stubs for other Features

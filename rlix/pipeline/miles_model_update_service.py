@@ -15,6 +15,7 @@ version publish + atomic timeout.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import uuid
@@ -129,18 +130,36 @@ class MilesModelUpdateService:
         sync_id: str | None,
         target_engine_indices: set[int] | frozenset[int],
         version: int,
+        *,
+        broadcast_local_ranks: set[int] | frozenset[int] | None = None,
     ) -> int:
         """F15 / F20 atomic sync unit — sender + finalize + publish.
 
-        Iter 18 establishes the signature only; iter 19 wires the
-        transport phase (cpu_serialize per-engine + NCCL broadcast),
-        iter 20 wires the finalize fan-out + ``manager.set_weight_version``
-        + single ``asyncio.wait_for(self._timeout_s)``.
+        Single ``asyncio.wait_for(self._timeout_s)`` covers:
+          (a) ``cache_owner_actor.run_sync_session(plan)`` — single composite RPC
+              that drives every per-bucket transport (cpu_serialize tmpfs +
+              NCCL broadcast, classified via the ``broadcast_local_ranks``
+              kwarg below).
+          (b) ``finalize_weight_update`` fan-out across receivers.
+          (c) ``manager.set_weight_version(version, engine_indices=target)``
+              single publish per sync (F21).
+
+        ``version == -1`` is the F40 base path: the cache_owner has already
+        built buckets at init Step 4; the transport flow is identical (no
+        special-case branch).
+
+        ``broadcast_local_ranks`` is the subset of ``target_engine_indices``
+        whose engines need the NCCL broadcast path (non-colocate engines
+        whose GPU is outside the train pool). M11.1 RLix mode default is
+        all-cpu_serialize, so the kwarg defaults to ``None`` (empty set).
 
         Returns the published version (echoed for caller logging).
         """
+        import asyncio
+
         sync_id = sync_id or f"miles-sync-{uuid.uuid4().hex}"
-        if not target_engine_indices:
+        target = frozenset(int(i) for i in target_engine_indices)
+        if not target:
             logger.info(
                 "[MilesModelUpdateService] sync_selected_workers no-op "
                 "pipeline_id=%s sync_id=%s (empty target set)",
@@ -148,17 +167,177 @@ class MilesModelUpdateService:
                 sync_id,
             )
             return int(version)
+
+        broadcast_set = frozenset(int(i) for i in (broadcast_local_ranks or ()))
+        if not broadcast_set.issubset(target):
+            raise ValueError(
+                f"broadcast_local_ranks={sorted(broadcast_set)} must be a subset "
+                f"of target_engine_indices={sorted(target)}"
+            )
+        cpu_serialize_set = target - broadcast_set
+
+        async def _run() -> int:
+            return await self._run_atomic_unit(
+                sync_id=sync_id,
+                target=target,
+                version=int(version),
+                cpu_serialize_set=cpu_serialize_set,
+                broadcast_set=broadcast_set,
+            )
+
+        if self._timeout_s is None or self._timeout_s <= 0:
+            return await _run()
+        return await asyncio.wait_for(_run(), timeout=float(self._timeout_s))
+
+    async def _run_atomic_unit(
+        self,
+        *,
+        sync_id: str,
+        target: frozenset[int],
+        version: int,
+        cpu_serialize_set: frozenset[int],
+        broadcast_set: frozenset[int],
+    ) -> int:
+        # (1) Read-only entry: fetch per-engine handles from manager.
+        handles_ref = self._rollout_manager.get_engine_handles.remote(sorted(target))
+        handles: dict[int, Any] = await _ray_get(handles_ref)
+        if set(handles.keys()) != set(target):
+            raise RuntimeError(
+                f"manager returned handles {sorted(handles.keys())}; "
+                f"requested {sorted(target)} (lossy snapshot)"
+            )
+
+        # (2) Build the wire-format plan dict.
+        plan = await self._build_plan(
+            sync_id=sync_id,
+            version=version,
+            target_handles=handles,
+            cpu_serialize_set=cpu_serialize_set,
+            broadcast_set=broadcast_set,
+        )
+
+        # (3) Single composite RPC into the cache_owner. F04 invariant
+        #     means run_sync_session is the ONLY top-level Ray method
+        #     used for transport.
+        await _ray_get(self._cache_owner_actor.run_sync_session.remote(plan))
+
+        # (4) Finalize fan-out. F21: per-bucket payload had no version;
+        #     finalize_weight_update on every receiver flushes pending
+        #     work so update_weight_version below is observed at the
+        #     next prefill.
+        await _ray_get(
+            [h.finalize_weight_update.remote() for h in handles.values()]
+        )
+
+        # (5) Single version publish (F21). Pipeline / coordinator MUST
+        #     NOT call this directly — only the service does.
+        await _ray_get(
+            self._rollout_manager.set_weight_version.remote(
+                int(version), engine_indices=sorted(target)
+            )
+        )
         logger.info(
-            "[MilesModelUpdateService] sync_selected_workers_stub pipeline_id=%s "
-            "sync_id=%s version=%s targets=%s",
+            "[MilesModelUpdateService] sync_selected_workers_done pipeline_id=%s "
+            "sync_id=%s version=%s targets=%s cpu_serialize=%s broadcast=%s",
             self._pipeline_id,
             sync_id,
             version,
-            sorted(target_engine_indices),
+            sorted(target),
+            sorted(cpu_serialize_set),
+            sorted(broadcast_set),
         )
-        # Iter 19/20 replaces this stub with the real transport +
-        # finalize + publish + timeout flow.
         return int(version)
+
+    async def _build_plan(
+        self,
+        *,
+        sync_id: str,
+        version: int,
+        target_handles: dict[int, Any],
+        cpu_serialize_set: frozenset[int],
+        broadcast_set: frozenset[int],
+    ) -> dict[str, Any]:
+        # F26 / C16: master_port != 0. Claim a free port from the
+        # cache_owner actor (not 0; not picked by the receiver) and
+        # publish it via the SharedStorage singleton so concurrent
+        # service instances can avoid collisions.
+        master_addr_ref = self._cache_owner_actor.get_node_ip.remote()
+        master_port_ref = self._cache_owner_actor.get_free_port.remote()
+        master_addr_raw, master_port_raw = await _ray_get(
+            [master_addr_ref, master_port_ref]
+        )
+        master_addr = str(master_addr_raw)
+        master_port = int(master_port_raw)
+        if master_port <= 0:
+            raise RuntimeError(
+                f"cache_owner.get_free_port returned non-positive {master_port}"
+            )
+        # Best-effort SharedStorage claim. Mirror the pattern in
+        # rlix.pipeline.model_update_service so concurrent services
+        # see the claim.
+        try:
+            from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE, STORAGE_NAME
+
+            shared_storage = ray.get_actor(STORAGE_NAME, namespace=GLOBAL_STORAGE_NAMESPACE)
+            await _ray_get(
+                shared_storage.set.remote(
+                    f"MASTER_ADDR_PORT:{master_addr}:{master_port}",
+                    self._pipeline_id,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "MilesModelUpdateService: SharedStorage port-claim skipped: %r",
+                exc,
+            )
+
+        # Per-engine NCCL rank within the dynamic broadcast group.
+        # cache_owner is rank 0; receivers are 1..N.
+        comm_ranks: dict[int, int] = {}
+        for r, idx in enumerate(sorted(broadcast_set), start=1):
+            comm_ranks[idx] = r
+        # cpu_serialize engines are not in the broadcast group; they
+        # never enter setup_collective_group. Comm-rank assignment is
+        # ignored for them but kept in the dict for plan-shape
+        # uniformity (run_sync_session reads it conditionally).
+        for idx in cpu_serialize_set:
+            comm_ranks.setdefault(idx, 0)
+
+        world_size = 1 + len(broadcast_set) if broadcast_set else 1
+
+        plan = SyncSessionPlan(
+            sync_id=sync_id,
+            version=int(version),
+            group_name=f"miles_{self._pipeline_id}_{sync_id}",
+            master_addr=master_addr,
+            master_port=master_port,
+            timeout_s=float(self._timeout_s or 0.0),
+            target_handles=dict(target_handles),
+            cpu_serialize_local_ranks=cpu_serialize_set,
+            broadcast_local_ranks=broadcast_set,
+            comm_ranks=comm_ranks,
+            world_size=int(world_size),
+        )
+        return plan.as_wire_dict()
+
+
+async def _ray_get(refs):
+    """``await``able wrapper around ``ray.get`` so the timeout-bounded
+    ``asyncio.wait_for`` in :meth:`sync_selected_workers` can cancel
+    the surrounding task.
+
+    Ray's ObjectRefs are already awaitable in newer versions, so we
+    just delegate.
+    """
+    if isinstance(refs, list):
+        return await asyncio.gather(*[_await_ref(r) for r in refs])
+    return await _await_ref(refs)
+
+
+async def _await_ref(ref):
+    import asyncio  # noqa: F401  -- module-level import handled below
+
+    return await ref
 
 
 __all__ = ["SyncSessionPlan", "MilesModelUpdateService"]

@@ -174,10 +174,14 @@ class MilesPipeline:
         self._run_async(self._train_group.build_cpu_bucket_cache(step=-1))
 
         # Step 5: train offload — release overlap GPU.
+        logger.info("[MilesPipeline] phaseA step5: offload start")
         self._run_async(self._train_group.offload())
+        logger.info("[MilesPipeline] phaseA step5: offload done")
 
         # Step 6.5: collect cache_owner role.
+        logger.info("[MilesPipeline] phaseA step6.5: collect_cache_owner_roles start")
         roles = self._train_group.collect_cache_owner_roles()
+        logger.info("[MilesPipeline] phaseA step6.5: collect_cache_owner_roles done roles=%s", roles)
         owners = [(r, h) for (r, is_owner, h) in roles if is_owner]
         if len(owners) != 1:
             raise RuntimeError(
@@ -191,7 +195,9 @@ class MilesPipeline:
         # finds the base version available. register_model_update_resources
         # + bootstrap_active_engines run in phase B once the manager is
         # constructed.
+        logger.info("[MilesPipeline] phaseA step6.6: publish_cache_ready_step(-1) start")
         ray.get(self._coordinator_handle.publish_cache_ready_step.remote(-1))
+        logger.info("[MilesPipeline] phaseA step6.6: publish_cache_ready_step(-1) done")
 
         # P1-7: release actor_train BEFORE requesting actor_infer so the
         # scheduler can satisfy actor_infer when the GPU pool is sized
@@ -200,9 +206,11 @@ class MilesPipeline:
         # R11-F1: only flip the ledger flag after a SUCCESSFUL release —
         # otherwise shutdown_hard would skip the cluster_id and leak the
         # allocation server-side.
+        logger.info("[MilesPipeline] phaseA step7: release actor_train start")
         released = self._notify_release_cluster_gpus(
             cluster_id=self._actor_train_cluster_id, global_step=-1
         )
+        logger.info("[MilesPipeline] phaseA step7: release actor_train done released=%s", released)
         if released:
             self._actor_train_allocated = False
 
@@ -216,11 +224,13 @@ class MilesPipeline:
         """
         miles_args = getattr(self._pipeline_config, "miles_args")
 
+        logger.info("[MilesPipeline] phaseB step1: request actor_infer start")
         infer_allocated = self._request_cluster_gpus(
             cluster_id=self._actor_infer_cluster_id,
             priority=Priority.INITIALIZATION,
             global_step=-1,
         )
+        logger.info("[MilesPipeline] phaseB step1: request actor_infer done allocated=%s", infer_allocated)
         self._actor_infer_allocated = True
         # R11-F2 fail-fast: confirm the rlix scheduler granted the full
         # infer pool. The downstream _create_placement_group bypasses the
@@ -259,15 +269,18 @@ class MilesPipeline:
         # silently mis-route under multi-pipeline contention.
         from miles.ray.placement_group import _create_placement_group
 
+        logger.info("[MilesPipeline] phaseB step2: _create_placement_group start")
         pg, reordered_bundle_indices, reordered_gpu_ids = _create_placement_group(
             int(miles_args.rollout_num_gpus)
         )
         legacy_pg = (pg, reordered_bundle_indices, reordered_gpu_ids)
+        logger.info("[MilesPipeline] phaseB step2: _create_placement_group done")
 
         # RolloutManager construction. Engines come up `active` via the
         # standard start_rollout_servers flow inside __init__.
         from miles.ray.rollout import RolloutManager
 
+        logger.info("[MilesPipeline] phaseB step3: RolloutManager.remote start")
         self._rollout_manager = RolloutManager.options(
             namespace=self._ray_namespace,
             name=f"miles_rollout_manager_{self._pipeline_id}",
@@ -275,28 +288,35 @@ class MilesPipeline:
             max_restarts=0,
             max_task_retries=0,
         ).remote(miles_args, legacy_pg)
+        logger.info("[MilesPipeline] phaseB step3: RolloutManager.remote done")
 
+        logger.info("[MilesPipeline] phaseB step4: get_engine_count start")
         engine_count = int(ray.get(self._rollout_manager.get_engine_count.remote()))
+        logger.info("[MilesPipeline] phaseB step4: get_engine_count done count=%d", engine_count)
         self._declared_engine_count = engine_count
 
         # F107 / X2: register handles. F22 (relaxed): in M11.1 single-pipeline
         # this happens after the manager exists; the dual-pipeline-shell-init
         # F22 ordering is deferred.
+        logger.info("[MilesPipeline] phaseB step5: register_model_update_resources start")
         ray.get(
             self._coordinator_handle.register_model_update_resources.remote(
                 cache_owner_actor=self._cache_owner_actor,
                 rollout_manager=self._rollout_manager,
             )
         )
+        logger.info("[MilesPipeline] phaseB step5: register_model_update_resources done")
         # All engines came up active via start_rollout_servers; bootstrap
         # the full set as the active group. X3 / F19 still applies — this
         # is the SINGLE bootstrap call.
         full_engine_indices = list(range(engine_count))
+        logger.info("[MilesPipeline] phaseB step6: bootstrap_active_engines start")
         ray.get(
             self._coordinator_handle.bootstrap_active_engines.remote(
                 frozenset(full_engine_indices)
             )
         )
+        logger.info("[MilesPipeline] phaseB step6: bootstrap_active_engines done")
 
         active = ray.get(self._coordinator_handle.get_active_engines.remote())
         if set(active) != set(full_engine_indices):

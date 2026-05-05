@@ -174,6 +174,20 @@ class MilesModelUpdateService:
                 f"broadcast_local_ranks={sorted(broadcast_set)} must be a subset "
                 f"of target_engine_indices={sorted(target)}"
             )
+        if broadcast_set:
+            # The cache-owner sender NCCL path (init_process_group +
+            # per-bucket dist.broadcast + dist.destroy_process_group)
+            # is not yet implemented inside MILES run_sync_session
+            # (iter 12 wires only the receiver-side fan-out). Fail
+            # fast rather than hang the receivers waiting for an
+            # absent sender.
+            raise NotImplementedError(
+                "broadcast_local_ranks transport requires sender-side NCCL "
+                "(init_process_group + dist.broadcast on the cache_owner). "
+                "MILES iter 12 only wired the receiver-side fan-out. "
+                "Until the sender-side path lands, route every target "
+                "through cpu_serialize."
+            )
         cpu_serialize_set = target - broadcast_set
 
         async def _run() -> int:
@@ -272,24 +286,48 @@ class MilesModelUpdateService:
             raise RuntimeError(
                 f"cache_owner.get_free_port returned non-positive {master_port}"
             )
-        # Best-effort SharedStorage claim. Mirror the pattern in
-        # rlix.pipeline.model_update_service so concurrent services
-        # see the claim.
-        try:
-            from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE, STORAGE_NAME
+        # SharedStorage atomic port claim — mirrors the pattern in
+        # rlix.pipeline.model_update_service. ``try_put`` returns
+        # False if the key already exists, which we treat as a
+        # collision and re-pick. Bound the retry budget so a stuck
+        # claim can't hang the sync.
+        from roll.distributed.scheduler.storage import (  # type: ignore[import-not-found]
+            STORAGE_NAME,
+        )
+        from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE  # type: ignore[import-not-found]
 
+        try:
             shared_storage = ray.get_actor(STORAGE_NAME, namespace=GLOBAL_STORAGE_NAMESPACE)
-            await _ray_get(
-                shared_storage.set.remote(
-                    f"MASTER_ADDR_PORT:{master_addr}:{master_port}",
-                    self._pipeline_id,
-                )
-            )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "MilesModelUpdateService: SharedStorage port-claim skipped: %r",
+            logger.warning(
+                "MilesModelUpdateService: SharedStorage actor unavailable; "
+                "skipping port claim: %r",
                 exc,
             )
+            shared_storage = None
+
+        if shared_storage is not None:
+            for attempt in range(8):
+                claim_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"
+                claimed = bool(
+                    await _ray_get(shared_storage.try_put.remote(claim_key, self._pipeline_id))
+                )
+                if claimed:
+                    break
+                # Collision — pick another free port and re-try.
+                next_port = int(await _ray_get(self._cache_owner_actor.get_free_port.remote()))
+                if next_port == master_port:
+                    # get_free_port returned the same value; tiny
+                    # back-off + retry.
+                    await asyncio.sleep(0.05)
+                    continue
+                master_port = next_port
+            else:
+                raise RuntimeError(
+                    "SharedStorage port-claim retry budget exhausted "
+                    f"(addr={master_addr}); release stale claims before "
+                    "retrying."
+                )
 
         # Per-engine NCCL rank within the dynamic broadcast group.
         # cache_owner is rank 0; receivers are 1..N.

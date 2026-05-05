@@ -405,35 +405,58 @@ class MilesCoordinator(Coordinator):
         """Scheduler-driven resize. ``dp_ranks_*`` are the scheduler's
         DP-rank view; first-build contiguous-mapping invariant (F35
         C6) makes them == MILES engine_index.
+
+        R10-F1: ``_shrink_workers`` / ``_expand_workers`` issue Ray RPCs
+        WITHOUT holding ``_resize_sync_lock``. Snapshot-under-lock /
+        RPC-without-lock / commit-under-lock matches the pattern in
+        :meth:`sync_base_weights_to_active`. Concurrent callers that
+        only need ``_active_engine_indices`` snapshots
+        (``get_active_engines``, ``publish_cache_ready_step``,
+        ``sync_base_weights_to_active``) no longer queue behind the
+        full RPC chain.
         """
-        with self._resize_sync_lock:
-            if dp_ranks_to_remove:
-                self._shrink_workers(set(int(i) for i in dp_ranks_to_remove))
-            if dp_ranks_to_add:
-                self._expand_workers(set(int(i) for i in dp_ranks_to_add))
+        if dp_ranks_to_remove:
+            self._shrink_workers(set(int(i) for i in dp_ranks_to_remove))
+        if dp_ranks_to_add:
+            self._expand_workers(set(int(i) for i in dp_ranks_to_add))
         # rlix.protocol.types.ActionResponse is frozen=True/slots=True with
         # one field (success: bool); do not pass message/payload kwargs.
         return ActionResponse(success=True)
 
     def _shrink_workers(self, engine_indices: Set[int]) -> None:
-        rollout_manager = self._model_update_resources.get("rollout_manager")
-        if rollout_manager is None:
-            raise RuntimeError("resource registration missing for shrink")
+        # Snapshot under lock — only to read shared state; the Ray RPC
+        # runs without the lock held (R10-F1).
+        with self._resize_sync_lock:
+            rollout_manager = self._model_update_resources.get("rollout_manager")
+            if rollout_manager is None:
+                raise RuntimeError("resource registration missing for shrink")
+        # RPC outside the lock.
         ray.get(rollout_manager.shrink_engines.remote(sorted(engine_indices)))
-        self._active_engine_indices -= engine_indices
+        # Commit under lock.
+        with self._resize_sync_lock:
+            self._active_engine_indices -= engine_indices
 
     def _expand_workers(self, engine_indices: Set[int]) -> None:
-        rollout_manager = self._model_update_resources.get("rollout_manager")
-        if rollout_manager is None:
-            raise RuntimeError("resource registration missing for expand")
-        # F22 ordering: pipeline must have called publish_cache_ready_step
-        # (init Step 6.6) before the FIRST runtime expand.
-        if self._cache_ready_step is None:
-            raise RuntimeError(
-                "resize_infer expand fired before publish_cache_ready_step; "
-                "MilesPipeline init bootstrap Step 6.6 must complete first"
-            )
-        # Read entry-state snapshot so we dispatch INIT vs Runtime.
+        # Phase 1 — Snapshot under lock (R10-F1).
+        with self._resize_sync_lock:
+            rollout_manager = self._model_update_resources.get("rollout_manager")
+            if rollout_manager is None:
+                raise RuntimeError("resource registration missing for expand")
+            # F22 ordering: pipeline must have called publish_cache_ready_step
+            # (init Step 6.6) before the FIRST runtime expand.
+            if self._cache_ready_step is None:
+                raise RuntimeError(
+                    "resize_infer expand fired before publish_cache_ready_step; "
+                    "MilesPipeline init bootstrap Step 6.6 must complete first"
+                )
+            cached_step = int(self._cache_ready_step)
+            service = self._ensure_model_update_service()
+
+        # Phase 2 — RPC chain WITHOUT the lock held. Read entry-state
+        # snapshot so we dispatch INIT vs Runtime; the rollout manager
+        # is itself a Ray actor with internal serialization, so racing
+        # this read against another resize_infer is safe at the
+        # manager layer.
         states = ray.get(
             rollout_manager.get_engine_states.remote(sorted(engine_indices))
         )
@@ -447,26 +470,27 @@ class MilesCoordinator(Coordinator):
                 "must come from MilesPipeline.initialize_pipeline Step 7, "
                 "not from resize_infer."
             )
-        if unique_states == {"offloaded"}:
-            # F40 Runtime branch: wake → service.sync_selected_workers →
-            # activate_routing.
-            ray.get(rollout_manager.expand_engines.remote(sorted(engine_indices)))
-            service = self._ensure_model_update_service()
-            ray.get(
-                service.sync_selected_workers.remote(
-                    sync_id=None,
-                    target_engine_indices=frozenset(engine_indices),
-                    version=int(self._cache_ready_step),
-                )
+        if unique_states != {"offloaded"}:
+            # Heterogeneous entry states are an upstream error per scope F37.
+            raise RuntimeError(
+                f"_expand_workers got heterogeneous engine states: {unique_states}; "
+                f"upstream must dispatch a uniform set."
             )
-            ray.get(rollout_manager.activate_routing.remote(sorted(engine_indices)))
-            self._active_engine_indices |= set(engine_indices)
-            return
-        # Heterogeneous entry states are an upstream error per scope F37.
-        raise RuntimeError(
-            f"_expand_workers got heterogeneous engine states: {unique_states}; "
-            f"upstream must dispatch a uniform set."
+        # F40 Runtime branch: wake → service.sync_selected_workers →
+        # activate_routing.
+        ray.get(rollout_manager.expand_engines.remote(sorted(engine_indices)))
+        ray.get(
+            service.sync_selected_workers.remote(
+                sync_id=None,
+                target_engine_indices=frozenset(engine_indices),
+                version=cached_step,
+            )
         )
+        ray.get(rollout_manager.activate_routing.remote(sorted(engine_indices)))
+
+        # Phase 3 — Commit under lock.
+        with self._resize_sync_lock:
+            self._active_engine_indices |= set(engine_indices)
 
     def create_pipeline_actor(self, *, pipeline_config: Any) -> Any:
         """Create / return the per-pipeline MilesPipeline actor."""

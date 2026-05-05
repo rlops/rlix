@@ -213,8 +213,9 @@ class PipelineCoordinator(Coordinator):
         self._resource_manager_node0_pg = self._resource_manager_proxy.node2pg.get(0)
 
         self._pipeline_actor = None
-        # Lazily resolved on first sync_lora_weights call; created by the pipeline actor during init.
-        self._model_update_service = None
+        # Lazily resolved on first sync call; created by the pipeline actor during init.
+        self._lora_model_update_service = None
+        self._nemo_rl_model_update_service = None
         # Serializes resize_infer and sync_lora_weights: prevents a weight sync from
         # racing with a concurrent shrink/expand triggered by the central scheduler.
         self._resize_sync_lock = threading.Lock()
@@ -480,14 +481,14 @@ class PipelineCoordinator(Coordinator):
                 # All infer workers preempted/sleeping; expand_worker syncs on next wake.
                 return
             # Created by the pipeline actor during init; lazy-resolve here.
-            if self._model_update_service is None:
+            if self._lora_model_update_service is None:
                 model_update_service_name = f"{self._pipeline_id}_model_update_service"
-                self._model_update_service = get_actor_or_raise(
+                self._lora_model_update_service = get_actor_or_raise(
                     model_update_service_name,
                     self._ray_namespace,
                     error_context=f"ModelUpdateService required for pipeline_id={self._pipeline_id!r}.",
                 )
-            model_update_service = self._model_update_service
+            model_update_service = self._lora_model_update_service
             assert model_update_service is not None
             ray.get(
                 model_update_service.sync_selected_workers.remote(
@@ -496,6 +497,47 @@ class PipelineCoordinator(Coordinator):
                     verify=self._verify_model_after_sync,
                 )
             )
+        finally:
+            self._resize_sync_lock.release()
+
+    def sync_base_weights_to_active(self) -> List[int]:
+        """Push base model weights to currently-active inference DP ranks.
+
+        NeMo RL partial-overlap keeps non-overlap inference ranks serving while
+        training runs. Those active ranks do not pass through expand, so the
+        training loop must refresh them before releasing actor_train GPUs.
+        """
+        acquired = self._resize_sync_lock.acquire(
+            timeout=_RESIZE_LOCK_TIMEOUT_S if _RESIZE_LOCK_TIMEOUT_S is not None else -1
+        )
+        if not acquired:
+            raise RuntimeError(
+                f"sync_base_weights_to_active timed out waiting for _resize_sync_lock "
+                f"after {_RESIZE_LOCK_TIMEOUT_S}s. pipeline_id={self._pipeline_id!r}"
+            )
+        try:
+            active_ranks = sorted(self._active_infer_dp_ranks)
+            if not active_ranks:
+                return []
+
+            if self._nemo_rl_model_update_service is None:
+                model_update_service_name = f"{self._pipeline_id}_nemo_rl_model_update_service"
+                self._nemo_rl_model_update_service = get_actor_or_raise(
+                    model_update_service_name,
+                    self._ray_namespace,
+                    error_context=(
+                        f"NeMo RL ModelUpdateService required for pipeline_id={self._pipeline_id!r}."
+                    ),
+                )
+            model_update_service = self._nemo_rl_model_update_service
+            assert model_update_service is not None
+            ray.get(
+                model_update_service.sync_selected_workers.remote(
+                    tgt_dp_ranks=active_ranks,
+                    verify=self._verify_model_after_sync,
+                )
+            )
+            return active_ranks
         finally:
             self._resize_sync_lock.release()
 

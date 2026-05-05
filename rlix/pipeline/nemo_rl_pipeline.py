@@ -427,8 +427,8 @@ class NemoRLFullFinetunePipeline:
         self._policy_generation.mark_dp_ranks_inactive(ranks)
 
         # Step 2: Wake sleeping workers (training already offloaded — no OOM risk).
-        # F2: VllmGeneration.wake_up_partial(dp_ranks)
-        self._policy_generation.wake_up_partial(ranks)
+        # skip_activate=True: keep ranks off routing until weight sync finishes (Step 5).
+        self._policy_generation.wake_up_partial(ranks, skip_activate=True)
         self._pre_activation_ranks.update(ranks)
 
         # Steps 3-5: atomic block.

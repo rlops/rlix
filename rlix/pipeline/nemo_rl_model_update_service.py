@@ -4,24 +4,20 @@ When the scheduler expands a NeMo RL pipeline (adds sleeping inference shards),
 this service pushes the latest training weights from the CPU bucket cache to the
 woken inference workers.
 
-Transport paths (mirroring NeMo RL's existing transports):
-  - CUDA IPC   — sender and receiver share the same physical GPU (overlap shards).
-                 Zero-copy; only correct path when two ranks are on the same GPU.
-  - NCCL bcast — receiver is on a different GPU. Uses NeMo RL's packed_broadcast
-                 producer/consumer pattern (model_update.py collective group).
+Transport paths:
+  - cpu_serialize — CPU uint8 bucket DMA-copied to each receiver GPU.
+                    Default; works across all GPU topologies.
+  - cuda_ipc      — Zero-copy CUDA IPC handle; only when sender and receiver
+                    share the same physical GPU (colocated overlap shards).
+  - NCCL bcast    — Broadcast via StatelessProcessGroup; cross-GPU non-colocated.
 
 This service is a Ray actor; one instance per pipeline, created by
 NemoRLFullFinetunePipeline.initialize_pipeline().
-
-NOTE (Feature 4 dependency):
-    sync_selected_workers currently raises NotImplementedError until the CPU
-    bucket cache (Feature 4) and selective transport routing (Feature 4/6) are
-    implemented in the NeMo RL repo. The interface is complete so F5/F6 wiring
-    compiles and can be tested end-to-end once F4 lands.
 """
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, List, Optional
 
 import ray
@@ -36,16 +32,14 @@ class NemoRLModelUpdateService:
     Holds references to the Megatron training policy and the vLLM generation
     interface. sync_selected_workers is called in two scenarios:
       - expand path: DP ranks that just woke up (scheduler-driven expand).
-      - active refresh path: DP ranks currently serving requests (partial-overlap
-        ranks that did not shrink during training and will not pass through expand).
-    In both cases, untargeted shards are not contacted and continue generation.
+      - active refresh path: DP ranks currently serving requests.
 
     Args:
         pipeline_id:       Unique identifier for this pipeline.
-        policy:            NeMo RL ColocatablePolicyInterface (Megatron backend).
-                           Must expose build_cpu_bucket_cache / cache_ready_step
-                           once Feature 4 is implemented.
-        policy_generation: NeMo RL VllmGeneration instance owning the vLLM workers.
+        policy:            NeMo RL policy object. Must expose worker actors that
+                           implement selective_sync_active_cache (MegatronPolicyWorkerImpl).
+                           Supported patterns: .src_cluster.workers, .workers, list, single actor.
+        policy_generation: VllmGeneration Ray actor handle.
     """
 
     def __init__(
@@ -61,57 +55,140 @@ class NemoRLModelUpdateService:
         self._policy = policy
         self._policy_generation = policy_generation
 
-        logger.info(
-            "[NemoRLModelUpdateService] init pipeline_id=%s", pipeline_id
-        )
+        logger.info("[NemoRLModelUpdateService] init pipeline_id=%s", pipeline_id)
 
     def sync_selected_workers(
         self,
         tgt_dp_ranks: List[int],
         verify: bool = False,
     ) -> None:
-        """Push latest training weights to the specified inference DP shards.
+        """Push active CPU bucket cache to the specified inference DP shards.
 
-        High-level flow (once Feature 4 is implemented):
-          1. Assert CPU bucket cache is ready (_cache_ready_step >= 0).
-          2. Determine transport per target device:
-               - Same physical GPU as cache owner → CUDA IPC (zero-copy).
-               - Different GPU                    → NCCL broadcast.
-          3. For each bucket in the CPU cache:
-               a. Stage CPU → GPU (sender side, controlled staging buffer).
-               b. Send via IPC handle (colocated) or NCCL broadcast (remote).
-               c. Receiver calls model_runner.model.load_weights() to apply.
-               d. Release staging buffer before next bucket.
-          4. Optionally verify weights via checksum comparison.
-
-        Non-targeted shards (non-overlap GPUs) are NOT contacted; they continue
-        generation without pause.
+        Flow:
+          1. Get inference receiver surface from VllmGeneration.
+          2. Build comm plan (cpu_serialize, no NCCL topology analysis).
+          3. Call selective_sync_active_cache on ALL training workers;
+             only the cache owner (pp0/dp0/tp0) does actual transport.
+          4. Finalize post-load hooks on inference workers.
+          5. Optionally verify weight checksums.
 
         Args:
-            tgt_dp_ranks: DP ranks to push weights to. Two callers:
-                          - expand path: ranks that just woke up, not yet routing.
-                          - active refresh path: ranks currently serving requests;
-                            implementation must synchronize CUDA streams after
-                            load_weights() to avoid mid-inference weight switching.
-            verify:       When True, run post-sync weight verification checksums.
-
-        Raises:
-            NotImplementedError: Until Feature 4 (CPU bucket cache) is implemented.
+            tgt_dp_ranks: Inference DP ranks to update.
+            verify:       When True, run post-sync checksum verification.
         """
         if not tgt_dp_ranks:
             raise ValueError("tgt_dp_ranks must be non-empty")
 
         logger.info(
-            "[NemoRLModelUpdateService] sync_selected_workers "
+            "[NemoRLModelUpdateService] sync_selected_workers start "
             "pipeline_id=%s tgt_dp_ranks=%s",
             self._pipeline_id,
             tgt_dp_ranks,
         )
 
-        raise NotImplementedError(
-            "NeMo RL selective base-weight sync requires the Feature 4 sender "
-            "implementation (CPU bucket cache transport). Refusing to mark stale "
-            "inference workers as synced."
+        # --- Step 1: inference receiver surface ---
+        # VllmGeneration is a Ray actor; get_model_update_receiver returns a
+        # SimpleNamespace(workers, rank2worker, worker_config).
+        receiver = ray.get(self._policy_generation.get_model_update_receiver.remote())
+        num_gpus_per_worker: int = int(receiver.worker_config.num_gpus_per_worker)
+        device_mapping: List[int] = list(receiver.worker_config.device_mapping or [])
+        dp_size: int = len(receiver.rank2worker)
+
+        # Build tgt_workers as a list indexed by dp_rank (required by
+        # selective_sync_active_cache: tgt_workers[dp_rank] → leader actor).
+        tgt_workers_indexed = [receiver.rank2worker[r] for r in range(dp_size)]
+
+        # --- Step 2: comm plan (cpu_serialize — no NCCL group needed) ---
+        sync_id = f"{self._pipeline_id}_{uuid.uuid4().hex[:8]}"
+        comm_plan = {
+            sync_id: {
+                "group_name": sync_id,
+                "master_addr": "127.0.0.1",
+                "master_port": 0,          # unused for cpu_serialize
+                "tgt_devices": [],         # unused for cpu_serialize
+                "ipc_targets": [
+                    {
+                        "dp_rank": dp_rank,
+                        "local_ranks": list(range(num_gpus_per_worker)),
+                    }
+                    for dp_rank in tgt_dp_ranks
+                ],
+                "broadcast_local_ranks_by_dp_rank": {},   # no NCCL
+            }
+        }
+
+        # --- Step 3: run selective sync on all training workers ---
+        # selective_sync_active_cache is a no-op on non-owner ranks.
+        policy_workers = self._get_policy_workers()
+        sync_refs = [
+            w.selective_sync_active_cache.remote(
+                sync_id=sync_id,
+                comm_plan=comm_plan,
+                tgt_dp_ranks=tgt_dp_ranks,
+                tgt_workers=tgt_workers_indexed,
+                tgt_device_mapping=device_mapping or list(range(dp_size)),
+                tgt_num_gpus_per_worker=num_gpus_per_worker,
+                model_update_transport="cpu_serialize",
+            )
+            for w in policy_workers
+        ]
+        results = ray.get(sync_refs)
+
+        # --- Step 4: finalize post-load hooks on all inference workers ---
+        # VllmGeneration.finalize_weight_update() is a pass-through that calls
+        # process_weights_after_loading on all workers (idempotent).
+        ray.get(self._policy_generation.finalize_weight_update.remote())
+
+        # --- Step 5: optional weight verification ---
+        if verify:
+            weight_stats: Optional[dict] = None
+            for r in results:
+                if isinstance(r, dict) and "weight_stats" in r:
+                    weight_stats = r["weight_stats"]
+                    break
+            if weight_stats:
+                ray.get(self._policy_generation.verify_model.remote(weight_stats))
+
+        logger.info(
+            "[NemoRLModelUpdateService] sync_selected_workers done "
+            "pipeline_id=%s tgt_dp_ranks=%s",
+            self._pipeline_id,
+            tgt_dp_ranks,
+        )
+
+    def _get_policy_workers(self) -> List[Any]:
+        """Resolve list of training worker Ray actor handles from self._policy.
+
+        Tries common NeMo RL policy API patterns in priority order:
+          1. policy.src_cluster.workers  (NeMo RL ClusterSpec pattern)
+          2. policy.workers              (direct cluster with .workers list)
+          3. policy itself is a list/tuple of Ray actor handles
+          4. policy is a single Ray actor handle
+        """
+        # Pattern 1: policy.src_cluster.workers
+        src_cluster = getattr(self._policy, "src_cluster", None)
+        if src_cluster is not None:
+            workers = getattr(src_cluster, "workers", None)
+            if workers:
+                return list(workers)
+
+        # Pattern 2: policy.workers
+        workers = getattr(self._policy, "workers", None)
+        if workers:
+            return list(workers)
+
+        # Pattern 3: policy is a list/tuple of actor handles
+        if isinstance(self._policy, (list, tuple)) and self._policy:
+            return list(self._policy)
+
+        # Pattern 4: single actor handle
+        if self._policy is not None:
+            return [self._policy]
+
+        raise RuntimeError(
+            f"[NemoRLModelUpdateService] Cannot resolve training workers from policy "
+            f"(type={type(self._policy).__name__}). Policy must expose "
+            ".src_cluster.workers, .workers, or be a list/single Ray actor handle."
         )
 
     def __repr__(self) -> str:

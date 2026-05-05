@@ -424,6 +424,37 @@ class MilesPipeline:
         self.shutdown_hard()
 
     # ------------------------------------------------------------------
+    # Driver-side accessors (post-iter-27 wiring)
+    # ------------------------------------------------------------------
+
+    def get_train_group(self):
+        if not self._initialized:
+            raise RuntimeError("MilesPipeline.get_train_group before initialize")
+        return self._train_group
+
+    def get_rollout_manager(self):
+        if not self._initialized:
+            raise RuntimeError("MilesPipeline.get_rollout_manager before initialize")
+        return self._rollout_manager
+
+    def get_declared_engine_count(self) -> int:
+        if not self._initialized:
+            raise RuntimeError("MilesPipeline.get_declared_engine_count before initialize")
+        return int(self._declared_engine_count)
+
+    def is_initialized(self) -> bool:
+        return bool(self._initialized)
+
+    # Public aliases for the underscore-prefixed step hooks. Drivers SHOULD
+    # call these instead of the underscored variants so the public Ray
+    # surface stays stable.
+    def before_training(self, step: int) -> None:
+        return self._before_training(step)
+
+    def after_training(self, step: int) -> None:
+        return self._after_training(step)
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 

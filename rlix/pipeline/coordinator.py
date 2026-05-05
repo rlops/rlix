@@ -153,6 +153,11 @@ def _validate_offload_nccl(*, pipeline_config: Any) -> None:
         device_mapping = getattr(worker_config, "device_mapping", None)
         if not device_mapping:
             continue
+        # DeepSpeed strategies manage their own process groups and are incompatible with
+        # ROLL's ReloadableProcessGroup monkey-patch. Skip enforcement for deepspeed clusters.
+        strategy_name = getattr(getattr(worker_config, "strategy_args", None), "strategy_name", "")
+        if strategy_name.startswith("deepspeed"):
+            continue
         offload_nccl = getattr(worker_config, "offload_nccl", None)
         if offload_nccl is None:
             worker_config.offload_nccl = True
@@ -524,8 +529,9 @@ class PipelineCoordinator(Coordinator):
         )
         if not acquired:
             raise RuntimeError(
-                f"sync_base_weights_to_active timed out waiting for _resize_sync_lock "
-                f"after {_RESIZE_LOCK_TIMEOUT_S}s. pipeline_id={self._pipeline_id!r}"
+                f"sync_base_weights_to_active timed out waiting for _resize_sync_lock after {_RESIZE_LOCK_TIMEOUT_S}s "
+                f"(likely blocked by a long-running resize_infer). "
+                f"pipeline_id={self._pipeline_id!r}"
             )
         try:
             active_ranks = sorted(self._active_infer_dp_ranks)

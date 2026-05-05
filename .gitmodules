@@ -2,3 +2,6 @@
 	path = external/ROLL
 	url = https://github.com/rlops/ROLL.git
 	branch = rlix
+[submodule "external/NeMo"]
+	path = external/NeMo
+	url = https://github.com/zhenyulincs/RL.git

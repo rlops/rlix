@@ -1,15 +1,15 @@
-"""NeMo RL pipeline F5/F6 tests.
+﻿"""NeMo RL pipeline F5/F6 tests.
 
 Tests the control-flow skeleton of NemoRLFullFinetunePipeline and
 NemoRLRLixHooks without any real Ray cluster, GPU, torch, or Megatron.
 
 Test map:
-  test_hooks_are_called_around_training_step   — F5: hook timing in training loop
-  test_resize_infer_dispatches_to_shrink_and_expand — F5: resize_infer routing
-  test_expand_workers_is_atomic_on_success     — F6: 5-step ordering invariant
-  test_expand_workers_does_not_activate_on_sync_failure — F6: error path
-  test_shrink_workers_calls_sleep_partial      — F5/F2: shrink path
-  test_minimal_f5_f6_integration_flow          — F5+F6: full lifecycle
+  test_hooks_are_called_around_training_step   â€” F5: hook timing in training loop
+  test_resize_infer_dispatches_to_shrink_and_expand â€” F5: resize_infer routing
+  test_expand_workers_is_atomic_on_success     â€” F6: 5-step ordering invariant
+  test_expand_workers_does_not_activate_on_sync_failure â€” F6: error path
+  test_shrink_workers_calls_sleep_partial      â€” F5/F2: shrink path
+  test_minimal_f5_f6_integration_flow          â€” F5+F6: full lifecycle
 
 Run:
     cd rlix/
@@ -27,9 +27,9 @@ from contextlib import contextmanager
 from typing import Any, Dict, Generator, List, Optional
 
 # ---------------------------------------------------------------------------
-# Import isolation — must run before any rlix import.
+# Import isolation â€” must run before any rlix import.
 # Pre-populates sys.modules to prevent heavy __init__.py side-effects
-# (rlix/__init__.py → ray, rlix/pipeline/__init__.py → torch).
+# (rlix/__init__.py â†’ ray, rlix/pipeline/__init__.py â†’ torch).
 # ---------------------------------------------------------------------------
 
 _RLIX_ROOT = pathlib.Path(__file__).resolve().parent.parent / "rlix"
@@ -98,7 +98,7 @@ def _fake_ray_get(future: Any) -> Any:
 
 
 class _RemoteMethod:
-    """Wraps a callable so .remote(*args, **kwargs) → _MockFuture."""
+    """Wraps a callable so .remote(*args, **kwargs) â†’ _MockFuture."""
 
     def __init__(self, fn: Any) -> None:
         self._fn = fn
@@ -198,7 +198,7 @@ class MockScheduler:
 
 
 # ---------------------------------------------------------------------------
-# Mock: VllmGeneration (F2/F3 stub — async sleep_partial for _shrink_workers)
+# Mock: VllmGeneration (F2/F3 stub â€” async sleep_partial for _shrink_workers)
 # ---------------------------------------------------------------------------
 
 
@@ -338,7 +338,7 @@ class RecordingRLixHooks:
 
 
 # ---------------------------------------------------------------------------
-# Fake training loop — minimal stand-in for async_grpo_train
+# Fake training loop â€” minimal stand-in for async_grpo_train
 # ---------------------------------------------------------------------------
 
 
@@ -352,7 +352,7 @@ def fake_async_grpo_train(
 
     Calls on_trajectory_collector_created once at start (mirrors the real
     grpo.py path where AsyncTrajectoryCollector is created before the loop).
-    Then for each step: before_training → "train" → after_training.
+    Then for each step: before_training â†’ "train" â†’ after_training.
 
     Args:
         num_steps:     Number of simulated training steps.
@@ -395,7 +395,7 @@ def _make_test_pipeline(
 ) -> NemoRLFullFinetunePipeline:
     """Build a NemoRLFullFinetunePipeline without Ray using object.__new__.
 
-    Bypasses __init__ (which calls get_actor_or_raise → ray) and injects
+    Bypasses __init__ (which calls get_actor_or_raise â†’ ray) and injects
     mock dependencies directly. Sets _initialized=True so _ensure_initialized
     is a no-op in all tests.
     """
@@ -440,7 +440,7 @@ class TestHookTiming:
     """F5: before_training / after_training must bracket each training step."""
 
     def test_hooks_are_called_around_training_step(self):
-        """Verify ordering: on_collector_created, then per-step before→train→after."""
+        """Verify ordering: on_collector_created, then per-step beforeâ†’trainâ†’after."""
         hooks = RecordingRLixHooks()
         training_log: List[str] = []
 
@@ -467,7 +467,7 @@ class TestHookTiming:
         assert [e["step"] for e in after_events] == [0, 1, 2], \
             "after_training must fire for each step in order"
 
-        # --- Per-step ordering: before → train → after ---
+        # --- Per-step ordering: before â†’ train â†’ after ---
         # Interleave hook events with training_log to build a global timeline
         all_events: List[str] = []
         hook_iter = iter(e for e in hooks.events if e["type"] != "on_collector_created")
@@ -520,12 +520,12 @@ class TestHookTiming:
             hooks.before_training(step=7)
             hooks.after_training(step=7)
 
-        # before_training → _request_cluster_gpus → scheduler.request_gpus
+        # before_training â†’ _request_cluster_gpus â†’ scheduler.request_gpus
         assert len(sched.request_calls) == 1
         assert sched.request_calls[0]["step"] == 7
         assert ACTOR_TRAIN_CLUSTER_NAME in sched.request_calls[0]["cluster_id"]
 
-        # after_training → _notify_release_cluster_gpus → scheduler.notify_release_gpus
+        # after_training â†’ _notify_release_cluster_gpus â†’ scheduler.notify_release_gpus
         assert len(sched.release_calls) == 1
         assert sched.release_calls[0]["step"] == 7
         assert ACTOR_TRAIN_CLUSTER_NAME in sched.release_calls[0]["cluster_id"]
@@ -550,7 +550,7 @@ class TestResizeInferDispatch:
         vllm = MockVLLMGeneration(dp_size=4)
         pipeline = _make_test_pipeline(vllm=vllm)
 
-        # asyncio.run(sleep_partial(...)) is the shrink path — sleep_partial is async
+        # asyncio.run(sleep_partial(...)) is the shrink path â€” sleep_partial is async
         result = pipeline.resize_infer(dp_ranks_to_remove=[1], dp_ranks_to_add=[])
 
         assert result.success is True
@@ -602,14 +602,14 @@ class TestResizeInferDispatch:
 
 
 class TestExpandWorkersAtomic:
-    """F6: _expand_workers must be atomic — activate only after sync+version succeed."""
+    """F6: _expand_workers must be atomic â€” activate only after sync+version succeed."""
 
     def _run_expand(self, pipeline, dp_ranks):
         with patch_ray_get():
             pipeline._expand_workers(dp_ranks_to_add=dp_ranks)
 
     def test_expand_workers_is_atomic_on_success(self):
-        """F6 ordering invariant: mark→wake→sync→finalize→set_version→activate."""
+        """F6 ordering invariant: markâ†’wakeâ†’syncâ†’finalizeâ†’set_versionâ†’activate."""
         shared: List[str] = []  # single list records global call order across all mocks
         vllm = MockVLLMGeneration(dp_size=4, shared_events=shared)
         vllm.active_dp_ranks = {0}
@@ -840,18 +840,18 @@ class TestMissingDependencies:
 
 
 class TestMinimalIntegrationFlow:
-    """F5 + F6: end-to-end mock integration — before→shrink→train→after→expand."""
+    """F5 + F6: end-to-end mock integration â€” beforeâ†’shrinkâ†’trainâ†’afterâ†’expand."""
 
     def test_minimal_f5_f6_integration_flow(self):
         """Simulate a single training step with scheduler-driven shrink + expand.
 
         Timeline:
-          1. on_trajectory_collector_created — collector handle registered
-          2. before_training(0)             — scheduler.request_gpus called (F5)
-          3. [Scheduler side effect]         — resize_infer(remove=[1]) → shrink (F5)
-          4. "training"                      — (simulated)
-          5. after_training(0)              — scheduler.notify_release called (F5)
-          6. [Scheduler side effect]         — resize_infer(add=[1]) → expand (F6)
+          1. on_trajectory_collector_created â€” collector handle registered
+          2. before_training(0)             â€” scheduler.request_gpus called (F5)
+          3. [Scheduler side effect]         â€” resize_infer(remove=[1]) â†’ shrink (F5)
+          4. "training"                      â€” (simulated)
+          5. after_training(0)              â€” scheduler.notify_release called (F5)
+          6. [Scheduler side effect]         â€” resize_infer(add=[1]) â†’ expand (F6)
           7. Verify: rank 1 active, version=1, collector.version=1
         """
         # --- Setup ---
@@ -874,7 +874,7 @@ class TestMinimalIntegrationFlow:
             assert pipeline._trajectory_collector is mock_collector_proxy, \
                 "collector handle must be registered on pipeline after on_trajectory_collector_created"
 
-            # --- Step 2: before_training → scheduler.request_gpus ---
+            # --- Step 2: before_training â†’ scheduler.request_gpus ---
             hooks.before_training(step=0)
             assert len(sched.request_calls) == 1, \
                 "before_training must trigger exactly one scheduler.request_gpus call"
@@ -890,7 +890,7 @@ class TestMinimalIntegrationFlow:
 
             # --- Step 4: "training" happens here (no GPU needed for this test) ---
 
-            # --- Step 5: after_training → scheduler.notify_release ---
+            # --- Step 5: after_training â†’ scheduler.notify_release ---
             hooks.after_training(step=0)
             assert len(sched.release_calls) == 1, \
                 "after_training must trigger exactly one scheduler.notify_release call"
@@ -938,7 +938,7 @@ class TestMinimalIntegrationFlow:
                 # Scheduler expands
                 pipeline.resize_infer(dp_ranks_to_remove=[], dp_ranks_to_add=[1])
 
-        # Two expand cycles: step=0 → version=0, step=1 → version=1 (no bump on expand)
+        # Two expand cycles: step=0 â†’ version=0, step=1 â†’ version=1 (no bump on expand)
         assert pipeline._current_weight_version == 1
         assert collector.weight_version == 1
         # Scheduler was called twice for each side

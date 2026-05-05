@@ -93,6 +93,43 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
         self._reference_cluster_id = f"{self._pipeline_id}_{REFERENCE_CLUSTER_NAME}"
         # Lazily resolved and cached on first use by _get_coordinator_handle().
         self._coordinator_handle: Any = None
+        # Lifecycle tracker for ROLL's CPU bucket cache (Feature 4).
+        self._lifecycle: Any = None  # BucketCacheLifecycle, set during initialize_pipeline
+        # Version of the last committed base-model checkpoint (= _lifecycle.cache_ready_step).
+        self._current_weight_version: Optional[int] = None
+        # ModelUpdateService Ray actor handle (Feature 6), set during initialize_pipeline.
+        self._model_update_service: Any = None
+        # AsyncTrajectoryCollector Ray actor handle for set_weight_version (Feature 6).
+        # Injected by the training loop (grpo.py) via set_trajectory_collector().
+        self._trajectory_collector: Any = None
+
+    def set_trajectory_collector(self, collector: Any) -> None:
+        """Inject the AsyncTrajectoryCollector Ray actor handle (injection path).
+
+        Called by the training loop (grpo.py) after the collector is created.
+        The pipeline also lazily resolves the collector by name via
+        _get_trajectory_collector() when PIPELINE_ID and ROLL_RAY_NAMESPACE are set.
+        Spec: nemorl-port-plan.md lines 490, 538, 603.
+        """
+        self._trajectory_collector = collector
+
+    def _get_trajectory_collector(self) -> Any:
+        """Return the trajectory collector, lazily resolved by named Ray actor if needed."""
+        if self._trajectory_collector is not None:
+            return self._trajectory_collector
+        import os as _os
+        pipeline_id = _os.environ.get("PIPELINE_ID", "")
+        namespace = _os.environ.get("ROLL_RAY_NAMESPACE", "")
+        if not pipeline_id or not namespace:
+            return None
+        try:
+            self._trajectory_collector = ray.get_actor(
+                f"rlix:trajectory_collector:{pipeline_id}",
+                namespace=namespace,
+            )
+        except Exception:
+            pass
+        return self._trajectory_collector
 
     def _get_coordinator_handle(self) -> Any:
         """Resolve and cache the per-pipeline PipelineCoordinator actor handle.
@@ -282,24 +319,31 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
 
                 # Build and promote the initial base-model cache (-1/-1) before offload.
                 # Under sleep_level=2 this cache must stay active so expand can rehydrate infer workers.
+                # Megatron-only: DeepSpeed strategies do not implement bucket cache / checkpoint promotion.
                 init_checkpoint_version = -1
                 self.actor_train.load_states(blocking=True)
-                ray.get(
-                    [
-                        w.build_latest_bucket_cache.remote(
-                            checkpoint_version=int(init_checkpoint_version),
-                        )
-                        for w in self.actor_train.workers
-                    ]
-                )
-                ray.get(
-                    [
-                        w.promote_active_checkpoint.remote(
-                            checkpoint_version=int(init_checkpoint_version),
-                        )
-                        for w in self.actor_train.workers
-                    ]
-                )
+                try:
+                    ray.get(
+                        [
+                            w.build_latest_bucket_cache.remote(
+                                checkpoint_version=int(init_checkpoint_version),
+                            )
+                            for w in self.actor_train.workers
+                        ]
+                    )
+                    ray.get(
+                        [
+                            w.promote_active_checkpoint.remote(
+                                version=int(init_checkpoint_version),
+                            )
+                            for w in self.actor_train.workers
+                        ]
+                    )
+                except RuntimeError as e:
+                    if "does not support" in str(e):
+                        logger.info("[init][%s] skipping bucket cache/checkpoint promotion: %s", self._pipeline_id, e)
+                    else:
+                        raise
 
                 # Offload training-side clusters before initializing actor_infer (avoid transient OOM).
                 logger.info("[init][%s] offloading actor_train before actor_infer init", self._pipeline_id)
@@ -418,9 +462,12 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                 pipeline_id=self._pipeline_id,
                 src_cluster=self.actor_train,
                 tgt_cluster=self.actor_infer,
+                model_update_transport=os.environ.get("RLIX_MODEL_UPDATE_TRANSPORT", "cpu_serialize"),
+                bucket_size_bytes=int(os.environ["RLIX_BUCKET_SIZE_BYTES"]) if os.environ.get("RLIX_BUCKET_SIZE_BYTES") else None,
             )
             # Block until actor init completes.
             ray.get(svc.__ray_ready__.remote())
+            self._model_update_service = svc
             # Start from a well-defined state:
             # - disable routing until we request GPUs from RLix.
             # NOTE: avoid local suspend()/resume() state transitions; shrink-to-zero is the single
@@ -428,6 +475,21 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
             dp_ranks = list(range(self.actor_infer.dp_size))
             ray.get(self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
             ray.get(self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
+
+            # Feature 4: create lifecycle tracker. The initial base-model cache (version=-1)
+            # was already built and promoted above (before actor_infer init). Record the
+            # version in the lifecycle without re-calling workers.
+            from rlix.pipeline.bucket_cache_lifecycle import BucketCacheLifecycle
+
+            self._lifecycle = BucketCacheLifecycle(
+                pipeline_id=self._pipeline_id,
+                workers=list(self.actor_train.workers),
+            )
+            self._lifecycle.mark_promoted(BucketCacheLifecycle._BASE_VERSION)
+            self._current_weight_version = self._lifecycle.cache_ready_step
+            _tc = self._get_trajectory_collector()
+            if _tc is not None:
+                ray.get(_tc.set_weight_version.remote(self._current_weight_version))
 
             self._initialized = True
             return ActionResponse(success=True)
@@ -451,14 +513,48 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
     def _expand_workers(self, *, dp_ranks_to_add: List[int]) -> Dict[str, Any]:
         """Pipeline-local expand helper.
 
-        Train scheduler does weight load + routing; val scheduler does routing-only.
+        Atomic expand sequence (spec: nemorl-port-plan.md lines 589-609):
+          1. Wake overlap ranks (skip_load=True — weights come from CPU bucket cache, not ROLL load).
+          2. Sync weights from CPU bucket cache via ModelUpdateService (Feature 6 path).
+          3. Val scheduler routing update (skip_load=True always).
+          4. Publish _current_weight_version so newly-woken workers are consistent.
         """
         if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
             raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
         with self._infer_resize_lock:
-            # Train: load model states + routing update.
-            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=False))
-            # Val: routing-only (skip_load=True) — shared infer cluster, already loaded by train.
+            # Step 1: Sync weights from CPU bucket cache to the woken workers BEFORE
+            # routing is enabled.  Workers are Ray actors that accept remote calls even
+            # while shrunk; syncing here ensures weights land before rebalance_on_expand
+            # adds the ranks to active_dp_ranks (spec: nemorl-port-plan.md lines 589-609).
+            if hasattr(self, "_model_update_service") and self._model_update_service is not None:
+                ray.get(
+                    self._model_update_service.sync_selected_workers.remote(
+                        tgt_dp_ranks=dp_ranks_to_add,
+                    )
+                )
+
+            # Step 1b: finalize_weight_update — pipeline-owned per spec line 624-632.
+            # Must run after all buckets land (sync_selected_workers returned) and before
+            # routing is activated so inference workers are fully ready.
+            finalize_refs = [
+                self.actor_infer.rank2worker[int(r)].finalize_weight_update.remote()
+                for r in dp_ranks_to_add
+            ]
+            ray.get(finalize_refs)
+
+            # Step 2: Publish version BEFORE activating routing.
+            # Spec (nemorl-port-plan.md lines 602-608): version must be published before
+            # activate_dp_ranks so the collector sees the correct weight version as soon
+            # as newly expanded ranks start serving requests.
+            if self._lifecycle is not None:
+                self._current_weight_version = self._lifecycle.cache_ready_step
+                _tc = self._get_trajectory_collector()
+                if _tc is not None:
+                    ray.get(_tc.set_weight_version.remote(self._current_weight_version))
+
+            # Step 3: Activate routing AFTER version is published.
+            # skip_load=True — weights already synced in step 1.
+            result = ray.get(self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
             ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
             return cast(Dict[str, Any], result)
 
@@ -685,29 +781,14 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                         train_batch_size=self.pipeline_config.rollout_batch_size,
                         include_val=bool(eval_this_step),
                     )
-                    # Release actor_train from the previous step only if it was a non-warmup step
-                    # (which leaves actor_train allocated with ACTOR_TRAINING). Warmup steps release
-                    # all train clusters in Phase 15, so there is nothing to release — use plain request.
-                    prev_step_had_actor_train = global_step > 0 and (
-                        self.pipeline_config.adv_estimator != "gae"
-                        or self.pipeline_config.critic_warmup <= (global_step - 1)
+                    # actor_train GPUs are released immediately at end of each training step (Feature 4/5/6),
+                    # so there is never a deferred release to perform here — always use plain request.
+                    allocated_actor_infer_gpus = self._request_cluster_gpus(
+                        cluster_id=self._actor_infer_cluster_id,
+                        priority=Priority.GENERATION,
+                        global_step=global_step,
+                        step_target_estimate=generation_step_target_estimate,
                     )
-                    if prev_step_had_actor_train:
-                        allocated_actor_infer_gpus = self._notify_release_then_request_cluster_gpus(
-                            release_cluster_id=self._actor_train_cluster_id,
-                            release_global_step=global_step - 1,
-                            request_cluster_id=self._actor_infer_cluster_id,
-                            request_priority=Priority.GENERATION,
-                            request_global_step=global_step,
-                            request_step_target_estimate=generation_step_target_estimate,
-                        )
-                    else:
-                        allocated_actor_infer_gpus = self._request_cluster_gpus(
-                            cluster_id=self._actor_infer_cluster_id,
-                            priority=Priority.GENERATION,
-                            global_step=global_step,
-                            step_target_estimate=generation_step_target_estimate,
-                        )
                     assert len(allocated_actor_infer_gpus) > 0
                     is_partial_allocation = len(allocated_actor_infer_gpus) < len(expected_gpus)
                     logger.info(
@@ -1003,20 +1084,61 @@ class RollFullFinetunePipeline(AgenticPipeline):  # type: ignore[misc]
                             metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
                         metrics["time/train_step"] = actor_train_timer.last
 
-                        # Promote trained weights so expand_sampler can rehydrate infer workers on the next step.
+                        # Feature 4: build CPU bucket cache, then promote to active.
+                        # Build must precede promote (spec: nemorl-port-plan.md:332-338).
+                        # Megatron-only: DeepSpeed strategies do not implement these methods.
                         checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
-                        ray.get(
-                            [
-                                worker.promote_active_checkpoint.remote(checkpoint_version)
-                                for worker in self.actor_train.workers
+                        try:
+                            ray.get(
+                                [
+                                    worker.build_latest_bucket_cache.remote(checkpoint_version)
+                                    for worker in self.actor_train.workers
+                                ]
+                            )
+                            ray.get(
+                                [
+                                    worker.promote_active_checkpoint.remote(checkpoint_version)
+                                    for worker in self.actor_train.workers
+                                ]
+                            )
+                            assert self._lifecycle is not None
+                            self._lifecycle.mark_promoted(checkpoint_version)
+                        except RuntimeError as e:
+                            if "does not support" in str(e):
+                                logger.info("[train][%s] skipping bucket cache build/promote: %s", self._pipeline_id, e)
+                            else:
+                                raise
+
+                        # Offload training weights to CPU before syncing to active infer workers.
+                        self.actor_train.offload_states(blocking=True)
+
+                        # Feature 5/6: sync base weights to all currently-active infer dp ranks.
+                        # sync_selected_workers handles transport; finalize is pipeline-owned (spec line 624).
+                        # Coordinator returns the exact ranks that were synced (may be [] if all sleeping).
+                        coordinator = self._get_coordinator_handle()
+                        synced_ranks: List[int] = ray.get(coordinator.sync_base_weights_to_active.remote())
+
+                        # finalize_weight_update: pipeline-owned, only for the synced ranks (spec line 488-490).
+                        if synced_ranks:
+                            finalize_refs = [
+                                self.actor_infer.rank2worker[int(r)].finalize_weight_update.remote()
+                                for r in synced_ranks
                             ]
+                            ray.get(finalize_refs)
+
+                        # Publish version after sync+finalize completes.
+                        self._current_weight_version = self._lifecycle.cache_ready_step
+                        _tc = self._get_trajectory_collector()
+                        if _tc is not None:
+                            ray.get(_tc.set_weight_version.remote(self._current_weight_version))
+                        # Spec: nemorl-port-plan.md lines 489-490, 536-538.
+
+                        # Release actor_train GPUs immediately (not deferred to next step).
+                        self._notify_release_cluster_gpus(
+                            cluster_id=self._actor_train_cluster_id,
+                            global_step=global_step,
                         )
-
-                        if self.pipeline_config.is_actor_infer_colocated:
-                            self.actor_train.offload_states(blocking=True)
-
-                        # actor_train (ACTOR_TRAINING) remains allocated; released at next step's Phase 4.5.
-                        last_train_cluster_allocated = self._actor_train_cluster_id
+                        last_train_cluster_allocated = None
                     else:
                         # Warmup: Phase 15 released actor_train → critic, then critic was released above.
                         # No train cluster remains allocated.

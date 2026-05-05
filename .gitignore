@@ -67,6 +67,7 @@ output/
 # External dependencies (allow git submodules)
 external/*
 !external/ROLL
+!external/NeMo
 
 ## Internal / personal files (not for release)
 #CLAUDE.md

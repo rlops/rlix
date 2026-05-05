@@ -106,3 +106,68 @@ Plan reference: `/Users/zhenyulin/.claude/plans/humming-sleeping-pumpkin.md`.
   - `miles/utils/tracking_utils.py` + `miles/utils/wandb_utils.py` — lazy wandb import
 - vast-only patches (not version-controlled):
   - ROLL `worker_config.py` SequencePackingConfig field default → default_factory
+
+## Attempt 2 — vast.ai resumed — full Phase A+B init pass, terminal blocker on partial-overlap GPU contention
+- Date: 2026-05-05
+- Branch heads:
+  - rlix `zhenyu/miles-mvp-e2e` @ b333143
+  - miles `zhenyu/m11-mvp-test` @ 7b83be5
+- Vast instance: ssh9.vast.ai:36579, 4× RTX 5090 (32 GB each), CUDA 12.9, py3.12
+
+### Achieved (extending Attempt 1)
+1. F10 topology validation passed (engines=4, per_engine=1, train=2, infer=4, overlap=2)
+2. orchestrator allocate / register / admit ✓
+3. MilesCoordinator named actor created ✓
+4. MilesPipeline.initialize_pipeline scheduled (with `num_gpus=0` after MILES_SKIP_NODE_PG_PIN=1) ✓
+5. **Phase A complete**: train init → bucket cache (988 MB, step=-1) → offload → cache_owner=rank0 → publish_cache_ready_step → release actor_train ✓
+6. **Phase B step1**: request actor_infer → allocated [0,1,2,3] ✓
+7. **Phase B step2a (new)**: `coord.remove_resource_manager_node_pg()` → removed=True ✓
+8. **Phase B step2**: `_create_placement_group(4)` succeeded — 4 bundles on node 172.17.0.10, GPUs 0–3 ✓
+9. **Phase B step3**: `RolloutManager.remote(...)` ✓
+10. **Phase B step4**: `get_engine_count` → 4 engines ✓
+11. **Phase B step5**: `register_model_update_resources` ✓
+12. **Phase B step6**: `bootstrap_active_engines` ✓
+13. `MilesPipeline.initialize_pipeline complete pipeline_id=miles_58beb7a7bc5f engines=4` ✓
+14. Driver pulled handles: `train_group=ok rollout_manager=ok engines=4` ✓
+15. SGLang router up at 172.17.0.10:4077; 4 SGLang engines registered (POST /add_worker for ports 15000/15003/15006/15009 returned 200) ✓
+
+### Terminal failure
+`train_group.set_rollout_manager(rollout_manager)` raised `ActorDiedError`:
+```
+Worker exit type: INTENDED_SYSTEM_EXIT
+Worker exit detail: Destroying worker since its placement group was removed.
+Placement group id: 6ae74ed32dd95b3b6fd78e088ba201000000, bundle index: 0
+```
+The train actors were pinned to ROLL's node-PG (via miles `placement_provider.get_train_workers` → `allocated[idx][0]["placement_group"]`). When Phase B step2a removed the node-PG to free GPUs for the inference PG, Ray killed all actors pinned to it — including the train actors that the loop still needs.
+
+### Root cause: partial-overlap GPU contention without working tms.pause
+With train [0,1] / infer [0,1,2,3] on a 4-GPU machine:
+- ROLL ResourceManagerProxy's node-PG reserves all 4 GPUs.
+- Train actors take 2 of those (2 GPUs reserved).
+- For inference, miles Phase B wants 4 more GPUs from the same physical 4 — needs train to release its physical GPUs first.
+- `torch_memory_saver.pause()` is the standard release mechanism; it crashes on this hardware (CUDA 12.9 / Blackwell / tms 0.0.9) regardless of hook mode (preload segfaults on bucket build, torch crashes on pause).
+- Without `tms.pause`, train actors hold their 2 GPUs throughout. There are 4 GPUs total; engines need 4 → 2-GPU shortfall.
+
+### Why neither escape hatch closes the loop on this hardware
+- **Remove ROLL node-PG (current)**: kills train actors → set_rollout_manager fails on dead actors.
+- **Don't remove ROLL node-PG**: Phase B step2 deadlocks waiting for free GPUs.
+- **Disjoint pools (train=[0,1] / infer=[2,3])**: blocked by `assert_rlix_topology` C1 ("train ⊂ infer required") — rlix-mode is hardcoded for partial overlap.
+
+### Remaining paths to a green smoke (NOT in this attempt)
+- (a) Wait for `torch_memory_saver` >0.0.9 with Blackwell+CUDA12.9 fix.
+- (b) Run on a machine with ≥6 GPUs so train + infer fit without offload.
+- (c) Run on a smaller model (Qwen2.5-0.5B already smallest in the family; can't shrink further).
+- (d) Implement standalone-style placement in placement_provider so train actors aren't pinned to ROLL's node-PG, then remove the node-PG safely.
+
+### Smoke summary
+- Lines that hit "**phaseB step6: bootstrap_active_engines done**" and "**initialize_pipeline complete ... engines=4**" — full Phase A + Phase B init + 4 SGLang engines under rlix-mode driver: **PASS** ✓
+- The actual `--num-rollout 2` training loop (set_rollout_manager → coord.sync_base_weights_to_active(-1) → run_async_train_loop with before_step/after_step around train.train()): **BLOCKED** by tms.pause hardware incompatibility.
+
+### Watchdog parameters in final wrapper
+`/root/rlix/scripts/run_smoke_with_watchdog.sh`:
+- SILENCE_LIMIT default 300s (raised to 600–900s for production runs since import phase can take 80–120s)
+- RUN_LIMIT default 1800s (raised to 2400s for the final attempts)
+
+### Files / commits in Attempt 2
+- rlix `b333143`: MILES_SKIP_NODE_PG_PIN + remove_resource_manager_node_pg + Phase B bisect logs
+- miles `7b83be5`: forward MILES_* env vars to coordinator runtime_env

@@ -197,10 +197,14 @@ class MilesPipeline:
         # scheduler can satisfy actor_infer when the GPU pool is sized
         # for one role at a time. Mirrors the canonical pattern in
         # rlix.pipeline.full_finetune_pipeline (init L308-312).
-        self._notify_release_cluster_gpus(
+        # R11-F1: only flip the ledger flag after a SUCCESSFUL release —
+        # otherwise shutdown_hard would skip the cluster_id and leak the
+        # allocation server-side.
+        released = self._notify_release_cluster_gpus(
             cluster_id=self._actor_train_cluster_id, global_step=-1
         )
-        self._actor_train_allocated = False
+        if released:
+            self._actor_train_allocated = False
 
     def _init_phase_b_infer(self) -> None:
         """Step 7 — actor_infer side.
@@ -212,16 +216,47 @@ class MilesPipeline:
         """
         miles_args = getattr(self._pipeline_config, "miles_args")
 
-        self._request_cluster_gpus(
+        infer_allocated = self._request_cluster_gpus(
             cluster_id=self._actor_infer_cluster_id,
             priority=Priority.INITIALIZATION,
             global_step=-1,
         )
         self._actor_infer_allocated = True
+        # R11-F2 fail-fast: confirm the rlix scheduler granted the full
+        # infer pool. The downstream _create_placement_group bypasses the
+        # scheduler ledger — accepting a subset grant here would let Ray
+        # oversubscribe in dual-pipeline.
+        expected_infer_count = int(miles_args.rollout_num_gpus)
+        if len(set(infer_allocated)) < expected_infer_count:
+            raise RuntimeError(
+                "scheduler granted %d actor_infer GPUs but pipeline requires "
+                "%d (cluster_id=%s); _create_placement_group would bypass the "
+                "scheduler ledger and double-count under multi-pipeline. "
+                "Wait for full grant or wire the placement_provider path "
+                "(M11.2 follow-up)."
+                % (len(set(infer_allocated)), expected_infer_count,
+                   self._actor_infer_cluster_id)
+            )
 
         # Construct legacy `pg` for the inference pool. The standalone
         # MILES path uses _create_placement_group directly; we mirror it
         # here so start_rollout_servers can do its normal thing.
+        #
+        # R11-F2 (M11.1 -> M11.2 deferred): _create_placement_group calls
+        # ``ray.util.placement_group(...)`` against Ray's free GPU pool
+        # directly, independent of the rlix scheduler ledger. In M11.1
+        # single-pipeline this is benign because the scheduler grant for
+        # actor_infer exhausts the pool, so Ray's PG and the rlix ledger
+        # reference the same physical GPUs. For M11.2 dual-pipeline this
+        # bypass would let Ray oversubscribe a pool the rlix scheduler is
+        # already serving to a peer pipeline. The clean fix is to route
+        # through ``self._placement_provider.get_all_rollout_engine_placements()``
+        # but that requires shaping the returned WorkerPlacement list back
+        # into the (pg, reordered_bundle_indices, reordered_gpu_ids) tuple
+        # ``RolloutManager.__init__`` consumes — work tracked as M11.2
+        # follow-up. For now, fail-fast if the scheduler grant returns a
+        # subset that does NOT cover the full infer pool, so we can't
+        # silently mis-route under multi-pipeline contention.
         from miles.ray.placement_group import _create_placement_group
 
         pg, reordered_bundle_indices, reordered_gpu_ids = _create_placement_group(
@@ -308,11 +343,13 @@ class MilesPipeline:
             self._coordinator_handle.sync_base_weights_to_active.remote(int(step))
         )
         # Release the actor_train allocation back to the scheduler so
-        # other pipelines can step.
-        self._notify_release_cluster_gpus(
+        # other pipelines can step. R11-F1: only flip the ledger flag
+        # after a SUCCESSFUL release.
+        released = self._notify_release_cluster_gpus(
             cluster_id=self._actor_train_cluster_id, global_step=int(step)
         )
-        self._actor_train_allocated = False
+        if released:
+            self._actor_train_allocated = False
 
     # ------------------------------------------------------------------
     # M4 minimal hard cleanup
@@ -323,7 +360,15 @@ class MilesPipeline:
         # actors, then release per-cluster_id ledger.
         if self._rollout_manager is not None:
             try:
-                ray.get(self._rollout_manager.shutdown_hard.remote())
+                # R11-F3: bound the outer ray.get so a wedged manager
+                # cannot block ledger release. Inner per-engine
+                # shutdown.remote already has its own 10s timeout
+                # (rollout.py:1013); 30s here is the worst-case bound
+                # for N parallel engine shutdowns plus monitor stop.
+                ray.get(
+                    self._rollout_manager.shutdown_hard.remote(),
+                    timeout=30.0,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("shutdown_hard: rollout_manager failed: %r", exc)
             try:
@@ -414,12 +459,23 @@ class MilesPipeline:
             )
         return allocated
 
-    def _notify_release_cluster_gpus(self, *, cluster_id: str, global_step) -> None:
+    def _notify_release_cluster_gpus(self, *, cluster_id: str, global_step) -> bool:
         """Synchronous release. Uses ray.get so the release is committed
-        before this method returns (P2-13 fix)."""
+        before this method returns (P2-13 fix).
+
+        Returns True iff the scheduler RPC completed successfully — the
+        caller MUST consult the return value before flipping any
+        per-cluster_id ledger flag (R11-F1 fix). Returning False (or
+        receiving None scheduler handle) means the cluster_id may still
+        be allocated server-side; ``shutdown_hard`` will retry the
+        release if the flag stays True.
+        """
         scheduler = self._get_scheduler_handle(silent_on_missing=True)
         if scheduler is None:
-            return
+            # No scheduler reachable — treat as failure so the caller
+            # leaves the ledger flag set and ``shutdown_hard`` can
+            # retry once the scheduler is available again.
+            return False
         try:
             ray.get(
                 scheduler.notify_release_gpus.remote(
@@ -428,10 +484,12 @@ class MilesPipeline:
                 ),
                 timeout=10.0,
             )
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "_notify_release_cluster_gpus(%s) failed: %r", cluster_id, exc
             )
+            return False
 
     def _run_async(self, coro):
         """Drive a coroutine to completion from a sync method.

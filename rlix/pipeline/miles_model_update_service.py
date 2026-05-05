@@ -190,6 +190,15 @@ class MilesModelUpdateService:
             )
         cpu_serialize_set = target - broadcast_set
 
+        # R06-F1 fix: track every Ray ObjectRef issued by this atomic
+        # unit so an asyncio.wait_for timeout (or any other cancellation)
+        # can fan out ray.cancel(force=True) on them. Without this, the
+        # local coroutine cancels but the Ray actor methods on
+        # cache_owner / rollout_manager keep running and continue to
+        # hold cache_owner._cache_lock — the next sync_selected_workers
+        # call would queue behind the still-executing prior method.
+        inflight_refs: list = []
+
         async def _run() -> int:
             return await self._run_atomic_unit(
                 sync_id=sync_id,
@@ -197,11 +206,44 @@ class MilesModelUpdateService:
                 version=int(version),
                 cpu_serialize_set=cpu_serialize_set,
                 broadcast_set=broadcast_set,
+                inflight_refs=inflight_refs,
             )
 
-        if self._timeout_s is None or self._timeout_s <= 0:
-            return await _run()
-        return await asyncio.wait_for(_run(), timeout=float(self._timeout_s))
+        try:
+            if self._timeout_s is None or self._timeout_s <= 0:
+                return await _run()
+            return await asyncio.wait_for(_run(), timeout=float(self._timeout_s))
+        except asyncio.TimeoutError:
+            self._cancel_inflight(inflight_refs, reason="wait_for timeout")
+            raise
+        except asyncio.CancelledError:
+            # Outer cancellation (caller cancelled sync_selected_workers
+            # task) — propagate after firing ray.cancel so we don't leak
+            # inflight Ray work either.
+            self._cancel_inflight(inflight_refs, reason="task cancelled")
+            raise
+
+    def _cancel_inflight(self, inflight_refs: list, *, reason: str) -> None:
+        if not inflight_refs:
+            return
+        logger.warning(
+            "[MilesModelUpdateService] cancelling %d inflight ObjectRefs "
+            "pipeline_id=%s reason=%s",
+            len(inflight_refs),
+            self._pipeline_id,
+            reason,
+        )
+        for ref in inflight_refs:
+            try:
+                ray.cancel(ref, force=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ray.cancel failed pipeline_id=%s reason=%s exc=%r",
+                    self._pipeline_id,
+                    reason,
+                    exc,
+                )
+        inflight_refs.clear()
 
     async def _run_atomic_unit(
         self,
@@ -211,9 +253,14 @@ class MilesModelUpdateService:
         version: int,
         cpu_serialize_set: frozenset[int],
         broadcast_set: frozenset[int],
+        inflight_refs: list,
     ) -> int:
+        # Each .remote() is captured into inflight_refs BEFORE we await
+        # so the outer cancellation handler can fire ray.cancel(force=True)
+        # on every dispatched ref (R06-F1).
         # (1) Read-only entry: fetch per-engine handles from manager.
         handles_ref = self._rollout_manager.get_engine_handles.remote(sorted(target))
+        inflight_refs.append(handles_ref)
         handles: dict[int, Any] = await _ray_get(handles_ref)
         if set(handles.keys()) != set(target):
             raise RuntimeError(
@@ -228,28 +275,31 @@ class MilesModelUpdateService:
             target_handles=handles,
             cpu_serialize_set=cpu_serialize_set,
             broadcast_set=broadcast_set,
+            inflight_refs=inflight_refs,
         )
 
         # (3) Single composite RPC into the cache_owner. F04 invariant
         #     means run_sync_session is the ONLY top-level Ray method
         #     used for transport.
-        await _ray_get(self._cache_owner_actor.run_sync_session.remote(plan))
+        sync_ref = self._cache_owner_actor.run_sync_session.remote(plan)
+        inflight_refs.append(sync_ref)
+        await _ray_get(sync_ref)
 
         # (4) Finalize fan-out. F21: per-bucket payload had no version;
         #     finalize_weight_update on every receiver flushes pending
         #     work so update_weight_version below is observed at the
         #     next prefill.
-        await _ray_get(
-            [h.finalize_weight_update.remote() for h in handles.values()]
-        )
+        finalize_refs = [h.finalize_weight_update.remote() for h in handles.values()]
+        inflight_refs.extend(finalize_refs)
+        await _ray_get(finalize_refs)
 
         # (5) Single version publish (F21). Pipeline / coordinator MUST
         #     NOT call this directly — only the service does.
-        await _ray_get(
-            self._rollout_manager.set_weight_version.remote(
-                int(version), engine_indices=sorted(target)
-            )
+        publish_ref = self._rollout_manager.set_weight_version.remote(
+            int(version), engine_indices=sorted(target)
         )
+        inflight_refs.append(publish_ref)
+        await _ray_get(publish_ref)
         logger.info(
             "[MilesModelUpdateService] sync_selected_workers_done pipeline_id=%s "
             "sync_id=%s version=%s targets=%s cpu_serialize=%s broadcast=%s",
@@ -270,6 +320,7 @@ class MilesModelUpdateService:
         target_handles: dict[int, Any],
         cpu_serialize_set: frozenset[int],
         broadcast_set: frozenset[int],
+        inflight_refs: list,
     ) -> dict[str, Any]:
         # F26 / C16: master_port != 0. Claim a free port from the
         # cache_owner actor (not 0; not picked by the receiver) and
@@ -277,6 +328,8 @@ class MilesModelUpdateService:
         # service instances can avoid collisions.
         master_addr_ref = self._cache_owner_actor.get_node_ip.remote()
         master_port_ref = self._cache_owner_actor.get_free_port.remote()
+        inflight_refs.append(master_addr_ref)
+        inflight_refs.append(master_port_ref)
         master_addr_raw, master_port_raw = await _ray_get(
             [master_addr_ref, master_port_ref]
         )
@@ -309,24 +362,28 @@ class MilesModelUpdateService:
         if shared_storage is not None:
             for attempt in range(8):
                 claim_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"
-                claimed = bool(
-                    await _ray_get(shared_storage.try_put.remote(claim_key, self._pipeline_id))
-                )
+                try_put_ref = shared_storage.try_put.remote(claim_key, self._pipeline_id)
+                inflight_refs.append(try_put_ref)
+                claimed = bool(await _ray_get(try_put_ref))
                 if claimed:
                     break
                 # Collision — pick another free port and re-try.
-                next_port = int(await _ray_get(self._cache_owner_actor.get_free_port.remote()))
+                next_port_ref = self._cache_owner_actor.get_free_port.remote()
+                inflight_refs.append(next_port_ref)
+                next_port = int(await _ray_get(next_port_ref))
+                # Always advance master_port to the new pick to avoid
+                # burning a budget slot on the same key (R06-F4).
                 if next_port == master_port:
                     # get_free_port returned the same value; tiny
-                    # back-off + retry.
+                    # back-off + retry on a fresh try_put round.
                     await asyncio.sleep(0.05)
-                    continue
                 master_port = next_port
             else:
                 raise RuntimeError(
                     "SharedStorage port-claim retry budget exhausted "
-                    f"(addr={master_addr}); release stale claims before "
-                    "retrying."
+                    f"(pipeline_id={self._pipeline_id} addr={master_addr} "
+                    f"last_port={master_port} attempts=8); release stale "
+                    "claims before retrying."
                 )
 
         # Per-engine NCCL rank within the dynamic broadcast group.

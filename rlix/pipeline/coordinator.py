@@ -296,6 +296,18 @@ class PipelineCoordinator(Coordinator):
         # allowing multi-pipeline startup/admission to proceed concurrently.
         return self._pipeline_actor
 
+    def report_progress(self, report: ProgressReport) -> None:
+        """F9: Receive a ProgressReport from a NeMo RL training hook and forward.
+
+        Called fire-and-forget by NemoRLRLixHooks._emit_progress() in the
+        AsyncTrajectoryCollector actor.  Delegates to report_progress_from_scheduler
+        so the coordinator's aggregation and 2%-bucket deduplication logic applies.
+
+        Args:
+            report: ProgressReport produced by NemoRLRLixHooks with mode="train".
+        """
+        self.report_progress_from_scheduler(report)
+
     def report_progress_from_scheduler(self, report: ProgressReport) -> None:
         """Aggregate per-scheduler progress and forward to the rlix scheduler.
 

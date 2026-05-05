@@ -4,4 +4,5 @@
 	branch = rlix
 [submodule "external/NeMo"]
 	path = external/NeMo
-	url = https://github.com/zhenyulincs/RL.git
+	url = https://github.com/TianyeGGBond/RL.git
+	branch = nemo

@@ -470,6 +470,25 @@ class MilesCoordinator(Coordinator):
                 "must come from MilesPipeline.initialize_pipeline Step 7, "
                 "not from resize_infer."
             )
+        if unique_states == {"active"}:
+            # Smoke-time hatch: miles' RolloutManager brings engines up
+            # in "active" state directly (no shell→offloaded→active
+            # transition). When the scheduler's gap-ratio planner fires
+            # the first GEN expand after init, the engines are already
+            # active; treat it as a no-op so the cycle can commit the
+            # allocation bookkeeping. Engines already serve traffic, the
+            # base v=-1 sync was driven from MilesPipeline init step7,
+            # and routing is alive (RolloutManager.add_worker fired
+            # during start_rollout_servers).
+            with self._resize_sync_lock:
+                self._active_engine_indices |= set(engine_indices)
+            logger.info(
+                "[MilesCoordinator] _expand_workers: engines already 'active' "
+                "(M11.x init-comes-up-active branch); skipping wake/sync/activate_routing "
+                "engine_indices=%s",
+                sorted(engine_indices),
+            )
+            return
         if unique_states != {"offloaded"}:
             # Heterogeneous entry states are an upstream error per scope F37.
             raise RuntimeError(

@@ -289,9 +289,33 @@ class MilesModelUpdateService:
         #     finalize_weight_update on every receiver flushes pending
         #     work so update_weight_version below is observed at the
         #     next prefill.
+        # (4.pre, rlix-mode safety) pause each engine's scheduler before
+        # finalize_weight_update. ``finalize_weight_update`` invokes
+        # SGLang's ``/flush_cache`` which loops up to 60 s waiting for
+        # the request queue to drain. With a fully-async rollout
+        # function, the rollout-data return does not synchronously
+        # quiesce the engine — pending decode batches keep the queue
+        # non-empty and flush_cache times out. ``pause_generation``
+        # retracts the in-flight batch and reaches a quiescent state
+        # so the subsequent flush_cache returns 200 immediately.
+        try:
+            pause_refs = [h.pause_generation.remote(mode="retract") for h in handles.values()]
+            await _ray_get(pause_refs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[MilesModelUpdateService] pause_generation pre-finalize failed: %r", exc
+            )
         finalize_refs = [h.finalize_weight_update.remote() for h in handles.values()]
         inflight_refs.extend(finalize_refs)
         await _ray_get(finalize_refs)
+        # (4.post) resume the engines so subsequent generate calls work.
+        try:
+            cont_refs = [h.continue_generation.remote() for h in handles.values()]
+            await _ray_get(cont_refs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[MilesModelUpdateService] continue_generation post-finalize failed: %r", exc
+            )
 
         # (5) Single version publish (F21). Pipeline / coordinator MUST
         #     NOT call this directly — only the service does.

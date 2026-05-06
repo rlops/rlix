@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Optional
 
 import ray
@@ -172,7 +173,17 @@ class MilesPipeline:
             # engines to also schedule on the same bundle.
             num_gpus_per_actor=0,
             role="actor",
-            with_ref=False,
+            # Match miles standalone (placement_group.py:192): ref model
+            # required when KL loss / KL coefficient are active. Without
+            # this, train_actor's ref_log_probs computation is skipped
+            # (gated on `"ref" in self.weights_backuper.backup_tags`)
+            # and policy_loss_function crashes with
+            # ``torch.cat(None, dim=0)`` because batch["ref_log_probs"]
+            # is None.
+            with_ref=bool(
+                getattr(miles_args, "use_kl_loss", False)
+                or float(getattr(miles_args, "kl_coef", 0.0)) != 0.0
+            ),
         )
         self._run_async(self._train_group.init())
 
@@ -366,9 +377,170 @@ class MilesPipeline:
         ray.get(self._coordinator_handle.sync_base_weights_to_active.remote(-1))
         logger.info("[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) done")
 
+        # Step 8: transition actor_infer from INITIALIZATION → GENERATION
+        # priority. INITIALIZATION is the highest priority and the
+        # scheduler will NEVER preempt it; subsequent ACTOR_TRAINING
+        # requests would block forever. Release at INITIALIZATION then
+        # re-request at GENERATION (preemptable). Mirrors the canonical
+        # full_finetune_pipeline pattern (init → release → runtime
+        # re-request at GENERATION).
+        logger.info("[MilesPipeline] phaseB step8: actor_infer init→GENERATION transition start")
+        released_infer = self._notify_release_cluster_gpus(
+            cluster_id=self._actor_infer_cluster_id, global_step=-1
+        )
+        if released_infer:
+            self._actor_infer_allocated = False
+        # The scheduler's gap-ratio planner skips GENERATION clusters with
+        # both progress=0 AND step_target_estimate=None, hanging the request.
+        # Estimate per-rollout trajectory demand from miles_args:
+        #   rollout_batch_size × n_samples_per_prompt
+        gen_step_target_estimate = max(
+            int(getattr(miles_args, "rollout_batch_size", 1))
+            * int(getattr(miles_args, "n_samples_per_prompt", 1)),
+            1,
+        )
+        regranted = self._request_cluster_gpus(
+            cluster_id=self._actor_infer_cluster_id,
+            priority=Priority.GENERATION,
+            global_step=-1,
+            step_target_estimate=gen_step_target_estimate,
+        )
+        self._actor_infer_allocated = True
+        logger.info(
+            "[MilesPipeline] phaseB step8: actor_infer init→GENERATION done released=%s allocated=%s step_target_estimate=%d",
+            released_infer, regranted, gen_step_target_estimate,
+        )
+
     # ------------------------------------------------------------------
     # Runtime hooks
     # ------------------------------------------------------------------
+
+    def _wait_for_overlap_engines_offloaded(self, allocated_train_gpus, *, timeout_s: float = 60.0) -> None:
+        """After scheduler grants actor_train, poll the rollout manager
+        until the engines on overlap GPUs have transitioned to ``offloaded``
+        AND the OS-reported GPU memory is actually free. SGLang's HTTP
+        ``/release_memory_occupation`` 200 OK + state="offloaded" do not
+        by themselves guarantee the CUDA driver has returned the memory
+        to the OS pool — the wake_up in the next-process train actor
+        would then OOM. Verify actual GPU mem free by parsing
+        ``nvidia-smi --query-gpu=memory.free`` on the same node, since
+        miles' single-node smoke topology has driver+actors+engines all
+        on the head node and ``CUDA_VISIBLE_DEVICES`` is the per-actor
+        slice of the shared physical pool.
+        """
+        rollout_manager = getattr(self, "_rollout_manager", None)
+        if rollout_manager is None:
+            return
+        miles_args = self._pipeline_config.miles_args
+        per_engine = max(int(getattr(miles_args, "rollout_num_gpus_per_engine", 1)), 1)
+        target_indices = sorted({int(g) // per_engine for g in allocated_train_gpus})
+        target_gpu_ids = sorted(set(int(g) for g in allocated_train_gpus))
+        if not target_indices:
+            return
+
+        # Phase 1: wait for engine state transitions to "offloaded" / "shell".
+        deadline = time.time() + float(timeout_s)
+        uniq: set = set()
+        while time.time() < deadline:
+            try:
+                states = ray.get(
+                    rollout_manager.get_engine_states.remote(target_indices)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "_wait_for_overlap_engines_offloaded: get_engine_states failed: %r", exc
+                )
+                return
+            uniq = {states.get(i, "?") for i in target_indices}
+            if uniq.issubset({"offloaded", "shell"}):
+                logger.info(
+                    "_wait_for_overlap_engines_offloaded: engines %s reached state=%s",
+                    target_indices, uniq,
+                )
+                break
+            time.sleep(0.1)
+        else:
+            logger.warning(
+                "_wait_for_overlap_engines_offloaded: state timeout after %.1fs; "
+                "engines %s still in state=%r",
+                timeout_s, target_indices, uniq,
+            )
+
+        # Phase 2: probe nvidia-smi for OS-level free memory on the
+        # overlap GPU IDs. The train actor will need ~3.7 GB for the
+        # 0.5B model + a few GB for activations; aim for ≥20 GB free
+        # before we let _before_training proceed to wake_up.
+        target_free_gb = 20.0
+        deadline2 = time.time() + float(timeout_s)
+        last_min_free_gb: Optional[float] = None
+        while time.time() < deadline2:
+            min_free_gb = self._probe_min_free_gpu_mem_gb(target_gpu_ids)
+            if min_free_gb is None:
+                # nvidia-smi unavailable or unparseable — fall back to a
+                # short grace sleep so we don't spin forever.
+                logger.warning(
+                    "_wait_for_overlap_engines_offloaded: nvidia-smi probe unavailable; "
+                    "falling back to 3s grace sleep"
+                )
+                time.sleep(3.0)
+                return
+            last_min_free_gb = min_free_gb
+            if min_free_gb >= target_free_gb:
+                logger.info(
+                    "_wait_for_overlap_engines_offloaded: OS-level GPU mem free "
+                    "min=%.2f GB across overlap GPUs %s (target=%.1f GB)",
+                    min_free_gb, target_gpu_ids, target_free_gb,
+                )
+                return
+            time.sleep(0.5)
+        logger.warning(
+            "_wait_for_overlap_engines_offloaded: free-mem timeout after %.1fs; "
+            "min_free_gb=%.2f below %.1f GB target on GPUs %s — wake_up may OOM",
+            timeout_s,
+            last_min_free_gb if last_min_free_gb is not None else float("nan"),
+            target_free_gb,
+            target_gpu_ids,
+        )
+
+    @staticmethod
+    def _probe_min_free_gpu_mem_gb(gpu_ids: list[int]) -> Optional[float]:
+        """Return the minimum free GPU memory (GB) across ``gpu_ids`` as
+        reported by ``nvidia-smi``. Returns ``None`` if nvidia-smi is
+        not available or output cannot be parsed.
+        """
+        if not gpu_ids:
+            return None
+        import shutil
+        import subprocess
+
+        if shutil.which("nvidia-smi") is None:
+            return None
+        try:
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    f"--id={','.join(str(g) for g in gpu_ids)}",
+                    "--query-gpu=memory.free",
+                    "--format=csv,noheader,nounits",
+                ],
+                stderr=subprocess.STDOUT,
+                timeout=5.0,
+            ).decode("utf-8", errors="replace")
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.debug("nvidia-smi probe failed: %r", exc)
+            return None
+        free_mibs: list[float] = []
+        for line in out.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                free_mibs.append(float(line))
+            except ValueError:
+                continue
+        if not free_mibs:
+            return None
+        return min(free_mibs) / 1024.0
 
     def _before_training(self, step: int) -> None:
         if not self._initialized:
@@ -383,12 +555,24 @@ class MilesPipeline:
             global_step=int(step),
         )
         self._actor_train_allocated = True
+        # Race-free wait: scheduler awaits resize_infer (shrink_engines)
+        # but SGLang's release_memory_occupation 200 OK is async wrt the
+        # CUDA caching allocator. Poll the engine states so wake_up never
+        # sees the old occupation (Rank 0 saw 29.39 GB used previously).
+        self._wait_for_overlap_engines_offloaded(allocated)
         if not allocated or len(set(allocated)) < train_count:
             raise RuntimeError(
                 f"_before_training: scheduler returned undersized actor_train "
                 f"allocation ({allocated}); expected {train_count} GPUs"
             )
-        self._run_async(self._train_group.onload())
+        # Do NOT call train_group.onload() here: when args.offload_train is
+        # set, MegatronTrainRayActor.train() already wakes up internally
+        # (see miles/backends/megatron_utils/actor.py:357). Adding an
+        # onload here causes a double wake_up — the second call hits
+        # `[torch_memory_saver.cpp] Cannot resume allocation that is not
+        # paused` because tms regions are already resumed. Leave the
+        # actor offloaded; rlix_train_loop will dispatch train() which
+        # wakes up safely.
 
     def _after_training(self, step: int) -> None:
         if not self._initialized:
@@ -525,20 +709,30 @@ class MilesPipeline:
         cluster_id: str,
         priority,
         global_step: int,
+        step_target_estimate: int | None = None,
     ) -> list[int]:
         """Block until scheduler allocates GPUs for ``cluster_id``.
 
         Mirrors rlix.pipeline.full_finetune_pipeline._request_cluster_gpus
         (P1-3 fix — real scheduler API is request_gpus, not the prior
         request_cluster_gpus(pipeline_id=, role=, num_gpus=) signature).
+
+        ``step_target_estimate`` is required for ``priority=GENERATION``
+        requests when no per-pipeline progress metric has been published
+        yet — the planner's gap-ratio path skips clusters with both
+        progress=0 AND step_target_estimate=None, which would block the
+        request forever.
         """
         scheduler = self._get_scheduler_handle()
+        kwargs = dict(
+            cluster_id=str(cluster_id),
+            priority=priority,
+            global_step=int(global_step),
+        )
+        if step_target_estimate is not None:
+            kwargs["step_target_estimate"] = int(step_target_estimate)
         allocated = ray.get(
-            scheduler.request_gpus.remote(
-                cluster_id=str(cluster_id),
-                priority=priority,
-                global_step=int(global_step),
-            )
+            scheduler.request_gpus.remote(**kwargs)
         )
         if not isinstance(allocated, list):
             raise RuntimeError(

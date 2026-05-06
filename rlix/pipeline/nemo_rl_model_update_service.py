@@ -39,7 +39,10 @@ class NemoRLModelUpdateService:
         policy:            NeMo RL policy object. Must expose worker actors that
                            implement selective_sync_active_cache (MegatronPolicyWorkerImpl).
                            Supported patterns: .src_cluster.workers, .workers, list, single actor.
-        policy_generation: VllmGeneration Ray actor handle.
+        policy_generation: VllmGeneration Python object (not a Ray actor).
+        policy_workers:    Optional pre-resolved training worker actor handles.
+        model_update_receiver:
+                           Optional pre-resolved inference receiver surface.
     """
 
     def __init__(
@@ -48,12 +51,16 @@ class NemoRLModelUpdateService:
         pipeline_id: str,
         policy: Any,
         policy_generation: Any,
+        policy_workers: Optional[List[Any]] = None,
+        model_update_receiver: Optional[Any] = None,
     ) -> None:
         if not isinstance(pipeline_id, str) or not pipeline_id:
             raise ValueError("pipeline_id must be a non-empty str")
         self._pipeline_id = pipeline_id
         self._policy = policy
         self._policy_generation = policy_generation
+        self._policy_workers = list(policy_workers or [])
+        self._model_update_receiver = model_update_receiver
 
         logger.info("[NemoRLModelUpdateService] init pipeline_id=%s", pipeline_id)
 
@@ -87,9 +94,13 @@ class NemoRLModelUpdateService:
         )
 
         # --- Step 1: inference receiver surface ---
-        # VllmGeneration is a Ray actor; get_model_update_receiver returns a
-        # SimpleNamespace(workers, rank2worker, worker_config).
-        receiver = ray.get(self._policy_generation.get_model_update_receiver.remote())
+        # VllmGeneration is a plain Python class (not a Ray actor). Prefer the
+        # pre-resolved receiver surface so this Ray actor only stores actor
+        # handles and small config objects.
+        if self._model_update_receiver is not None:
+            receiver = self._model_update_receiver
+        else:
+            receiver = self._policy_generation.get_model_update_receiver()
         num_gpus_per_worker: int = int(receiver.worker_config.num_gpus_per_worker)
         device_mapping: List[int] = list(receiver.worker_config.device_mapping or [])
         dp_size: int = len(receiver.rank2worker)
@@ -137,7 +148,15 @@ class NemoRLModelUpdateService:
         # --- Step 4: finalize post-load hooks on all inference workers ---
         # VllmGeneration.finalize_weight_update() is a pass-through that calls
         # process_weights_after_loading on all workers (idempotent).
-        ray.get(self._policy_generation.finalize_weight_update.remote())
+        if self._policy_generation is not None:
+            self._policy_generation.finalize_weight_update()
+        else:
+            ray.get(
+                [
+                    receiver.rank2worker[int(dp_rank)].finalize_weight_update.remote()
+                    for dp_rank in range(dp_size)
+                ]
+            )
 
         # --- Step 5: optional weight verification ---
         if verify:
@@ -147,7 +166,17 @@ class NemoRLModelUpdateService:
                     weight_stats = r["weight_stats"]
                     break
             if weight_stats:
-                ray.get(self._policy_generation.verify_model.remote(weight_stats))
+                if self._policy_generation is not None:
+                    self._policy_generation.verify_model(weight_stats)
+                else:
+                    ray.get(
+                        [
+                            receiver.rank2worker[int(dp_rank)].verify_model.remote(
+                                weight_stats
+                            )
+                            for dp_rank in range(dp_size)
+                        ]
+                    )
 
         logger.info(
             "[NemoRLModelUpdateService] sync_selected_workers done "
@@ -160,35 +189,42 @@ class NemoRLModelUpdateService:
         """Resolve list of training worker Ray actor handles from self._policy.
 
         Tries common NeMo RL policy API patterns in priority order:
-          1. policy.src_cluster.workers  (NeMo RL ClusterSpec pattern)
-          2. policy.workers              (direct cluster with .workers list)
-          3. policy itself is a list/tuple of Ray actor handles
-          4. policy is a single Ray actor handle
+          1. policy.worker_group.workers (NeMo RL Policy pattern)
+          2. policy.src_cluster.workers  (NeMo RL ClusterSpec pattern)
+          3. policy.workers              (direct cluster with .workers list)
+          4. policy itself is a list/tuple of Ray actor handles
         """
-        # Pattern 1: policy.src_cluster.workers
+        if self._policy_workers:
+            return list(self._policy_workers)
+
+        # Pattern 1: policy.worker_group.workers
+        worker_group = getattr(self._policy, "worker_group", None)
+        if worker_group is not None:
+            workers = getattr(worker_group, "workers", None)
+            if workers:
+                return list(workers)
+
+        # Pattern 2: policy.src_cluster.workers
         src_cluster = getattr(self._policy, "src_cluster", None)
         if src_cluster is not None:
             workers = getattr(src_cluster, "workers", None)
             if workers:
                 return list(workers)
 
-        # Pattern 2: policy.workers
+        # Pattern 3: policy.workers
         workers = getattr(self._policy, "workers", None)
         if workers:
             return list(workers)
 
-        # Pattern 3: policy is a list/tuple of actor handles
+        # Pattern 4: policy is a list/tuple of actor handles
         if isinstance(self._policy, (list, tuple)) and self._policy:
             return list(self._policy)
-
-        # Pattern 4: single actor handle
-        if self._policy is not None:
-            return [self._policy]
 
         raise RuntimeError(
             f"[NemoRLModelUpdateService] Cannot resolve training workers from policy "
             f"(type={type(self._policy).__name__}). Policy must expose "
-            ".src_cluster.workers, .workers, or be a list/single Ray actor handle."
+            ".worker_group.workers, .src_cluster.workers, .workers, or be a list "
+            "of Ray actor handles."
         )
 
     def __repr__(self) -> str:

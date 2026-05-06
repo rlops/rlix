@@ -23,7 +23,6 @@ Feature dependencies in this file:
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import threading
@@ -121,6 +120,12 @@ class NemoRLRLixHooks:
         )
         self._pipeline._trajectory_collector = collector
 
+    def begin_progress_batch(self, step: int, count_intended: int) -> None:
+        pass
+
+    def end_progress_batch(self, step: int, trajectories_collected: int) -> None:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Pipeline actor
@@ -178,6 +183,7 @@ class NemoRLFullFinetunePipeline:
         self._policy: Optional[Any] = None
         self._policy_generation: Optional[Any] = None
         self._model_update_service: Optional[Any] = None
+        self._nemo_setup_result: Optional[tuple] = None
 
         self._coordinator_handle: Optional[Any] = None
 
@@ -271,6 +277,12 @@ class NemoRLFullFinetunePipeline:
                 "[%s] initialize_pipeline start", self._pipeline_id
             )
 
+            # Build the NeMo Policy/VllmGeneration objects once. They are plain
+            # Python handles that own Ray worker groups, so all later lifecycle
+            # calls must run after this setup has populated self._policy and
+            # self._policy_generation.
+            self._setup_nemo_rl_objects()
+
             # ----------------------------------------------------------------
             # Phase 1: Training init
             # ----------------------------------------------------------------
@@ -355,9 +367,7 @@ class NemoRLFullFinetunePipeline:
         """Abort-drain-sleep selected DP shards.
 
         Delegates to VllmGeneration.sleep_partial() which implements the
-        abort → drain (poll engine idle) → sleep sequence (Feature 2).
-        sleep_partial is an async method; we run it in a fresh event loop to
-        keep this sync Ray actor method unblocked.
+        abort → drain → sleep sequence (Feature 2).
         """
         if not dp_ranks_to_remove:
             raise ValueError("dp_ranks_to_remove must be non-empty")
@@ -374,11 +384,15 @@ class NemoRLFullFinetunePipeline:
             return
 
         # Feature 2: VllmGeneration.sleep_partial(dp_ranks, level=2)
-        # Implements: mark _preempted_shards → abort_all_requests → drain → sleep.
-        # It's an async method because drain needs to poll engine idle.
-        asyncio.run(
-            self._policy_generation.sleep_partial(dp_ranks_to_remove, level=2)
+        # Synchronous method; internally calls ray.get on the per-shard futures.
+        ok = self._policy_generation.sleep_partial(
+            dp_ranks_to_remove, level=2, mode="abort"
         )
+        if not ok:
+            raise RuntimeError(
+                f"[{self._pipeline_id}] sleep_partial failed for dp_ranks="
+                f"{dp_ranks_to_remove}"
+            )
 
     # ------------------------------------------------------------------
     # Expand — Feature 6 (atomic wake + selective sync + version + routing)
@@ -452,8 +466,6 @@ class NemoRLFullFinetunePipeline:
             logger.info(
                 "[%s] _expand_workers: sync_selected_workers done", self._pipeline_id
             )
-
-            self._finalize_weight_update(ranks)
 
             # Step 4: publish the cache version BEFORE routing activation.
             # Expand reuses the same CPU cache as active refresh, so it must not
@@ -532,10 +544,7 @@ class NemoRLFullFinetunePipeline:
         self._destroy_nccl_groups()
 
         coordinator = self._get_coordinator_handle()
-        active_ranks = ray.get(coordinator.sync_base_weights_to_active.remote())
-        active_ranks = [int(rank) for rank in (active_ranks or [])]
-        if active_ranks:
-            self._finalize_weight_update(active_ranks)
+        ray.get(coordinator.sync_base_weights_to_active.remote())
 
         return self._publish_weight_version()
 
@@ -606,6 +615,9 @@ class NemoRLFullFinetunePipeline:
         ``RLixVirtualClusterAdapter`` instances instead of letting NeMo RL create
         standalone ``RayVirtualCluster`` placement groups.
         """
+        if self._nemo_setup_result is not None:
+            return self._nemo_setup_result
+
         from omegaconf import OmegaConf
 
         from nemo_rl.algorithms.grpo import setup as grpo_setup
@@ -704,7 +716,7 @@ class NemoRLFullFinetunePipeline:
             self._create_model_update_service()
 
         async_cfg = master_config["grpo"]["async_grpo"]
-        return (
+        self._nemo_setup_result = (
             policy,
             policy_generation,
             dataloader,
@@ -719,6 +731,7 @@ class NemoRLFullFinetunePipeline:
             master_config,
             int(async_cfg["max_trajectory_age_steps"]),
         )
+        return self._nemo_setup_result
 
     def _resolve_nemo_config_path(self) -> Path:
         raw_path = (
@@ -880,10 +893,15 @@ class NemoRLFullFinetunePipeline:
                 self._pipeline_id,
             )
             return
-        # Feature 1: finish_generation() calls vLLM sleep(level=self._sleep_level).
-        # Feature 2: marks all DP ranks as inactive via sleep_partial path.
-        if hasattr(self._policy_generation, "finish_generation"):
-            self._policy_generation.finish_generation()
+        # Feature 1/2: sleep every DP rank and remove all ranks from routing.
+        if hasattr(self._policy_generation, "sleep_all"):
+            ok = self._policy_generation.sleep_all(level=2, mode="abort")
+        elif hasattr(self._policy_generation, "finish_generation"):
+            ok = self._policy_generation.finish_generation()
+        else:
+            ok = False
+        if not ok:
+            raise RuntimeError(f"[{self._pipeline_id}] failed to sleep inference workers")
         logger.info(
             "[%s] All inference workers sleeping (level=2)", self._pipeline_id
         )
@@ -907,7 +925,7 @@ class NemoRLFullFinetunePipeline:
                 "NeMo RL policy must implement build_cpu_bucket_cache(step) before "
                 "Feature 5+6 weight refresh can run safely."
             )
-        ray.get(self._policy.build_cpu_bucket_cache.remote(step))
+        self._policy.build_cpu_bucket_cache(step)
 
     def _offload_training_gpu(self) -> None:
         """Release training GPU VRAM so inference can wake_up on overlap GPUs.
@@ -915,7 +933,10 @@ class NemoRLFullFinetunePipeline:
         Feature 11 dependency: implemented as policy.offload_training_gpu().
         """
         if self._policy is not None and hasattr(self._policy, "offload_training_gpu"):
-            ray.get(self._policy.offload_training_gpu.remote())
+            self._policy.offload_training_gpu()
+            return
+        if self._policy is not None and hasattr(self._policy, "offload_after_refit"):
+            self._policy.offload_after_refit()
             return
         logger.warning("[%s] policy.offload_training_gpu unavailable", self._pipeline_id)
 
@@ -927,21 +948,9 @@ class NemoRLFullFinetunePipeline:
         training is idle. Without this, inference wake_up on overlap GPUs may OOM.
         """
         if self._policy is not None and hasattr(self._policy, "destroy_nccl_groups"):
-            ray.get(self._policy.destroy_nccl_groups.remote())
+            self._policy.destroy_nccl_groups()
             return
         logger.warning("[%s] policy.destroy_nccl_groups unavailable", self._pipeline_id)
-
-    def _finalize_weight_update(self, dp_ranks: List[int]) -> None:
-        """Run one post-load finalization on each target vLLM worker."""
-        ranks = sorted(set(int(rank) for rank in dp_ranks))
-        if not ranks:
-            return
-        if self._policy_generation is None:
-            raise RuntimeError("policy_generation is required for finalize_weight_update")
-
-        if not hasattr(self._policy_generation, "finalize_weight_update"):
-            raise RuntimeError("policy_generation must expose finalize_weight_update(dp_ranks)")
-        ray.get(self._policy_generation.finalize_weight_update(ranks))
 
     def _publish_weight_version(self) -> int:
         """Publish the cache-producing step as the current collector version."""
@@ -954,6 +963,13 @@ class NemoRLFullFinetunePipeline:
 
     def _create_model_update_service(self) -> None:
         """Create NemoRLModelUpdateService Ray actor in the pipeline namespace."""
+        if self._model_update_service is not None:
+            return
+        if self._policy is None or self._policy_generation is None:
+            raise RuntimeError(
+                "policy and policy_generation must be initialized before creating "
+                "NemoRLModelUpdateService"
+            )
         namespace = get_pipeline_namespace(self._pipeline_id)
         svc_name = f"{self._pipeline_id}_nemo_rl_model_update_service"
 
@@ -979,8 +995,10 @@ class NemoRLFullFinetunePipeline:
             lifetime="detached",
         ).remote(
             pipeline_id=self._pipeline_id,
-            policy=self._policy,
-            policy_generation=self._policy_generation,
+            policy=None,
+            policy_generation=None,
+            policy_workers=list(self._policy.worker_group.workers),
+            model_update_receiver=self._policy_generation.get_model_update_receiver(),
         )
         ray.get(svc.__ray_ready__.remote())
         self._model_update_service = svc

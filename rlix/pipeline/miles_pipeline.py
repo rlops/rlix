@@ -812,7 +812,14 @@ class MilesPipeline:
     def _build_placement_provider(self, miles_args):
         """Construct a fresh :class:`MilesPlacementProvider`.
 
-        Per the cross-cutting review (P1-5): `__ray_call__.remote(lambda)`
+        For M11.2 dual-pipeline: prefer ``cluster_device_mappings`` from
+        the pipeline_config (forwarded by the driver from the
+        ``orchestrator.register_pipeline`` call) over recomputing
+        ``range(actor_count)`` / ``range(rollout_num_gpus)``. The fallback
+        keeps M11.1 single-pipeline behavior unchanged when the driver
+        doesn't set the field.
+
+        Per the cross-cutting review (P1-5): ``__ray_call__.remote(lambda)``
         is not a Ray API. RollResourceManagerProxy is documented as a
         read-only proxy to a shared singleton ResourceManager actor —
         constructing multiple proxies pointing at the same singleton is
@@ -826,15 +833,31 @@ class MilesPipeline:
         proxy = RollResourceManagerProxy(
             num_gpus_per_node=int(miles_args.num_gpus_per_node)
         )
-        return MilesPlacementProvider(
-            resource_manager_proxy=proxy,
-            train_device_mapping=list(
+
+        cluster_mappings = getattr(
+            self._pipeline_config, "cluster_device_mappings", None
+        ) or {}
+        train_mapping = cluster_mappings.get("actor_train")
+        infer_mapping = cluster_mappings.get("actor_infer")
+        if train_mapping is None:
+            train_mapping = list(
                 range(
                     int(miles_args.actor_num_nodes)
                     * int(miles_args.actor_num_gpus_per_node)
                 )
-            ),
-            infer_device_mapping=list(range(int(miles_args.rollout_num_gpus))),
+            )
+        if infer_mapping is None:
+            infer_mapping = list(range(int(miles_args.rollout_num_gpus)))
+
+        logger.info(
+            "[MilesPipeline] _build_placement_provider train=%s infer=%s "
+            "(from pipeline_config.cluster_device_mappings: %s)",
+            train_mapping, infer_mapping, bool(cluster_mappings),
+        )
+        return MilesPlacementProvider(
+            resource_manager_proxy=proxy,
+            train_device_mapping=list(train_mapping),
+            infer_device_mapping=list(infer_mapping),
             rollout_num_gpus_per_engine=int(miles_args.rollout_num_gpus_per_engine),
             num_gpus_per_node=int(miles_args.num_gpus_per_node),
         )

@@ -344,10 +344,19 @@ class MilesModelUpdateService:
         # False if the key already exists, which we treat as a
         # collision and re-pick. Bound the retry budget so a stuck
         # claim can't hang the sync.
-        from roll.distributed.scheduler.storage import (  # type: ignore[import-not-found]
-            STORAGE_NAME,
-        )
-        from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE  # type: ignore[import-not-found]
+        # ROLL@main relocated STORAGE_NAME from roll.distributed.scheduler.storage
+        # to roll.utils.constants. Try the new location first, fall back to the
+        # old location for older ROLL releases.
+        try:
+            from roll.utils.constants import (  # type: ignore[import-not-found]
+                GLOBAL_STORAGE_NAMESPACE,
+                STORAGE_NAME,
+            )
+        except ImportError:
+            from roll.distributed.scheduler.storage import (  # type: ignore[import-not-found]
+                STORAGE_NAME,
+            )
+            from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE  # type: ignore[import-not-found]
 
         try:
             shared_storage = ray.get_actor(STORAGE_NAME, namespace=GLOBAL_STORAGE_NAMESPACE)

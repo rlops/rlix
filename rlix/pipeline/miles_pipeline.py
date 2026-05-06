@@ -164,11 +164,25 @@ class MilesPipeline:
             num_nodes=int(miles_args.actor_num_nodes),
             num_gpus_per_node=int(miles_args.actor_num_gpus_per_node),
             worker_placements=train_workers,
-            num_gpus_per_actor=0.01,
+            # num_gpus=0 (not 0.01): partial-overlap rlix-mode. The ROLL
+            # node-PG bundle has GPU=N capacity reserved for the whole
+            # cluster; train actors use CUDA_VISIBLE_DEVICES set from
+            # WorkerPlacement.gpu_ids and do NOT take a Ray bundle
+            # reservation, leaving full GPU capacity for the inference
+            # engines to also schedule on the same bundle.
+            num_gpus_per_actor=0,
             role="actor",
             with_ref=False,
         )
         self._run_async(self._train_group.init())
+
+        # Step 3.5: actor.init() ends with sleep() when offload_train=True,
+        # which pauses tms and unmaps the GPU weights. The HF weight gather
+        # in build_cpu_bucket_cache needs weights on GPU, so wake them up
+        # before the bucket build.
+        if bool(getattr(miles_args, "offload_train", False)):
+            logger.info("[MilesPipeline] phaseA step3.5: wake_up (post-init pre-bucket-build)")
+            self._run_async(self._train_group.onload())
 
         # Step 4: build CPU bucket cache for the BASE step (-1).
         self._run_async(self._train_group.build_cpu_bucket_cache(step=-1))
@@ -267,29 +281,26 @@ class MilesPipeline:
         # follow-up. For now, fail-fast if the scheduler grant returns a
         # subset that does NOT cover the full infer pool, so we can't
         # silently mis-route under multi-pipeline contention.
-        from miles.ray.placement_group import _create_placement_group
-
-        # ROLL ResourceManagerProxy owns a node-PG that pins all GPUs at
-        # startup. Phase A's train actors are gone; the PG still holds the
-        # GPUs, so the next placement_group() call would block forever. Tell
-        # the coordinator to release it before we ask for the inference PG.
-        logger.info("[MilesPipeline] phaseB step2a: remove_resource_manager_node_pg start")
-        removed = bool(
-            ray.get(
-                self._coordinator_handle.remove_resource_manager_node_pg.remote()
-            )
-        )
+        # Reuse ROLL's node-PG via the placement_provider for the inference
+        # engines. The provider returns per-engine WorkerPlacement entries
+        # all sharing the same node-PG (single bundle, GPU=N capacity);
+        # train actors with num_gpus=0 leave the bundle capacity free for
+        # the engines. NO new PG is created and the node-PG is NOT
+        # removed; train actors stay alive for the loop.
+        logger.info("[MilesPipeline] phaseB step2: get_all_rollout_engine_placements start")
+        rollout_workers = self._placement_provider.get_all_rollout_engine_placements()
+        self._placement_provider.assert_structural(rollout_workers)
+        node_pg = rollout_workers[0].placement_group
+        reordered_bundle_indices = [
+            wp.bundle_index for wp in rollout_workers for _ in wp.gpu_ids
+        ]
+        reordered_gpu_ids = [g for wp in rollout_workers for g in wp.gpu_ids]
+        legacy_pg = (node_pg, reordered_bundle_indices, reordered_gpu_ids)
         logger.info(
-            "[MilesPipeline] phaseB step2a: remove_resource_manager_node_pg done removed=%s",
-            removed,
+            "[MilesPipeline] phaseB step2: get_all_rollout_engine_placements done "
+            "engines=%d bundle_indices=%s gpu_ids=%s",
+            len(rollout_workers), reordered_bundle_indices, reordered_gpu_ids,
         )
-
-        logger.info("[MilesPipeline] phaseB step2: _create_placement_group start")
-        pg, reordered_bundle_indices, reordered_gpu_ids = _create_placement_group(
-            int(miles_args.rollout_num_gpus)
-        )
-        legacy_pg = (pg, reordered_bundle_indices, reordered_gpu_ids)
-        logger.info("[MilesPipeline] phaseB step2: _create_placement_group done")
 
         # RolloutManager construction. Engines come up `active` via the
         # standard start_rollout_servers flow inside __init__.
@@ -309,6 +320,14 @@ class MilesPipeline:
         engine_count = int(ray.get(self._rollout_manager.get_engine_count.remote()))
         logger.info("[MilesPipeline] phaseB step4: get_engine_count done count=%d", engine_count)
         self._declared_engine_count = engine_count
+
+        # Wire the train group to the rollout manager so rank 0 can push
+        # train_parallel_config into RolloutManager during setup. Standalone
+        # does this in create_training_models; rlix mode runs it here, after
+        # the rollout manager exists.
+        logger.info("[MilesPipeline] phaseB step4b: set_rollout_manager start")
+        self._run_async(self._train_group.set_rollout_manager(self._rollout_manager))
+        logger.info("[MilesPipeline] phaseB step4b: set_rollout_manager done")
 
         # F107 / X2: register handles. F22 (relaxed): in M11.1 single-pipeline
         # this happens after the manager exists; the dual-pipeline-shell-init
@@ -339,6 +358,13 @@ class MilesPipeline:
                 f"post-INIT active set mismatch: declared={full_engine_indices}, "
                 f"got={sorted(active)}"
             )
+
+        # Push base v=-1 weights to the active engines now that the cache
+        # is built (Phase A Step 4) and the active set is known. Driver no
+        # longer needs to call this — keeps init self-contained.
+        logger.info("[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) start")
+        ray.get(self._coordinator_handle.sync_base_weights_to_active.remote(-1))
+        logger.info("[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) done")
 
     # ------------------------------------------------------------------
     # Runtime hooks

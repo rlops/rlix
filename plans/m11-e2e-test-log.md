@@ -263,3 +263,140 @@ Diagnose why scheduler doesn't issue `resize_infer` in this configuration (singl
 
 ### Bottom line
 This iteration validated that the rlix-mode driver, partial-overlap PG sharing, F4d cpu_serialize transport, and one full GRPO rollout all work end-to-end on a 4-GPU machine — exactly as rlix is designed to. The only missing piece is the rlix scheduler's preemption signal, which is one targeted fix away from a fully-green num-rollout=2 smoke.
+
+---
+
+## Attempt 5 — `enable_memory_saver` was off → `release_memory_occupation` no-op (in-progress)
+
+- Date: 2026-05-06
+- Branch heads: rlix=zhenyu/miles-mvp-e2e (rsync; nvidia-smi probe in `_wait_for_overlap_engines_offloaded`), miles=zhenyu/m11-mvp-test (rsync)
+- Vast instance: 36156578 (4xRTX5090, 32 GB each)
+
+### What changed since attempt 4
+1. `_wait_for_overlap_engines_offloaded` Phase 2 now polls `nvidia-smi --query-gpu=memory.free --id=...` instead of calling `flush_engines`/`get_engine_free_gpu_mem` (which don't exist on miles' RolloutManager). Threshold ≥20 GB free; timeout 60 s.
+2. Added `--offload-rollout` to `scripts/run_smoke_e2e.sh` (was missing). Without it, `args.offload_rollout=False` → SGLang launched with `enable_memory_saver=False` → `release_memory_occupation` is a NO-OP and torch_memory_saver doesn't track engine allocations.
+
+### Smoking gun (run 4 log, before fix)
+```
+SGLangEngine ServerArgs: ... enable_memory_saver=False ...
+[Rank 0] Memory-Usage before wake_up model: free_GB=1.93, used_GB=29.43
+[torch_memory_saver.cpp] CUresult error: 2 (out of memory) file=csrc/utils.h func=cu_mem_create line=194
+```
+With state="offloaded" but 30 GB still occupied by SGLang's process, the 0.5B train wake_up's `cuMemCreate` for ~3.7 GB of weights runs out of OS-level memory.
+
+### What we expect with `--offload-rollout`
+- SGLang launches with `enable_memory_saver=True` → torch_memory_saver wraps engine allocations.
+- `shrink_engines` calls `release_memory_occupation` which now actually returns memory to the OS pool.
+- nvidia-smi probe sees ≥20 GB free within seconds; train wake_up succeeds; rollout 1 dispatches.
+
+
+### Attempt 5 outcome — memory_saver works, new SGLang race exposed
+- **Memory_saver fix verified**: with `enable_memory_saver=True`, `_wait_for_overlap_engines_offloaded` Phase 2 nvidia-smi probe immediately reports `min=28.20 GB` free (was 1.93 GB stuck). Train wake_up succeeds: `[Rank 0] free_GB=26.28 used_GB=5.08`.
+- **But also**: SGLang engines on GPUs 0,1 crash during `release_memory_occupation` with:
+  ```
+  write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
+  ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
+  Scheduler hit an exception: ...
+  SIGQUIT received. signum=None, frame=None. It usually means one child failed.
+  ```
+  + Megatron train actor 288645 dies with `[torch_memory_saver.cpp] Cannot resume allocation that is not paused. tag=default ptr=12918456320`.
+- **Race**: `is_idle` returns true means request queue drained, but SGLang's tokenizer/scheduler may still have an in-flight Triton kernel launched for the last decode pass. `release_memory_occupation` synchronously moves persistent token-pool buffers to CPU; if the Triton kernel runs after the move, it sees a CPU tensor. The Megatron crash is downstream — once one engine's process dies, ROLL's PG-coupled actors lose connectivity.
+
+### Attempt 6 — drain sync sleep before release_memory_occupation
+- Patch (`miles/miles/ray/rollout.py:911`): under `RLIX_CONTROL_PLANE=rlix`, sleep 0.5 s after the `is_idle` drain before `release_memory_occupation`. Lets SGLang's scheduler reach a safe checkpoint where no Triton kernels are dispatched against persistent buffers.
+- Cost: ~0.5 s per shrink (twice per smoke run = 1 s overhead). Smoke-only kludge; M11.5 follow-up = SGLang-side `pause_generation + synchronize_cuda` for a deterministic fix.
+
+
+### Attempt 6 outcome — 0.5s sleep made flush_cache hang for 60s
+- Before before_step ran, the rollout 0 result returned. Phase A→B init succeeded, `enable_memory_saver=True` confirmed.
+- before_step → resize_infer → shrink_engines → drain (is_idle=True) → 0.5s sleep → release_memory_occupation → flush_cache TIMEOUT after 60s ("Timeout while flushing cache").
+- The sleep didn't help; SGLang's `/flush_cache` returns non-200 for the entire 60s window — engine still has pending state from rollout 0 even after `is_idle` returned True. The sleep let the scheduler process some of that pending state but not all.
+- Cascading downstream: scheduler RayTaskError → before_training fails → driver exits.
+
+### Attempt 7 — replace sleep with `pause_generation(mode="retract")`
+- Patch (`miles/miles/ray/rollout.py:911`): replace 0.5s sleep with `pause_generation` HTTP call (rlix-mode only). SGLang's `pause_generation` blocks until the scheduler reaches a safe checkpoint and retracts in-flight decode iterations. This should give `release_memory_occupation` (and its inner flush_cache) a quiescent engine to work with.
+- Wrapped in try/except: pause_generation may reject if engine is already paused; we fall through to flush+release rather than blocking.
+
+
+### Attempt 7 outcome — pause_generation works, but double wake_up exposed
+- ✅ `pause_generation(mode="retract")` returns 200 OK from both engines
+- ✅ `release_memory_occupation` returns 200 OK (no Triton crash)
+- ✅ Free GPU mem reaches `min=28.16 GB` cleanly
+- ✅ wake_up #1 succeeds: `[Rank 0] free=24.39, used=6.97, elapsed=0.9s`
+- ❌ wake_up #2 fires immediately: `[torch_memory_saver.cpp] Cannot resume allocation that is not paused. tag=default ptr=13287555072`
+- Train actor exits SYSTEM_ERROR; before_step returns OK but train_group.train() raises ActorDiedError.
+
+#### Why two wake_ups
+1. `MilesPipeline._before_training` calls `train_group.onload()` → wake_up.
+2. `MegatronTrainRayActor.train()` calls `self.wake_up()` when `args.offload_train=True`.
+
+The standalone `train_async.train` only calls #2 (no explicit onload before train). Our rlix-mode added #1 redundantly.
+
+### Attempt 8 — remove redundant onload in `_before_training`
+- Patch (`rlix/pipeline/miles_pipeline.py:558`): drop `self._run_async(self._train_group.onload())`. Leave actor offloaded; rlix_train_loop dispatches train() which wakes up safely (matching standalone).
+
+
+### Attempt 8 outcome — full integration path runs cleanly until train_actor needs ref_log_probs
+- ✅ before_step + shrink_engines (pause_generation + release) clean — no Triton crash, no flush_cache timeout
+- ✅ train wake_up succeeds (single call only, 0.7 s elapsed)
+- ✅ Generation continues on engines 2, 3 in parallel
+- ❌ `train_actor` crashes: `policy_loss_function: ref_log_probs = torch.cat(ref_log_probs, dim=0); TypeError: cat() received an invalid combination of arguments - got (NoneType, dim=int)`
+- Root cause: `miles_pipeline.py:176` hardcodes `with_ref=False` when constructing `RayTrainGroup`. Standalone `placement_group.py:192` derives it as `args.kl_coef != 0 or args.use_kl_loss`. Without the ref model loaded, train_actor's pre-loss `compute_log_prob(store_prefix="ref_")` is gated off (line 419 `if "ref" in self.weights_backuper.backup_tags`), and `batch["ref_log_probs"]` stays `None`.
+
+### Attempt 9 — derive `with_ref` from miles_args.use_kl_loss / kl_coef
+- Patch (`rlix/pipeline/miles_pipeline.py:163`): `with_ref=bool(args.use_kl_loss or args.kl_coef != 0.0)`. Matches miles standalone semantics. With `--use-kl-loss` set in the smoke, this becomes True; ref model is loaded; ref_log_probs computation runs each train step.
+
+
+### Attempt 9 outcome — full train step succeeded; flush_cache wedge moved to weight-sync path
+- ✅ ref model loaded; train_actor's compute_log_prob(store_prefix="ref_") populates `batch["ref_log_probs"]`
+- ✅ rollout_id=0 step3: `train_group.train done` (full GRPO update with KL loss, ~11 s elapsed)
+- ✅ step4: `after_step start` → train_group.build_cpu_bucket_cache → train_group.offload (135.70 GB CPU usage at peak)
+- ❌ **`MilesCoordinator.sync_base_weights_to_active(0)`** → `MilesModelUpdateService.sync_selected_workers` → `SGLangEngine.finalize_weight_update` → `Timeout while flushing cache`
+- Same SGLang stuck-flush as the shrink path (attempt 6), now in weight-sync. The fully-async rollout function returned data but the engine queue was not synchronously quiesced, so flush_cache loops 60 s for non-200 status.
+
+### Attempt 10 — pause_generation before finalize_weight_update + continue_generation after
+- Patch (`rlix/pipeline/miles_model_update_service.py:288`): in `sync_selected_workers` step (4), before the `finalize_weight_update` fan-out, call `pause_generation(mode="retract")` on each handle to retract in-flight batches and reach a quiescent state. After `finalize_weight_update` returns, call `continue_generation()` to resume.
+- Rationale: same fix pattern as the shrink path (attempt 7) — SGLang's `flush_cache` only succeeds against a paused/quiescent scheduler.
+
+
+### Attempt 10 outcome — ✅ FULL E2E PASS (both rollouts complete + clean shutdown_hard)
+- 11:43:52 init complete (engines=4)
+- 11:43:52 [loop] pre-loop generate dispatch rollout_id=0
+- 11:43:57 [loop] rollout_id=0 step1: await rollout_data done (5 s)
+- 11:43:57 [loop] rollout_id=0 step2: before_step done (engines [0,1] offloaded; OS-level mem free 28.16 GB)
+- 11:44:07 [loop] rollout_id=0 step3: train_group.train done (10 s)
+- 11:44:19 [loop] rollout_id=0 step4: after_step done (12 s, includes sync_base_weights)
+- 11:44:19 [loop] rollout_id=1 step1: await rollout_data done (~0 s — already in flight)
+- 11:44:19 [loop] rollout_id=1 step2: before_step done
+- 11:44:22 [loop] rollout_id=1 step3: train_group.train done (3 s — warm cuda graphs)
+- 11:44:31 [loop] rollout_id=1 step4: after_step done (9 s)
+- 11:44:31 [run_miles_rlix] shutdown_hard complete pipeline_id=miles_cd235d4fa85a — exiting
+- **EXIT_CODE=0**
+
+#### Final commit chain (rlix branch zhenyu/miles-mvp-e2e):
+1. accessors + public hook aliases
+2. lazy MilesPipeline.__init__ + Phase A/B bisect logs
+3. PG-sharing + STORAGE_NAME compat + num_gpus=0 + step3.5 wake_up + step4b set_rollout_manager + step7 sync(-1)
+4. nvidia-smi probe in `_wait_for_overlap_engines_offloaded`
+5. drop redundant `train_group.onload()` in `_before_training` (avoid double wake_up — train() already does it)
+6. derive `with_ref` from `args.use_kl_loss / kl_coef` so ref model is loaded for KL-loss runs
+7. `pause_generation`/`continue_generation` wrap around `finalize_weight_update` in MilesModelUpdateService.sync_selected_workers
+
+#### Final commit chain (miles branch zhenyu/m11-mvp-test):
+1. driver + reusable async loop wired
+2. lazy wandb + placement_provider PG-shape unpack + MILES_TMS_HOOK_MODE/MILES_SKIP_TMS_PAUSE/MILES_SKIP_NODE_PG_PIN env hatches + MILES_* runtime_env forwarding
+3. real F4d /update_weights_from_cpu_bucket receiver + [loop] bisect logs
+4. rlix-mode override in `rollout.py` to force `needs_offload=True` (ensures `enable_memory_saver=True` in SGLang ServerArgs)
+5. `pause_generation(mode="retract")` wrap around `release_memory_occupation` in shrink_engines (rlix-mode)
+6. Smoke script: add `--offload-rollout` (so SGLang's release_memory_occupation actually frees memory back to OS)
+
+#### Total iterations to green: 10 attempts.
+
+#### Key lessons
+1. **SGLang's `release_memory_occupation` is a no-op without `enable_memory_saver=True`**, which requires `--offload-rollout` in miles. Without this, `is_idle` returns true but the CUDA caching allocator still holds the memory; partial-overlap topology becomes impossible because the next train wake_up OOMs.
+2. **`flush_cache` blocks on a non-quiescent SGLang scheduler.** With a fully-async rollout function, the rollout-data return does not synchronously quiesce the engine — `pause_generation(mode="retract")` is required before any flush_cache to retract in-flight batches and reach a safe checkpoint.
+3. **`with_ref=True` is required when `args.use_kl_loss`.** Otherwise `train_actor`'s ref_log_probs computation is gated off and `policy_loss_function` crashes on `torch.cat(None, dim=0)`.
+4. **Avoid double wake_up**: `MegatronTrainRayActor.train()` already wakes up internally when `args.offload_train` is set; do not call `train_group.onload()` from the runtime hook before train(). Otherwise the second resume hits `[torch_memory_saver.cpp] Cannot resume allocation that is not paused`.
+
+#### Total wall-clock time on vast.ai instance 36156578 across all 10 attempts: ~3.5 hours (instance now stopped).
+

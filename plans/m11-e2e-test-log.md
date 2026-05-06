@@ -171,3 +171,37 @@ With train [0,1] / infer [0,1,2,3] on a 4-GPU machine:
 ### Files / commits in Attempt 2
 - rlix `b333143`: MILES_SKIP_NODE_PG_PIN + remove_resource_manager_node_pg + Phase B bisect logs
 - miles `7b83be5`: forward MILES_* env vars to coordinator runtime_env
+
+## Attempt 3 — vast.ai + tms commit dc68769 + nested-patch — same terminal blocker
+- Date: 2026-05-06
+- Branch heads (unchanged from attempt 2):
+  - rlix `zhenyu/miles-mvp-e2e` @ d48c759
+  - miles `zhenyu/m11-mvp-test` @ 7b83be5
+- Vast instance: ssh9.vast.ai:36579, 4× RTX 5090, **CUDA 12.9** (driver 575.51.03; image is `cuda:12.9.x`, NOT 13.0 as expected — `nvidia-smi`/`nvcc`/`/usr/local/cuda-12.9` all confirm)
+
+### tms experiments
+- User-specified commit `dc68769` (built from src): nested-region assertion fires inside Megatron DDP init.
+- `0.0.9.post1` (PyPI): same nested-region assertion.
+- `0.0.9` (PyPI re-pull): same assertion (PyPI 0.0.9 was apparently re-uploaded with the strict assertion; the originally-installed 0.0.9 on the vast template was a custom build).
+- Patched `entrypoint.py:_with_region_config` in-place: when already in an interesting region, no-op the inner region (binary doesn't export `tms_get_current_tag`, so save/restore impossible).
+- After the patch: Phase A `init()` succeeded (DDP nested regions OK). With LD_PRELOAD preload mode, segfault returned at `Update weights` (same as attempt 1). With `MILES_TMS_HOOK_MODE=torch` + `MILES_SKIP_TMS_PAUSE=1` + `MILES_SKIP_NODE_PG_PIN=1`, full Phase A + Phase B + 4 SGLang engines passed (same achievement as attempt 2), then identical `set_rollout_manager` `ActorDiedError` because the train actors are pinned to ROLL's removed node-PG.
+
+### Conclusion
+The terminal blocker is **not** torch_memory_saver. It's an architectural conflict:
+
+- `MilesCoordinator.__init__` calls `RollResourceManagerProxy(num_gpus_per_node=4)` which creates a single-bundle PG holding all 4 node GPUs.
+- `MilesPlacementProvider.get_train_workers` uses that PG for the train actors (via `wp.placement_group` from `allocate_placement_group`).
+- `MilesPipeline._init_phase_b_infer` calls miles standalone `_create_placement_group(rollout_num_gpus)` which asks Ray's free GPU pool for a separate PG.
+- The two layers can't coexist on a 4-GPU machine: ROLL's PG holds all 4 GPUs, leaving Ray's free pool empty for the inference PG.
+- Removing ROLL's PG kills the train actors that the loop still needs for `set_rollout_manager`/`coord.sync_base_weights_to_active`.
+
+### What would unblock this on the same hardware
+None of the following are smoke-scoped one-liners; each is a real code change:
+- (a) `MilesPlacementProvider.get_train_workers` should use miles' own `_create_placement_group(2)` for train actors (Ray free pool, separate from ROLL's PG). Then ROLL's RM doesn't need to own the train GPUs at all and the inference PG can coexist; BUT total reservation 2+4=6 GPU on 4-GPU hardware → still won't fit without offload.
+- (b) Phase B reuses ROLL's existing node-PG for inference engines (single bundle, all 4 GPUs, with 4 engines fractionating). Train actors stay alive; train+infer fit if `num_gpus_per_actor` for train drops below 0 (i.e. zero Ray GPU reservation, just CUDA_VISIBLE_DEVICES). Single-PG multi-tenant approach, untested in rlix codebase.
+- (c) Run on hardware with ≥6 GPUs so 2 train + 4 infer fits without overlap.
+
+### Final smoke status
+- **Driver wiring**: validated end-to-end through MilesPipeline `initialize_pipeline complete engines=4`.
+- **rlix-mode E2E training loop**: BLOCKED by the architectural placement-group conflict above.
+- **Confidence**: high that the wiring itself is correct; low that the smoke can complete on this 4-GPU box without one of the (a)/(b)/(c) refactors.

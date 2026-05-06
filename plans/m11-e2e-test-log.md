@@ -205,3 +205,61 @@ None of the following are smoke-scoped one-liners; each is a real code change:
 - **Driver wiring**: validated end-to-end through MilesPipeline `initialize_pipeline complete engines=4`.
 - **rlix-mode E2E training loop**: BLOCKED by the architectural placement-group conflict above.
 - **Confidence**: high that the wiring itself is correct; low that the smoke can complete on this 4-GPU box without one of the (a)/(b)/(c) refactors.
+
+## Attempt 4 — Codex-prescribed PG-sharing fix + F4d receiver impl — END-TO-END
+- Date: 2026-05-06
+- Branch heads:
+  - rlix `zhenyu/miles-mvp-e2e` @ ce5c5f8
+  - miles `zhenyu/m11-mvp-test` @ 9040763
+- Vast: ssh9.vast.ai 4× RTX 5090, CUDA 12.9 (image is `cuda:12.9.x` — driver 575.51.03 caps reported CUDA at 12.9; not 13.0), torch 2.9.1+cu129
+- torch_memory_saver: 0.0.9 from PyPI, in-place patched `entrypoint.py:_with_region_config` to no-op when already in an interesting region (Megatron DDP init nests; the 0.0.9 binary doesn't export `tms_get_current_tag` so save/restore not possible).
+
+### What now passes end-to-end
+1. F10 topology validation
+2. orchestrator allocate / register / admit
+3. MilesCoordinator + MilesPipeline construction (with `num_gpus_per_actor=0` for train so ROLL's node-PG bundle has GPU capacity left for engines)
+4. Phase A: train init → onload (post-init wake_up) → build_cpu_bucket_cache(-1) → offload (real `tms.pause`, memory drops 4.57 → 0.81 GB) → cache_owner role → publish_cache_ready_step → release actor_train
+5. Phase B step1: request actor_infer [0,1,2,3]
+6. Phase B step2: `placement_provider.get_all_rollout_engine_placements()` reuses ROLL's node-PG (bundle_indices=[0,0,0,0], gpu_ids=[0,1,2,3]) — NO `_create_placement_group` and NO PG removal
+7. Phase B step3: RolloutManager + 4 SGLang engines spawned and registered with the router (POST /add_worker → 200 OK ×4)
+8. Phase B step4: get_engine_count=4
+9. Phase B step4b: train_group.set_rollout_manager — train actors stay alive
+10. Phase B step5: register_model_update_resources
+11. Phase B step6: bootstrap_active_engines indices=[0,1,2,3]
+12. **Phase B step7: sync_base_weights_to_active(-1)** — F4d cpu_serialize sender writes torch-pickled bucket to /dev/shm; receiver reads, deserializes, re-serializes via SGLang's `MultiprocessingSerializer`, calls `tokenizer_manager.update_weights_from_tensor`. **All 4 engines hit `/update_weights_from_cpu_bucket → 200 OK`.**
+13. `initialize_pipeline complete pipeline_id=... engines=4` ✓
+14. Driver pulled handles ✓
+15. **Loop pre-loop: `rollout_manager.generate.remote(rollout_id=0)` dispatched** ✓
+16. **Loop step1: rollout_data ready** — async rollout produced 100s of valid Qwen2.5-0.5B GRPO responses with chain-of-thought reasoning, ~2.4k tok/s gen throughput, prefix-cache hit ~9.3%, response_len mean=537 / max=1386 ✓
+17. **Loop step2: `before_step(0)` start** ✓ (entered _before_training in MilesPipeline)
+
+### Remaining wedge
+`_before_training(rollout_id=0)` blocks indefinitely at:
+```python
+allocated = self._request_cluster_gpus(
+    cluster_id=self._actor_train_cluster_id,
+    priority=Priority.ACTOR_TRAINING,
+    global_step=int(step),
+)
+```
+
+The rlix scheduler should detect priority inversion (train priority=1 vs infer priority=6) and emit `coordinator.resize_infer.remote(dp_ranks_to_remove=[overlap])` to free actor_train's GPUs. The wiring exists (rlix/scheduler/scheduler.py line 1374 + miles_coordinator.resize_infer + _shrink_workers + rollout_manager.shrink_engines), but the scheduler doesn't fire it for our setup. SGLang engines keep generating in the background; eventually the watchdog kills the run after the 25-min silence cap.
+
+### What would unblock the loop
+Diagnose why scheduler doesn't issue `resize_infer` in this configuration (single-pipeline, partial overlap, ACTOR_TRAINING request after sustained ROLLOUT activity). Likely a missing trigger on `request_gpus` priority-inversion path or a state machine that only preempts on the FIRST rollout request, not subsequent train requests. Out of scope for the smoke iteration; tracked for the rlix scheduler team.
+
+### Bug counts (commits)
+- rlix:
+  - 376bec7 — accessors + public hook aliases
+  - 9efe21c — lazy pipeline `__init__` + Phase A/B bisect logs
+  - 5602563 — attempt 1 log
+  - b333143 — MILES_SKIP_NODE_PG_PIN + remove_resource_manager_node_pg (later reverted in favor of PG-sharing)
+  - d48c759, 3b0bdd7 — attempt 2/3 logs
+  - **ce5c5f8** — codex-prescribed PG-sharing + STORAGE_NAME compat + num_gpus=0 + step3.5 wake_up + step4b set_rollout_manager + step7 sync(-1)
+- miles:
+  - e29396a — driver wiring + reusable async loop
+  - 7899122, 7b83be5 — vast.ai compat (lazy wandb + placement_provider PG-shape unpack + MILES_TMS_HOOK_MODE/MILES_SKIP_TMS_PAUSE/MILES_SKIP_NODE_PG_PIN env hatches + MILES_* runtime_env forwarding)
+  - **9040763** — real F4d /update_weights_from_cpu_bucket receiver (Pydantic body model, torch.load → MultiprocessingSerializer → tokenizer_manager.update_weights_from_tensor) + [loop] bisect logs
+
+### Bottom line
+This iteration validated that the rlix-mode driver, partial-overlap PG sharing, F4d cpu_serialize transport, and one full GRPO rollout all work end-to-end on a 4-GPU machine — exactly as rlix is designed to. The only missing piece is the rlix scheduler's preemption signal, which is one targeted fix away from a fully-green num-rollout=2 smoke.

@@ -205,7 +205,7 @@ class MockScheduler:
 class MockVLLMGeneration:
     """Stub for VllmGeneration.
 
-    sleep_partial is async (matches F2 design: abort-drain-sleep is awaitable).
+    sleep_partial is sync (VllmGeneration.sleep_partial calls ray.get internally).
     All methods write to both per-object events and optional shared_events list
     so tests can verify global call ordering across mocks.
     """
@@ -230,24 +230,24 @@ class MockVLLMGeneration:
         self.inactive_ranks.update(dp_ranks)
         self._log(f"mark_inactive({sorted(dp_ranks)})")
 
-    def wake_up_partial(self, dp_ranks: List[int]) -> None:
+    def wake_up_partial(self, dp_ranks: List[int], *, skip_activate: bool = False) -> None:
         self.woken_ranks.update(dp_ranks)
         self._log(f"wake_up_partial({sorted(dp_ranks)})")
 
-    async def sleep_partial(self, dp_ranks: List[int], level: int = 2) -> None:
-        """Async to match real F2 implementation (drain requires await)."""
+    def sleep_partial(self, dp_ranks: List[int], level: int = 2, mode: str = "wait") -> bool:
+        """Sync: VllmGeneration.sleep_partial is synchronous (calls ray.get internally)."""
         self.active_dp_ranks.difference_update(dp_ranks)
         self.woken_ranks.difference_update(dp_ranks)
-        self._log(f"sleep_partial({sorted(dp_ranks)}, level={level})")
+        self._log(f"sleep_partial({sorted(dp_ranks)}, level={level}, mode={mode})")
+        return True
 
     def activate_dp_ranks(self, dp_ranks: List[int]) -> None:
         self.active_dp_ranks.update(dp_ranks)
         self.inactive_ranks.difference_update(dp_ranks)
         self._log(f"activate_dp_ranks({sorted(dp_ranks)})")
 
-    def finalize_weight_update(self, dp_ranks: List[int]) -> List[Any]:
-        self._log(f"finalize_weight_update({sorted(dp_ranks)})")
-        return []
+    def finalize_weight_update(self) -> None:
+        self._log("finalize_weight_update()")
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +413,7 @@ def _make_test_pipeline(
     p._pre_activation_ranks = set()
     p._active_dp_ranks = set()
     p._cache_ready_step = initial_version
-    p._policy = _MockRemoteProxy(MockPolicy())
+    p._policy = MockPolicy()
     p._coordinator_handle = _MockRemoteProxy(MockCoordinator())
 
     # RLix scheduler (used by NemoRLRLixHooks via _request_cluster_gpus)
@@ -626,7 +626,6 @@ class TestExpandWorkersAtomic:
             "mark_inactive([1, 2])",
             "wake_up_partial([1, 2])",
             "sync_selected_workers([1, 2])",
-            "finalize_weight_update([1, 2])",
             "set_weight_version(3)",
             "activate_dp_ranks([1, 2])",
         ]:
@@ -635,8 +634,7 @@ class TestExpandWorkersAtomic:
         # Ordering: each step before the next
         assert idx["mark_inactive([1, 2])"] < idx["wake_up_partial([1, 2])"]
         assert idx["wake_up_partial([1, 2])"] < idx["sync_selected_workers([1, 2])"]
-        assert idx["sync_selected_workers([1, 2])"] < idx["finalize_weight_update([1, 2])"]
-        assert idx["finalize_weight_update([1, 2])"] < idx["set_weight_version(3)"]
+        assert idx["sync_selected_workers([1, 2])"] < idx["set_weight_version(3)"]
         # Critical: version must be set BEFORE routing is activated
         assert idx["set_weight_version(3)"] < idx["activate_dp_ranks([1, 2])"]
 

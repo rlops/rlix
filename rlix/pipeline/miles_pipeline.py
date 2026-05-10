@@ -50,6 +50,7 @@ from rlix.protocol.types import (
     SCHEDULER_ACTOR_NAME,
     get_pipeline_namespace,
 )
+from rlix.utils.env import parse_env_positive_float
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
@@ -488,10 +489,12 @@ class MilesPipeline:
             )
 
         # Phase 2: probe nvidia-smi for OS-level free memory on the
-        # overlap GPU IDs. The train actor will need ~3.7 GB for the
-        # 0.5B model + a few GB for activations; aim for ≥20 GB free
-        # before we let _before_training proceed to wake_up.
-        target_free_gb = 20.0
+        # overlap GPU IDs. The train actor needs model weights plus
+        # activation headroom before wake_up. The default 20 GB threshold
+        # is the validated Qwen2.5-0.5B smoke setting; larger models can
+        # override it with MILES_MIN_FREE_GPU_MEM_GB without changing the
+        # driver CLI surface.
+        target_free_gb = parse_env_positive_float("MILES_MIN_FREE_GPU_MEM_GB", 20.0)
         deadline2 = time.time() + float(timeout_s)
         last_min_free_gb: Optional[float] = None
         while time.time() < deadline2:

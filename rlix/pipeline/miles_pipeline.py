@@ -598,24 +598,31 @@ class MilesPipeline:
     def _after_training(self, step: int) -> None:
         if not self._initialized:
             raise RuntimeError("MilesPipeline._after_training before initialize")
-        # Build the new CPU bucket cache for this step BEFORE offload —
-        # named_params_and_buffers needs GPU weights resident.
-        self._run_async(self._train_group.build_cpu_bucket_cache(step=int(step)))
-        self._run_async(self._train_group.offload())
-        # Coordinator drives sync_base_weights_to_active under its
-        # resize lock; pipeline NEVER calls service / finalize /
-        # set_weight_version directly (F05).
-        ray.get(
-            self._coordinator_handle.sync_base_weights_to_active.remote(int(step))
-        )
-        # Release the actor_train allocation back to the scheduler so
-        # other pipelines can step. R11-F1: only flip the ledger flag
-        # after a SUCCESSFUL release.
-        released = self._notify_release_cluster_gpus(
-            cluster_id=self._actor_train_cluster_id, global_step=int(step)
-        )
-        if released:
-            self._actor_train_allocated = False
+        offloaded = False
+        try:
+            try:
+                # Build the new CPU bucket cache for this step BEFORE offload —
+                # named_params_and_buffers needs GPU weights resident.
+                self._run_async(self._train_group.build_cpu_bucket_cache(step=int(step)))
+            finally:
+                self._run_async(self._train_group.offload())
+                offloaded = True
+            # Coordinator drives sync_base_weights_to_active under its
+            # resize lock; pipeline NEVER calls service / finalize /
+            # set_weight_version directly (F05).
+            ray.get(
+                self._coordinator_handle.sync_base_weights_to_active.remote(int(step))
+            )
+        finally:
+            if offloaded:
+                # Release the actor_train allocation back to the scheduler so
+                # other pipelines can step. R11-F1: only flip the ledger flag
+                # after a SUCCESSFUL release.
+                released = self._notify_release_cluster_gpus(
+                    cluster_id=self._actor_train_cluster_id, global_step=int(step)
+                )
+                if released:
+                    self._actor_train_allocated = False
 
     # ------------------------------------------------------------------
     # M4 minimal hard cleanup

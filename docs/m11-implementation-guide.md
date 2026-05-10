@@ -532,6 +532,94 @@ Production hardening items (deferred to M11.5 per scope plan): `F79`–`F91` —
 
 ---
 
+## §7 How to reproduce
+
+The three scripts under `scripts/` are the verification rig. **A reviewer cloning the repo can re-run M11.1 single + M11.2 dual end-to-end and confirm `EXIT_CODE=0` themselves.** No hidden setup.
+
+### 7.1 Prerequisites
+
+A vast.ai (or equivalent) GPU instance with:
+
+| Component | Tested with | Notes |
+|---|---|---|
+| GPUs | 4× (RTX5090 for M11.1; A40 for M11.2) | Any 4× of ≥40 GB memory will do for Qwen2.5-0.5B GRPO. |
+| CUDA | 12.9 | Smoke is hardcoded to `MILES_TMS_HOOK_MODE=torch` (CUDAPluggableAllocator) which is required for CUDA 12.9 / Blackwell — F1 issue 2. |
+| Image | `radixark/miles_latest` (vast.ai) or any image with miles + rlix + Megatron-LM checked out under `/root/{miles,rlix,Megatron-LM}` | The smoke `cd /root/miles` and uses absolute paths under `/root`. |
+| Model checkpoint | Qwen2.5-0.5B at `/root/Qwen2.5-0.5B`, torch_dist at `/root/Qwen2.5-0.5B_torch_dist`, miles bundle at `/root/Qwen2.5-0.5B_miles/` | Any HF Megatron-compatible Qwen2.5-0.5B mirror works. |
+| Datasets | `/root/dapo-math-17k/dapo-math-17k.jsonl`, `/root/aime-2024/aime-2024.jsonl` | Eval is gated and skipped in smoke; the file just needs to exist. |
+| Branches | rlix on `zhenyu/miles-mvp-e2e` (or main once merged), miles on `zhenyu/m11-mvp-test` | See Appendix C for HEADs. |
+
+### 7.2 Smoke scripts
+
+Three scripts ship in `scripts/`:
+
+| Script | What it does | Smoke target | Expected runtime on 4×RTX5090 |
+|---|---|---|---|
+| `scripts/run_smoke_e2e.sh` | M11.1 single-pipeline. Qwen2.5-0.5B GRPO, partial-overlap topology (train=`[0,1]` ⊂ infer=`[0,1,2,3]`), `--num-rollout 2`. | AC1, AC2, AC3, AC4, AC5 | ~5–7 min (init + 2 rollouts) |
+| `scripts/run_smoke_dual.sh` | M11.2 dual-pipeline. Two MilesPipelines on disjoint pools (P1=`[0,1]`, P2=`[2,3]`), each running its own GRPO loop concurrently via `asyncio.gather`, `--num-rollout 2` each. | AC9, AC10, AC11, AC12 | ~10 min total (init phase is sequential P1→P2 then both train concurrently) |
+| `scripts/run_smoke_with_watchdog.sh` | Wrapper. Launches either of the above, monitors `/root/logs/run.log` for silence (default 5 min) and total runtime (default 40 min); kills the run on either limit. Always emits `EXIT_CODE=<n>` as the last log line for grep-friendly success detection. | — | n/a |
+
+The scripts are **rsync'd to `/root/rlix/scripts/`** on vast and executed there. They use `/root/miles/scripts/models/qwen2.5-0.5B.sh` (a miles-side helper) to source `MODEL_ARGS`.
+
+### 7.3 Run M11.1 single-pipeline
+
+On the vast instance:
+
+```bash
+# Use the watchdog wrapper so a hung smoke is killed automatically:
+SCRIPT=/root/rlix/scripts/run_smoke_e2e.sh \
+SILENCE_LIMIT=300 RUN_LIMIT=2400 \
+bash /root/rlix/scripts/run_smoke_with_watchdog.sh
+
+# Or run the smoke directly without the watchdog:
+bash /root/rlix/scripts/run_smoke_e2e.sh 2>&1 | tee /root/logs/run.log
+```
+
+**Success criteria** (all must hold):
+
+- Last line: `EXIT_CODE=0`
+- `[run_miles_rlix] training loop complete`
+- `[run_miles_rlix] shutdown_hard complete`
+- For both `rollout_id=0` and `rollout_id=1`: lines `step1: await rollout_data done`, `step2: before_step done`, `step3: train_group.train done`, `step4: after_step done` are all present (run_async_train_loop bracketing — F4)
+- `_wait_for_overlap_engines_offloaded: OS-level GPU mem free min=*` shows ≥20 GB free (F2 issue 1 + F1 issue 1 working)
+- No `Traceback`, no `KeyError`, no `Pointer argument cannot be accessed from Triton`, no `Cannot resume allocation that is not paused`, no `Failed to resolve actor`
+
+### 7.4 Run M11.2 dual-pipeline
+
+```bash
+SCRIPT=/root/rlix/scripts/run_smoke_dual.sh \
+SILENCE_LIMIT=900 RUN_LIMIT=3600 \
+bash /root/rlix/scripts/run_smoke_with_watchdog.sh
+```
+
+**Success criteria**:
+
+- Last line: `EXIT_CODE=0`
+- `[run_miles_dual] mp1 training loop complete pipeline_id=miles_<uuid>`
+- `[run_miles_dual] mp2 training loop complete pipeline_id=miles_<uuid>`
+- `[run_miles_dual] shutdown_hard complete pipeline_id=miles_<uuid>` × 2
+- **Zero** `KeyError('unknown engine_index ...')` warnings (F2 issue 2 fix at HEAD `5dc4e43+` is non-regressing)
+- SGLang ServerArgs log shows P1 engines on ports 15000–15007 and P2 engines on ports 16000–16007 (F8 issue 3 — `MILES_ROLLOUT_BASE_PORT` per-pipeline offset working)
+- `_build_placement_provider train=[2] infer=[2, 3] (from pipeline_config.cluster_device_mappings: True)` for the second pipeline (F8 issue 4 — `cluster_device_mappings` threading working)
+
+### 7.5 What to do if the smoke fails
+
+1. Check `/root/logs/run.log` for the failure mode (Traceback / KeyError / hang).
+2. Compare against the failure modes catalogued in §3 features F1–F12 — every smoke failure observed during M11.1 / M11.2 development is documented under "M11 issues found" with attempt number, root cause, and fix commit.
+3. If the failure is **new** (not in §3), check `plans/m11-e2e-test-log.md` (M11.1) or `plans/m11-2-dual-pipeline-log.md` (M11.2) for any later append-only entries that might document a regression.
+4. Network/cluster-state issues (`Failed to register worker to Raylet: IOError`) are typically vast image / Ray version issues — try `ray stop --force; sleep 3; ray start --head` manually before re-running.
+
+### 7.6 Customizing for non-vast
+
+The scripts hardcode `/root/{miles,rlix,Megatron-LM}` paths. To run elsewhere:
+
+- Edit lines `cd /root/miles` and `export PYTHONPATH=...` to match your layout.
+- Edit `--hf-checkpoint` / `--ref-load` / `--load` / `--prompt-data` to your model + dataset paths.
+- The watchdog wrapper writes `/root/logs/run.log` — override with `LOG=/path/to/your.log`.
+- Everything else (port ranges, GRPO hyperparameters, `--num-rollout 2`) should match the smoke as a baseline; deviations make the success criteria above unreliable.
+
+---
+
 ## Appendix A — Verification log map
 
 The two append-only iteration logs are the source of truth for what was exercised end-to-end on real GPUs.

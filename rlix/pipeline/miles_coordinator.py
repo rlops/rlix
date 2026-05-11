@@ -471,6 +471,22 @@ class MilesCoordinator(Coordinator):
                 "not from resize_infer."
             )
         if unique_states == {"active"}:
+            # M11.2 Option β: with MILES_INIT_DEFER_ADD_WORKER=1 engines
+            # come up state="loading", finish_init_offload lands them at
+            # "offloaded", and the F40 Runtime branch handles every
+            # subsequent expand. Hitting the "already-active" hatch under
+            # Option β implies a regression (somebody activated routing
+            # behind the coordinator's back). Raise so the regression
+            # surfaces in the smoke log. Standalone miles (env unset)
+            # still gets the hatch as the documented happy path.
+            import os as _os
+            if _os.environ.get("MILES_INIT_DEFER_ADD_WORKER") == "1":
+                raise RuntimeError(
+                    "_expand_workers: engines already 'active' under "
+                    "MILES_INIT_DEFER_ADD_WORKER=1 (Option β); expected "
+                    "'offloaded' (finish_init_offload should have landed "
+                    "them there). engine_indices=%s" % sorted(engine_indices)
+                )
             # Smoke-time hatch: miles' RolloutManager brings engines up
             # in "active" state directly (no shell→offloaded→active
             # transition). When the scheduler's gap-ratio planner fires

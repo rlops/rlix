@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Optional
 
@@ -332,6 +333,34 @@ class MilesPipeline:
         logger.info("[MilesPipeline] phaseB step4: get_engine_count done count=%d", engine_count)
         self._declared_engine_count = engine_count
 
+        # M11.2 Option β / Gate 4(c): when MILES_INIT_DEFER_ADD_WORKER=1,
+        # engines came up state="loading" (rollout.py:_init_engine_info_table
+        # branch) with router /add_worker skipped. Drive finish_init_offload
+        # immediately so engines transition loading → offloaded and VRAM is
+        # released via release_memory_occupation. Subsequent
+        # _expand_workers cycles hit the F40 Runtime branch
+        # (miles_coordinator.py:498-512) which does wake → sync →
+        # activate_routing (with /add_worker re-registration). This
+        # implements Gate 4(c) "initializes all SGLang engines, then
+        # offloads all without routing or sync" without rebuilding the
+        # full F22 shell-init architecture (deferred to M11.5).
+        full_engine_indices = list(range(engine_count))
+        option_beta = os.environ.get("MILES_INIT_DEFER_ADD_WORKER") == "1"
+        if option_beta:
+            logger.info(
+                "[MilesPipeline] phaseB step4a: finish_init_offload start "
+                "(Option β / Gate 4(c)) engines=%s",
+                full_engine_indices,
+            )
+            ray.get(
+                self._rollout_manager.finish_init_offload.remote(
+                    full_engine_indices
+                )
+            )
+            logger.info(
+                "[MilesPipeline] phaseB step4a: finish_init_offload done"
+            )
+
         # Wire the train group to the rollout manager so rank 0 can push
         # train_parallel_config into RolloutManager during setup. Standalone
         # does this in create_training_models; rlix mode runs it here, after
@@ -351,31 +380,71 @@ class MilesPipeline:
             )
         )
         logger.info("[MilesPipeline] phaseB step5: register_model_update_resources done")
-        # All engines came up active via start_rollout_servers; bootstrap
-        # the full set as the active group. X3 / F19 still applies — this
-        # is the SINGLE bootstrap call.
-        full_engine_indices = list(range(engine_count))
-        logger.info("[MilesPipeline] phaseB step6: bootstrap_active_engines start")
+
+        # bootstrap_active_engines: under Option β the post-INIT active
+        # set is EMPTY (engines offloaded, router empty); F40 Runtime
+        # branch fills it lazily on first _expand_workers. Standalone
+        # (env unset) keeps the original full-set bootstrap.
+        bootstrap_set = frozenset() if option_beta else frozenset(full_engine_indices)
+        logger.info(
+            "[MilesPipeline] phaseB step6: bootstrap_active_engines start "
+            "set=%s (option_beta=%s)",
+            sorted(bootstrap_set), option_beta,
+        )
         ray.get(
             self._coordinator_handle.bootstrap_active_engines.remote(
-                frozenset(full_engine_indices)
+                bootstrap_set
             )
         )
         logger.info("[MilesPipeline] phaseB step6: bootstrap_active_engines done")
 
         active = ray.get(self._coordinator_handle.get_active_engines.remote())
-        if set(active) != set(full_engine_indices):
+        expected_active = set(bootstrap_set)
+        if set(active) != expected_active:
             raise RuntimeError(
-                f"post-INIT active set mismatch: declared={full_engine_indices}, "
+                f"post-INIT active set mismatch: declared={sorted(expected_active)}, "
                 f"got={sorted(active)}"
             )
 
-        # Push base v=-1 weights to the active engines now that the cache
-        # is built (Phase A Step 4) and the active set is known. Driver no
-        # longer needs to call this — keeps init self-contained.
-        logger.info("[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) start")
-        ray.get(self._coordinator_handle.sync_base_weights_to_active.remote(-1))
-        logger.info("[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) done")
+        if option_beta:
+            # Codex KT review Q5-a: assert router enabled_workers is empty
+            # at end of Phase B INIT. Catches any code path that adds a
+            # worker behind our back (the env-gated _init_normal skip
+            # could be defeated by a future change).
+            enabled = ray.get(
+                self._rollout_manager.get_router_enabled_workers.remote()
+            )
+            if enabled:
+                raise RuntimeError(
+                    f"Phase B INIT contract violated: router "
+                    f"enabled_workers={enabled} not empty after "
+                    f"finish_init_offload (Option β / Gate 4(c))"
+                )
+            logger.info(
+                "[MilesPipeline] phaseB step6.5: router enabled_workers "
+                "empty post-INIT (invariant OK)"
+            )
+            # Skip step 7 sync_base_weights_to_active(-1): F40 Runtime
+            # branch will sync on first expand using cache_ready_step=-1
+            # already published in Phase A step 6.6.
+            logger.info(
+                "[MilesPipeline] phaseB step7: skipped under Option β — "
+                "F40 Runtime will sync at v=-1 on first expand"
+            )
+        else:
+            # Push base v=-1 weights to the active engines now that the
+            # cache is built (Phase A Step 4) and the active set is
+            # known. Driver no longer needs to call this — keeps init
+            # self-contained.
+            logger.info(
+                "[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) "
+                "start"
+            )
+            ray.get(self._coordinator_handle.sync_base_weights_to_active.remote(-1))
+            logger.info(
+                "[MilesPipeline] phaseB step7: sync_base_weights_to_active(-1) "
+                "done"
+            )
 
         # Step 8: transition actor_infer from INITIALIZATION → GENERATION
         # priority. INITIALIZATION is the highest priority and the
@@ -719,6 +788,29 @@ class MilesPipeline:
 
     def after_training(self, step: int) -> None:
         return self._after_training(step)
+
+    def _release_train_only(self, step: int) -> None:
+        """Cleanup-only release path used when ``train()`` raises mid-step.
+
+        ``_after_training`` builds + publishes a CPU bucket BEFORE the
+        scheduler release; calling it on a partial train would
+        double-publish or crash on un-onloaded weights. This shim skips
+        ``build_cpu_bucket_cache`` / ``offload`` / ``sync_base_weights_to_active``
+        and only releases the ``actor_train`` allocation back to the
+        scheduler so peer pipelines can step.
+        """
+        if not self._initialized:
+            return
+        if not self._actor_train_allocated:
+            return
+        released = self._notify_release_cluster_gpus(
+            cluster_id=self._actor_train_cluster_id, global_step=int(step)
+        )
+        if released:
+            self._actor_train_allocated = False
+
+    def release_train_only(self, step: int) -> None:
+        return self._release_train_only(step)
 
     # ------------------------------------------------------------------
     # Helpers

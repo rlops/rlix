@@ -111,10 +111,12 @@ def _validate_cpu_only_reward(*, pipeline_config: Any) -> None:
 
 
 def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
-    """Require vLLM sleep_level=2 for multi-pipeline GPU time-sharing.
+    """Validate vLLM sleep_level for multi-pipeline GPU time-sharing.
 
-    sleep_level=2 drops model weights on offload, freeing VRAM for co-tenant
-    pipelines. Lower levels retain weights and prevent effective sharing.
+    Accepts levels {1, 2}. Default 2 (drops weights on offload — max VRAM freed
+    for co-tenant). Level 1 is a diagnostic mode (debug #58) that bypasses
+    vLLM's `_sleep_saved_buffers` restore path which has cross-tenant
+    CuMemAllocator VA-poisoning issues at level 2.
     """
     actor_infer = getattr(pipeline_config, "actor_infer", None)
     if actor_infer is None:
@@ -129,8 +131,10 @@ def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
     sleep_level = strategy_config.get("sleep_level", None)
     if sleep_level is None:
         strategy_config["sleep_level"] = 2
-    elif int(sleep_level) != 2:
-        raise RuntimeError("actor_infer vLLM sleep_level=2 required (drop model weights on offload).")
+    elif int(sleep_level) not in (1, 2):
+        raise RuntimeError(
+            f"actor_infer vLLM sleep_level must be 1 or 2 (got {sleep_level})."
+        )
 
 
 def _validate_offload_nccl(*, pipeline_config: Any) -> None:
@@ -207,15 +211,20 @@ class PipelineCoordinator(Coordinator):
         # Config flag for post-sync weight verification (disabled by default).
         self._verify_model_after_sync: bool = bool(pipeline_config.verify_model_after_sync)
 
-        # Singleton ResourceManager (rlix:roll_resource_manager) shared across all pipelines.
-        # Created before any pipeline actor so placement groups are ready.
-        from roll.distributed.scheduler.resource_manager import RollResourceManagerProxy
-
-        self._resource_manager_proxy = RollResourceManagerProxy(num_gpus_per_node=pipeline_config.num_gpus_per_node)
-        # Pin pipeline actor to node-0's placement group so Ray sets
-        # CUDA_VISIBLE_DEVICES (needed for platform detection + checkpoint RNG state).
-        # The actor requests num_gpus=0.01 from the PG's bundle.
-        self._resource_manager_node0_pg = self._resource_manager_proxy.node2pg.get(0)
+        # NeMo RL path: pin pipeline actor to a CPU-only node-0 PG.
+        # Intentionally no GPU reservation here — the shared singleton PG
+        # (created in nemo_rl_pipeline._allocate_shared_pg) needs the entire
+        # cluster GPU budget for its per-GPU bundles, so any fractional GPU
+        # reservation here would prevent that PG from going to CREATED.
+        # Pipeline actors are orchestration-only and don't run CUDA kernels,
+        # so num_gpus=0 below is safe.
+        self._resource_manager_proxy = None
+        self._resource_manager_node0_pg = ray.util.placement_group(
+            [{"CPU": 1}],
+            strategy="PACK",
+            name=f"rlix-coord-node0-{pipeline_id}",
+        )
+        ray.get(self._resource_manager_node0_pg.ready())
 
         self._pipeline_actor = None
         # Lazily resolved on first sync call; created by the pipeline actor during init.
@@ -288,11 +297,10 @@ class PipelineCoordinator(Coordinator):
             max_task_retries=0,
             max_concurrency=_PIPELINE_ACTOR_MAX_CONCURRENCY,
             runtime_env={"env_vars": self._pipeline_env_vars},
-            # Schedule inside node-0's placement group so Ray sets CUDA_VISIBLE_DEVICES
-            # (needed for checkpoint RNG state saving). num_gpus=0.01 is drawn from the
-            # placement group's bundle, not the global pool — otherwise the ResourceManager
-            # couldn't reserve all integer GPU slots in its placement group.
-            num_gpus=0.01,
+            # Pipeline actor is orchestration only — no CUDA kernels here.
+            # num_gpus=0 keeps it off the GPU resource budget so the shared
+            # singleton PG (per-GPU bundles, GPU=1 each) can be satisfied.
+            num_gpus=0,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=self._resource_manager_node0_pg,
             ),

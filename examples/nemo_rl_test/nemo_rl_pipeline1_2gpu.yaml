@@ -1,0 +1,75 @@
+# NeMo RL pipeline 1 (rlix-orchestrated, 2-GPU partial overlap)
+#
+# Pipeline 1: actor_train on GPU 0, actor_infer on GPU 0+1.
+# Each pipeline's inference spans both GPUs (DP=2). Within a pipeline,
+# train (GPU 0) and infer.rank0 (GPU 0) overlap — partial overlap.
+# Across pipelines: GPU 0 hosts ppl1.train + ppl1.infer.rank0 + ppl2.infer.rank0;
+#                   GPU 1 hosts ppl2.train + ppl1.infer.rank1 + ppl2.infer.rank1.
+
+pipeline_cls: rlix.pipeline.nemo_rl_pipeline.NemoRLFullFinetunePipeline
+exp_name: "nemo_rl_pipeline1_grpo_math"
+
+nemo_config_path: /workspace/RL/examples/configs/grpo_math_1B.yaml
+
+nemo_config_overrides:
+  - policy.model_name=Qwen/Qwen2.5-0.5B-Instruct
+  - cluster.gpus_per_node=2
+  - policy.generation.colocated.enabled=false
+  - policy.generation.colocated.resources.gpus_per_node=1
+  - grpo.async_grpo.enabled=true
+  - loss_fn.use_importance_sampling_correction=true
+  - policy.generation.vllm_cfg.async_engine=true
+  - policy.generation.vllm_cfg.tensor_parallel_size=1
+  - policy.generation.vllm_cfg.gpu_memory_utilization=0.10
+  - policy.generation.vllm_cfg.enforce_eager=true
+  # Hardcode KV-cache blocks to skip vLLM's startup memory profile, which
+  # asserts "Initial free memory >= current free memory" and trips when the
+  # cross-pipeline co-tenant Megatron offloads mid-profile (debug #39).
+  # 512 blocks × 16 tokens/block = 8192 tokens ≫ smoke test needs.
+  - +policy.generation.vllm_cfg.num_gpu_blocks_override=64
+  - policy.precision=bfloat16
+  - policy.megatron_cfg.enabled=true
+  - policy.dtensor_cfg.enabled=false
+  - grpo.num_prompts_per_step=1
+  - grpo.num_generations_per_prompt=1
+  - policy.train_global_batch_size=1
+  - policy.train_micro_batch_size=1
+  - policy.max_total_sequence_length=64
+  - policy.generation.max_new_tokens=16
+  - grpo.max_num_steps=6
+  - grpo.val_at_start=false
+  - grpo.val_period=9999
+  - checkpointing.enabled=false
+
+# Partial-overlap topology (plan Gate 4, F12 shared-PG):
+#   ppl1.train=[0]  ppl1.infer=[0,1]    (train ⊂ infer at GPU 0, dp=2)
+#   ppl2.train=[1]  ppl2.infer=[0,1]    (train ⊂ infer at GPU 1, dp=2)
+# Each GPU hosts 1 train (one pipeline) + 1 infer.rank per pipeline (both
+# pipelines). Cross-pipeline GPU time-share via scheduler-driven
+# sleep_partial / wake_up_partial on overlap dp_rank.
+train_device_mapping: [0]
+infer_device_mapping: [0, 1]
+
+# Fractional GPU per worker so co-tenant clusters fit on the same physical GPU.
+# Worst-case GPU 0: ppl1.train + ppl1.infer.rank0 + ppl2.infer.rank0 = 3 workers.
+# Worst-case GPU 1: ppl2.train + ppl1.infer.rank1 + ppl2.infer.rank1 = 3 workers.
+# rlix_max_colocated_worker_groups=4 → num_gpus=0.25 per worker; 3 × 0.25 = 0.75 ≤ 1.
+rlix_max_colocated_worker_groups: 4
+
+num_gpus_per_node: 2
+verify_model_after_sync: false
+nemo_increment_log_dir: true
+
+actor_train:
+  device_mapping: [0]
+  offload_nccl: true
+  strategy_args:
+    strategy_name: megatron_train
+
+actor_infer:
+  device_mapping: [0, 1]
+  offload_nccl: true
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      sleep_level: 2

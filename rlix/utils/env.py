@@ -35,6 +35,37 @@ def pipeline_identity_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[
     }
 
 
+def resolve_nemo_rl_pipeline_namespace(*, default: str = "roll") -> str:
+    """Ray namespace for NeMo RL child actors, read from the inherited runtime env.
+
+    Intended for NeMo RL's Ray actors (e.g. ``AsyncTrajectoryCollector``,
+    ``ReplayBuffer``, ``ModelUpdateService``) that need to be created in the
+    per-pipeline namespace propagated by the rlix driver via
+    :func:`pipeline_identity_env_vars`.
+
+    Reads ``ROLL_RAY_NAMESPACE`` from the environment. When running under the
+    rlix control plane (``RLIX_CONTROL_PLANE=rlix``) the env var must be
+    set — otherwise the actor would leak into the default namespace and
+    break cross-pipeline isolation. In standalone mode falls back to
+    *default*.
+
+    Intentionally independent of the inline read in
+    ``rlix/pipeline/full_finetune_pipeline.py`` (ROLL side) so the NeMo RL
+    error path stays distinct.
+
+    Raises ValueError when ``RLIX_CONTROL_PLANE=rlix`` and
+    ``ROLL_RAY_NAMESPACE`` is unset or empty.
+    """
+    raw = os.environ.get("ROLL_RAY_NAMESPACE")
+    if os.environ.get("RLIX_CONTROL_PLANE") == "rlix" and not raw:
+        raise ValueError(
+            "NeMo RL child actor requires ROLL_RAY_NAMESPACE env var when "
+            "RLIX_CONTROL_PLANE=rlix; the rlix driver must propagate it via "
+            "runtime_env (see pipeline_identity_env_vars())."
+        )
+    return raw if raw else default
+
+
 def parse_env_timeout_s(env_key: str, default_s: Optional[float] = None) -> Optional[float]:
     """Read a timeout in seconds from an env var; fail-fast on invalid values.
 

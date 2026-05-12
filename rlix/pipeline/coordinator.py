@@ -111,10 +111,12 @@ def _validate_cpu_only_reward(*, pipeline_config: Any) -> None:
 
 
 def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
-    """Require vLLM sleep_level=2 for multi-pipeline GPU time-sharing.
+    """Validate vLLM sleep_level for multi-pipeline GPU time-sharing.
 
-    sleep_level=2 drops model weights on offload, freeing VRAM for co-tenant
-    pipelines. Lower levels retain weights and prevent effective sharing.
+    Accepts levels {1, 2}. Default 2 (drops weights on offload — max VRAM freed
+    for co-tenant). Level 1 is a diagnostic mode (debug #58) that bypasses
+    vLLM's `_sleep_saved_buffers` restore path which has cross-tenant
+    CuMemAllocator VA-poisoning issues at level 2.
     """
     actor_infer = getattr(pipeline_config, "actor_infer", None)
     if actor_infer is None:
@@ -129,8 +131,10 @@ def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
     sleep_level = strategy_config.get("sleep_level", None)
     if sleep_level is None:
         strategy_config["sleep_level"] = 2
-    elif int(sleep_level) != 2:
-        raise RuntimeError("actor_infer vLLM sleep_level=2 required (drop model weights on offload).")
+    elif int(sleep_level) not in (1, 2):
+        raise RuntimeError(
+            f"actor_infer vLLM sleep_level must be 1 or 2 (got {sleep_level})."
+        )
 
 
 def _validate_offload_nccl(*, pipeline_config: Any) -> None:
@@ -152,6 +156,11 @@ def _validate_offload_nccl(*, pipeline_config: Any) -> None:
         # Skip clusters that are inactive (no GPUs assigned — e.g. reward/env clusters).
         device_mapping = getattr(worker_config, "device_mapping", None)
         if not device_mapping:
+            continue
+        # DeepSpeed strategies manage their own process groups and are incompatible with
+        # ROLL's ReloadableProcessGroup monkey-patch. Skip enforcement for deepspeed clusters.
+        strategy_name = getattr(getattr(worker_config, "strategy_args", None), "strategy_name", "")
+        if strategy_name.startswith("deepspeed"):
             continue
         offload_nccl = getattr(worker_config, "offload_nccl", None)
         if offload_nccl is None:
@@ -202,19 +211,25 @@ class PipelineCoordinator(Coordinator):
         # Config flag for post-sync weight verification (disabled by default).
         self._verify_model_after_sync: bool = bool(pipeline_config.verify_model_after_sync)
 
-        # Singleton ResourceManager (rlix:roll_resource_manager) shared across all pipelines.
-        # Created before any pipeline actor so placement groups are ready.
-        from roll.distributed.scheduler.resource_manager import RollResourceManagerProxy
-
-        self._resource_manager_proxy = RollResourceManagerProxy(num_gpus_per_node=pipeline_config.num_gpus_per_node)
-        # Pin pipeline actor to node-0's placement group so Ray sets
-        # CUDA_VISIBLE_DEVICES (needed for platform detection + checkpoint RNG state).
-        # The actor requests num_gpus=0.01 from the PG's bundle.
-        self._resource_manager_node0_pg = self._resource_manager_proxy.node2pg.get(0)
+        # NeMo RL path: pin pipeline actor to a CPU-only node-0 PG.
+        # Intentionally no GPU reservation here — the shared singleton PG
+        # (created in nemo_rl_pipeline._allocate_shared_pg) needs the entire
+        # cluster GPU budget for its per-GPU bundles, so any fractional GPU
+        # reservation here would prevent that PG from going to CREATED.
+        # Pipeline actors are orchestration-only and don't run CUDA kernels,
+        # so num_gpus=0 below is safe.
+        self._resource_manager_proxy = None
+        self._resource_manager_node0_pg = ray.util.placement_group(
+            [{"CPU": 1}],
+            strategy="PACK",
+            name=f"rlix-coord-node0-{pipeline_id}",
+        )
+        ray.get(self._resource_manager_node0_pg.ready())
 
         self._pipeline_actor = None
-        # Lazily resolved on first sync_lora_weights call; created by the pipeline actor during init.
-        self._model_update_service = None
+        # Lazily resolved on first sync call; created by the pipeline actor during init.
+        self._lora_model_update_service = None
+        self._nemo_rl_model_update_service = None
         # Serializes resize_infer and sync_lora_weights: prevents a weight sync from
         # racing with a concurrent shrink/expand triggered by the central scheduler.
         self._resize_sync_lock = threading.Lock()
@@ -282,11 +297,10 @@ class PipelineCoordinator(Coordinator):
             max_task_retries=0,
             max_concurrency=_PIPELINE_ACTOR_MAX_CONCURRENCY,
             runtime_env={"env_vars": self._pipeline_env_vars},
-            # Schedule inside node-0's placement group so Ray sets CUDA_VISIBLE_DEVICES
-            # (needed for checkpoint RNG state saving). num_gpus=0.01 is drawn from the
-            # placement group's bundle, not the global pool — otherwise the ResourceManager
-            # couldn't reserve all integer GPU slots in its placement group.
-            num_gpus=0.01,
+            # Pipeline actor is orchestration only — no CUDA kernels here.
+            # num_gpus=0 keeps it off the GPU resource budget so the shared
+            # singleton PG (per-GPU bundles, GPU=1 each) can be satisfied.
+            num_gpus=0,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=self._resource_manager_node0_pg,
             ),
@@ -295,6 +309,18 @@ class PipelineCoordinator(Coordinator):
         # Initialization is executed lazily by pipeline.run() via _ensure_initialized(),
         # allowing multi-pipeline startup/admission to proceed concurrently.
         return self._pipeline_actor
+
+    def report_progress(self, report: ProgressReport) -> None:
+        """F9: Receive a ProgressReport from a NeMo RL training hook and forward.
+
+        Called fire-and-forget by NemoRLRLixHooks._emit_progress() in the
+        AsyncTrajectoryCollector actor.  Delegates to report_progress_from_scheduler
+        so the coordinator's aggregation and 2%-bucket deduplication logic applies.
+
+        Args:
+            report: ProgressReport produced by NemoRLRLixHooks with mode="train".
+        """
+        self.report_progress_from_scheduler(report)
 
     def report_progress_from_scheduler(self, report: ProgressReport) -> None:
         """Aggregate per-scheduler progress and forward to the rlix scheduler.
@@ -480,14 +506,14 @@ class PipelineCoordinator(Coordinator):
                 # All infer workers preempted/sleeping; expand_worker syncs on next wake.
                 return
             # Created by the pipeline actor during init; lazy-resolve here.
-            if self._model_update_service is None:
+            if self._lora_model_update_service is None:
                 model_update_service_name = f"{self._pipeline_id}_model_update_service"
-                self._model_update_service = get_actor_or_raise(
+                self._lora_model_update_service = get_actor_or_raise(
                     model_update_service_name,
                     self._ray_namespace,
                     error_context=f"ModelUpdateService required for pipeline_id={self._pipeline_id!r}.",
                 )
-            model_update_service = self._model_update_service
+            model_update_service = self._lora_model_update_service
             assert model_update_service is not None
             ray.get(
                 model_update_service.sync_selected_workers.remote(
@@ -496,6 +522,48 @@ class PipelineCoordinator(Coordinator):
                     verify=self._verify_model_after_sync,
                 )
             )
+        finally:
+            self._resize_sync_lock.release()
+
+    def sync_base_weights_to_active(self) -> List[int]:
+        """Push base model weights to currently-active inference DP ranks.
+
+        NeMo RL partial-overlap keeps non-overlap inference ranks serving while
+        training runs. Those active ranks do not pass through expand, so the
+        training loop must refresh them before releasing actor_train GPUs.
+        """
+        acquired = self._resize_sync_lock.acquire(
+            timeout=_RESIZE_LOCK_TIMEOUT_S if _RESIZE_LOCK_TIMEOUT_S is not None else -1
+        )
+        if not acquired:
+            raise RuntimeError(
+                f"sync_base_weights_to_active timed out waiting for _resize_sync_lock after {_RESIZE_LOCK_TIMEOUT_S}s "
+                f"(likely blocked by a long-running resize_infer). "
+                f"pipeline_id={self._pipeline_id!r}"
+            )
+        try:
+            active_ranks = sorted(self._active_infer_dp_ranks)
+            if not active_ranks:
+                return []
+
+            if self._nemo_rl_model_update_service is None:
+                model_update_service_name = f"{self._pipeline_id}_nemo_rl_model_update_service"
+                self._nemo_rl_model_update_service = get_actor_or_raise(
+                    model_update_service_name,
+                    self._ray_namespace,
+                    error_context=(
+                        f"NeMo RL ModelUpdateService required for pipeline_id={self._pipeline_id!r}."
+                    ),
+                )
+            model_update_service = self._nemo_rl_model_update_service
+            assert model_update_service is not None
+            ray.get(
+                model_update_service.sync_selected_workers.remote(
+                    tgt_dp_ranks=active_ranks,
+                    verify=self._verify_model_after_sync,
+                )
+            )
+            return active_ranks
         finally:
             self._resize_sync_lock.release()
 

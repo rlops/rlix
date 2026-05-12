@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import ray
+from ray.exceptions import ActorDiedError, RayActorError
 
 from rlix.protocol.types import (
     COORDINATOR_ACTOR_NAME_PREFIX,
@@ -506,6 +507,22 @@ class SchedulerImpl:
         the adapter_id for LoRA pipelines or a reserved sentinel for full-finetune.
         Source-type mixing (LoRA vs full-finetune) within a pipeline is rejected.
         """
+        # debug #63 instrumentation
+        import time as _t
+        try:
+            _metrics_summary = (
+                f"completed={report.metrics.get('completed') if isinstance(report.metrics, dict) else '?'} "
+                f"mode={report.metrics.get('mode') if isinstance(report.metrics, dict) else '?'}"
+            )
+        except Exception:
+            _metrics_summary = "?"
+        print(
+            f"[RLIX_SCHED_LOG] t={_t.time():.6f} fn=report_progress "
+            f"pipeline_id={report.pipeline_id} "
+            f"step_target_trajectories={report.step_target_trajectories} "
+            f"{_metrics_summary}",
+            flush=True,
+        )
         validate_pipeline_id(report.pipeline_id)
         if report.step_target_trajectories <= 0:
             raise ValueError("step_target_trajectories must be > 0")
@@ -595,6 +612,15 @@ class SchedulerImpl:
         matching allocation, the existing GPU list is returned immediately.
         Duplicate pending requests for the same cluster_id are rejected.
         """
+        # debug #63 instrumentation: scheduler input log
+        import time as _t
+        print(
+            f"[RLIX_SCHED_LOG] t={_t.time():.6f} fn=request_gpus "
+            f"cluster_id={cluster_id} priority={priority.name} "
+            f"global_step={global_step} step_target_estimate={step_target_estimate} "
+            f"lora_name={lora_name}",
+            flush=True,
+        )
         await self._wait_topology_ready()
         validate_cluster_id(cluster_id)
         event = asyncio.Event()
@@ -645,6 +671,13 @@ class SchedulerImpl:
 
     async def notify_release_gpus(self, *, cluster_id: str, global_step: Optional[int] = None) -> None:
         """Release all GPUs held by ``cluster_id`` back to the idle pool."""
+        # debug #63 instrumentation
+        import time as _t
+        print(
+            f"[RLIX_SCHED_LOG] t={_t.time():.6f} fn=notify_release_gpus "
+            f"cluster_id={cluster_id} global_step={global_step}",
+            flush=True,
+        )
         await self._wait_topology_ready()
         async with self._lock:
             alloc = self._state.active_allocations.pop(cluster_id, None)
@@ -653,6 +686,13 @@ class SchedulerImpl:
             # GPU Tracing: End traces for released GPUs
             self._tracer.end_traces_for_gpu_ids(alloc.gpu_ids)
             self._state.idle_gpus |= set(alloc.gpu_ids)
+            # debug #63: log post-release idle state
+            print(
+                f"[RLIX_SCHED_LOG] t={_t.time():.6f} fn=notify_release_gpus_done "
+                f"cluster_id={cluster_id} released_gpus={sorted(alloc.gpu_ids)} "
+                f"idle_gpus_now={sorted(self._state.idle_gpus)}",
+                flush=True,
+            )
             self._tracer.trace_active_gpus_update(num_gpus=self._num_gpus, idle_gpu_count=len(self._state.idle_gpus))
             # GPU Tracing: Instant marker for release
             self._tracer.trace_release_marker(cluster_id, alloc.gpu_ids)
@@ -1369,26 +1409,38 @@ class SchedulerImpl:
         # overlap with GPUs being freed). Expands targeting already-idle GPUs can run concurrently
         # with shrinks instead of waiting for all shrinks to finish first.
         """
-        # Phase 5.2: execute all shrinks (dp_ranks_to_remove) concurrently and wait for all to complete
-        shrink_tasks = [
-            coordinator.resize_infer.remote(dp_ranks_to_remove=list(removes), dp_ranks_to_add=[])
+        # Phase 5.2: execute all shrinks (dp_ranks_to_remove) concurrently and wait for all to complete.
+        # Tolerate dead pipeline coordinators (debug #50): a finished pipeline's
+        # PipelineCoordinator may have been collected before scheduler discovers
+        # it. Don't kill the whole loop because of one dead ppl — log + auto-
+        # unregister so the surviving pipelines keep training.
+        shrink_calls = [
+            (self._pipeline_id_for_coordinator_locked_unsafe(coordinator), coordinator, list(removes))
             for coordinator, removes, adds in calls
             if removes
         ]
-        if shrink_tasks:
-            await asyncio.gather(*shrink_tasks)
+        if shrink_calls:
+            await self._gather_resize_tolerate_dead(
+                [(pid, c.resize_infer.remote(dp_ranks_to_remove=removes, dp_ranks_to_add=[]))
+                 for pid, c, removes in shrink_calls],
+                op="shrink",
+            )
         # GPU Tracing: close slices right after shrinks complete, before expands start
         if shrink_trace_infos:
             self._tracer.end_traces_for_gpu_ids([info.gpu_id for info in shrink_trace_infos])
 
         # Phase 5.4: execute all expands (dp_ranks_to_add) concurrently after all shrinks complete
-        expand_tasks = [
-            coordinator.resize_infer.remote(dp_ranks_to_remove=[], dp_ranks_to_add=list(adds))
+        expand_calls = [
+            (self._pipeline_id_for_coordinator_locked_unsafe(coordinator), coordinator, list(adds))
             for coordinator, removes, adds in calls
             if adds
         ]
-        if expand_tasks:
-            await asyncio.gather(*expand_tasks)
+        if expand_calls:
+            await self._gather_resize_tolerate_dead(
+                [(pid, c.resize_infer.remote(dp_ranks_to_remove=[], dp_ranks_to_add=adds))
+                 for pid, c, adds in expand_calls],
+                op="expand",
+            )
         # GPU Tracing: open slices right after expands complete, before state commit
         for info in expand_trace_infos:
             self._tracer.start_gpu_trace(
@@ -1401,6 +1453,83 @@ class SchedulerImpl:
                 required_gpus_per_node=self._required_gpus_per_node,
                 cycle_counter=self._cycle_counter,
             )
+
+    async def _gather_resize_tolerate_dead(
+        self, pid_refs: List[Tuple[Optional[str], Any]], *, op: str
+    ) -> None:
+        """Gather resize_infer object refs, swallowing dead-pipeline errors.
+
+        Pipeline coordinators die when their pipeline.run() returns and Ray
+        garbage-collects the actor. The scheduler may still hold a stale handle
+        and try to fan out resize_infer to a dead actor, which raises
+        ActorDiedError / RayActorError. Without tolerance, asyncio.gather
+        propagates the error → _central_scheduling_loop signals all waiters
+        (including healthy pipelines) → fail-fast shutdown.
+
+        Strategy (debug #50): use return_exceptions=True so individual failures
+        don't poison the gather; for each dead-actor result, auto-unregister
+        the pipeline to clean up scheduler state and free its GPUs.
+        """
+        if not pid_refs:
+            return
+        refs = [r for _, r in pid_refs]
+        results = await asyncio.gather(*refs, return_exceptions=True)
+        dead_pipeline_ids: Set[str] = set()
+        for (pid, _ref), result in zip(pid_refs, results):
+            if isinstance(result, (ActorDiedError, RayActorError)):
+                logger.warning(
+                    "[Scheduler] resize_infer (%s) saw dead coordinator "
+                    "(pipeline_id=%s, error=%s); will auto-unregister",
+                    op, pid or "<unknown>", type(result).__name__,
+                )
+                if pid:
+                    dead_pipeline_ids.add(pid)
+            elif isinstance(result, BaseException):
+                # Re-raise non-dead-actor exceptions so they trigger fail-fast.
+                raise result
+        for pid in dead_pipeline_ids:
+            # v75 (debug #66): guard against racing a live pipeline's planned
+            # release. If the launcher (or another caller) holds an outstanding
+            # await_release_gpus for this pipeline, an auto-unregister here will
+            # raise a "Pipeline ... unregistered" error in that waiter
+            # (scheduler.py:311-325 + 1837). With the v75 launcher patch the
+            # graceful unregister fires AFTER the pipeline's run() finally has
+            # finished its await_release; if we still see a dead coordinator at
+            # that point, the pipeline must have already been unregistered
+            # gracefully OR truly crashed mid-flight and needs cleanup.
+            #
+            # Skip auto-unregister when:
+            #  (a) the pipeline already unregistered (registry pop): nothing to do
+            #  (b) the pipeline still has a pending planned release request:
+            #      a graceful path is in progress; let it land instead of stomping it
+            if pid not in self._state.pipeline_registry:
+                logger.info(
+                    "[Scheduler] dead coordinator for pipeline_id=%s already "
+                    "unregistered; skipping auto-unregister", pid,
+                )
+                continue
+            cluster_id = f"{pid}_{GENERATION_CLUSTER_NAME}"
+            if cluster_id in self._state.pending_planned_release_requests:
+                logger.warning(
+                    "[Scheduler] dead coordinator for pipeline_id=%s but "
+                    "planned-release in progress; deferring auto-unregister "
+                    "(graceful unregister should follow)", pid,
+                )
+                continue
+            try:
+                await self.unregister_pipeline(pipeline_id=pid)
+            except Exception as e:
+                logger.warning(
+                    "[Scheduler] auto-unregister pipeline_id=%s failed: %s",
+                    pid, e,
+                )
+
+    def _pipeline_id_for_coordinator_locked_unsafe(self, coordinator: Any) -> Optional[str]:
+        """Reverse-lookup pipeline_id from a coordinator handle via the cache."""
+        for pid, (_namespace, handle) in self._coordinator_handle_cache.items():
+            if handle is coordinator:
+                return pid
+        return None
 
     async def _fail_fast_shutdown(self, *, reason: str) -> None:
         """Trigger a forced orchestrator shutdown on unrecoverable scheduler error."""

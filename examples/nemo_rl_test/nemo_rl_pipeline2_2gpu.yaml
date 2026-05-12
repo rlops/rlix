@@ -1,0 +1,60 @@
+# NeMo RL pipeline 2 (rlix-orchestrated, 2-GPU partial overlap)
+# Pipeline 2: actor_train on GPU 1, actor_infer on GPU 0+1.
+# Mirrors pipeline 1 — see that file's header for topology details.
+
+pipeline_cls: rlix.pipeline.nemo_rl_pipeline.NemoRLFullFinetunePipeline
+exp_name: "nemo_rl_pipeline2_grpo_math"
+
+nemo_config_path: /workspace/RL/examples/configs/grpo_math_1B.yaml
+
+nemo_config_overrides:
+  - policy.model_name=Qwen/Qwen2.5-0.5B-Instruct
+  - cluster.gpus_per_node=2
+  - policy.generation.colocated.enabled=false
+  - policy.generation.colocated.resources.gpus_per_node=1
+  - grpo.async_grpo.enabled=true
+  - loss_fn.use_importance_sampling_correction=true
+  - policy.generation.vllm_cfg.async_engine=true
+  - policy.generation.vllm_cfg.tensor_parallel_size=1
+  - policy.generation.vllm_cfg.gpu_memory_utilization=0.10
+  - policy.generation.vllm_cfg.enforce_eager=true
+  # See pipeline1 yaml comment: skip vLLM profile (debug #39).
+  - +policy.generation.vllm_cfg.num_gpu_blocks_override=64
+  - policy.precision=bfloat16
+  - policy.megatron_cfg.enabled=true
+  - policy.dtensor_cfg.enabled=false
+  - grpo.num_prompts_per_step=1
+  - grpo.num_generations_per_prompt=1
+  - policy.train_global_batch_size=1
+  - policy.train_micro_batch_size=1
+  - policy.max_total_sequence_length=64
+  - policy.generation.max_new_tokens=16
+  - grpo.max_num_steps=6
+  - grpo.val_at_start=false
+  - grpo.val_period=9999
+  - checkpointing.enabled=false
+
+# Partial-overlap topology mirror of pipeline1 (plan Gate 4, F12 shared-PG).
+# ppl2.train=[1], ppl2.infer=[0,1] dp=2 — train ⊂ infer at GPU 1.
+train_device_mapping: [1]
+infer_device_mapping: [0, 1]
+
+rlix_max_colocated_worker_groups: 4
+
+num_gpus_per_node: 2
+verify_model_after_sync: false
+nemo_increment_log_dir: true
+
+actor_train:
+  device_mapping: [1]
+  offload_nccl: true
+  strategy_args:
+    strategy_name: megatron_train
+
+actor_infer:
+  device_mapping: [0, 1]
+  offload_nccl: true
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      sleep_level: 2

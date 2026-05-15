@@ -27,6 +27,10 @@ from rlix.scheduler.types import (
 _MAX_GAP_ITERATIONS: int = 10_000
 _MAX_GAP_ACTIVATIONS: int = 1_000
 
+# Floor demand (step-target units) for a held actor_infer cluster with no
+# progress and no pending GEN request — translates to ≥1 TP bundle downstream.
+_STARVATION_FLOOR_STEP_DEMAND: float = 1.0
+
 
 @dataclass(frozen=True, slots=True)
 class _GapRatioDPWorker:
@@ -225,11 +229,19 @@ def plan_generation_gap_ratio(
         remaining, step_target = progress_totals_fn(pipeline_id=pipeline_id)
         if step_target <= 0.0:
             step_target_estimate = get_pending_generation_step_target_estimate(pending_bucket_gen, cluster_id)
-            if step_target_estimate is None:
+            if step_target_estimate is not None:
+                remaining = float(step_target_estimate)
+                step_target = float(step_target_estimate)
+                percent_remaining = 1.0
+            elif cluster_id in active_allocations:
+                # Held actor_infer but no demand signal: keep visible to gap-ratio
+                # as receiver (reclaim from starvation) and donor (yield to peer).
+                # `active_allocations` guard excludes legitimate release.
+                remaining = _STARVATION_FLOOR_STEP_DEMAND
+                step_target = _STARVATION_FLOOR_STEP_DEMAND
+                percent_remaining = 1.0
+            else:
                 continue
-            remaining = float(step_target_estimate)
-            step_target = float(step_target_estimate)
-            percent_remaining = 1.0
         else:
             percent_remaining = remaining / step_target if step_target > 0 else 0.0
 

@@ -64,7 +64,7 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     env_vars = pipeline_identity_env_vars(
         pipeline_id=str(pipeline_id), ray_namespace=str(ray_namespace)
     )
-    for key in ("MILES_MIN_FREE_GPU_MEM_GB",):
+    for key in ("MILES_MAX_RESIDUAL_GPU_MEM_GB",):
         if (value := os.environ.get(key)) is not None:
             env_vars[key] = value
     return env_vars

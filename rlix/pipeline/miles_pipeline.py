@@ -419,12 +419,12 @@ class MilesPipeline:
     def _wait_for_overlap_engines_offloaded(self, allocated_train_gpus, *, timeout_s: float = 60.0) -> None:
         """After scheduler grants actor_train, poll the rollout manager
         until the engines on overlap GPUs have transitioned to ``offloaded``
-        AND the OS-reported GPU memory is actually free. SGLang's HTTP
+        AND OS-reported residual GPU memory is low enough. SGLang's HTTP
         ``/release_memory_occupation`` 200 OK + state="offloaded" do not
         by themselves guarantee the CUDA driver has returned the memory
         to the OS pool — the wake_up in the next-process train actor
-        would then OOM. Verify actual GPU mem free by parsing
-        ``nvidia-smi --query-gpu=memory.free`` on the same node, since
+        would then OOM. Verify actual residual GPU usage by parsing
+        ``nvidia-smi --query-gpu=memory.used`` on the same node, since
         miles' single-node smoke topology has driver+actors+engines all
         on the head node and ``CUDA_VISIBLE_DEVICES`` is the per-actor
         slice of the shared physical pool.
@@ -488,18 +488,20 @@ class MilesPipeline:
                 timeout_s, target_indices, uniq,
             )
 
-        # Phase 2: probe nvidia-smi for OS-level free memory on the
-        # overlap GPU IDs. The train actor needs model weights plus
-        # activation headroom before wake_up. The default 20 GB threshold
-        # is the validated Qwen2.5-0.5B smoke setting; larger models can
-        # override it with MILES_MIN_FREE_GPU_MEM_GB without changing the
-        # driver CLI surface.
-        target_free_gb = parse_env_positive_float("MILES_MIN_FREE_GPU_MEM_GB", 20.0)
+        # Phase 2: probe nvidia-smi for OS-level residual used memory on
+        # the overlap GPU IDs. A max-used threshold is portable across GPU
+        # models; a min-free threshold changes meaning with total VRAM.
+        # The default is intentionally conservative for smoke, and larger
+        # models or tighter environments can override it without changing
+        # the driver CLI surface.
+        target_residual_gb = parse_env_positive_float(
+            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 10.0
+        )
         deadline2 = time.time() + float(timeout_s)
-        last_min_free_gb: Optional[float] = None
+        last_max_used_gb: Optional[float] = None
         while time.time() < deadline2:
-            min_free_gb = self._probe_min_free_gpu_mem_gb(target_gpu_ids)
-            if min_free_gb is None:
+            max_used_gb = self._probe_max_used_gpu_mem_gb(target_gpu_ids)
+            if max_used_gb is None:
                 # nvidia-smi unavailable or unparseable — fall back to a
                 # short grace sleep so we don't spin forever.
                 logger.warning(
@@ -508,27 +510,28 @@ class MilesPipeline:
                 )
                 time.sleep(3.0)
                 return
-            last_min_free_gb = min_free_gb
-            if min_free_gb >= target_free_gb:
+            last_max_used_gb = max_used_gb
+            if max_used_gb <= target_residual_gb:
                 logger.info(
-                    "_wait_for_overlap_engines_offloaded: OS-level GPU mem free "
-                    "min=%.2f GB across overlap GPUs %s (target=%.1f GB)",
-                    min_free_gb, target_gpu_ids, target_free_gb,
+                    "_wait_for_overlap_engines_offloaded: OS-level GPU mem residual "
+                    "used max=%.2f GB across overlap GPUs %s "
+                    "(residual_target=%.1f GB)",
+                    max_used_gb, target_gpu_ids, target_residual_gb,
                 )
                 return
             time.sleep(0.5)
         logger.warning(
-            "_wait_for_overlap_engines_offloaded: free-mem timeout after %.1fs; "
-            "min_free_gb=%.2f below %.1f GB target on GPUs %s — wake_up may OOM",
+            "_wait_for_overlap_engines_offloaded: residual-used timeout after %.1fs; "
+            "max_used_gb=%.2f above %.1f GB target on GPUs %s — wake_up may OOM",
             timeout_s,
-            last_min_free_gb if last_min_free_gb is not None else float("nan"),
-            target_free_gb,
+            last_max_used_gb if last_max_used_gb is not None else float("nan"),
+            target_residual_gb,
             target_gpu_ids,
         )
 
     @staticmethod
-    def _probe_min_free_gpu_mem_gb(gpu_ids: list[int]) -> Optional[float]:
-        """Return the minimum free GPU memory (GB) across ``gpu_ids`` as
+    def _probe_max_used_gpu_mem_gb(gpu_ids: list[int]) -> Optional[float]:
+        """Return the maximum used GPU memory (GB) across ``gpu_ids`` as
         reported by ``nvidia-smi``. Returns ``None`` if nvidia-smi is
         not available or output cannot be parsed.
         """
@@ -544,7 +547,7 @@ class MilesPipeline:
                 [
                     "nvidia-smi",
                     f"--id={','.join(str(g) for g in gpu_ids)}",
-                    "--query-gpu=memory.free",
+                    "--query-gpu=memory.used",
                     "--format=csv,noheader,nounits",
                 ],
                 stderr=subprocess.STDOUT,
@@ -553,18 +556,18 @@ class MilesPipeline:
         except (subprocess.SubprocessError, OSError) as exc:
             logger.debug("nvidia-smi probe failed: %r", exc)
             return None
-        free_mibs: list[float] = []
+        used_mibs: list[float] = []
         for line in out.strip().splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                free_mibs.append(float(line))
+                used_mibs.append(float(line))
             except ValueError:
                 continue
-        if not free_mibs:
+        if not used_mibs:
             return None
-        return min(free_mibs) / 1024.0
+        return max(used_mibs) / 1024.0
 
     def _before_training(self, step: int) -> None:
         if not self._initialized:

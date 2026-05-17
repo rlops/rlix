@@ -674,17 +674,20 @@ class MilesPipeline:
         # Coordinator drives sync_base_weights_to_active under its
         # resize lock; pipeline NEVER calls service / finalize /
         # set_weight_version directly (F05).
-        ray.get(
-            self._coordinator_handle.sync_base_weights_to_active.remote(int(step))
-        )
-        # Release the actor_train allocation back to the scheduler so
-        # other pipelines can step. R11-F1: only flip the ledger flag
-        # after a SUCCESSFUL release.
-        released = self._notify_release_cluster_gpus(
-            cluster_id=self._actor_train_cluster_id, global_step=int(step)
-        )
-        if released:
-            self._actor_train_allocated = False
+        try:
+            ray.get(
+                self._coordinator_handle.sync_base_weights_to_active.remote(int(step))
+            )
+        finally:
+            # Release the actor_train allocation back to the scheduler so
+            # other pipelines can step even if weight sync fails after the
+            # train actor has offloaded. R11-F1: only flip the ledger flag
+            # after a SUCCESSFUL release.
+            released = self._notify_release_cluster_gpus(
+                cluster_id=self._actor_train_cluster_id, global_step=int(step)
+            )
+            if released:
+                self._actor_train_allocated = False
 
     # ------------------------------------------------------------------
     # M4 minimal hard cleanup

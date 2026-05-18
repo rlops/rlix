@@ -307,15 +307,17 @@ class MilesModelUpdateService:
             )
         finalize_refs = [h.finalize_weight_update.remote() for h in handles.values()]
         inflight_refs.extend(finalize_refs)
-        await _ray_get(finalize_refs)
-        # (4.post) resume the engines so subsequent generate calls work.
         try:
-            cont_refs = [h.continue_generation.remote() for h in handles.values()]
-            await _ray_get(cont_refs)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[MilesModelUpdateService] continue_generation post-finalize failed: %r", exc
-            )
+            await _ray_get(finalize_refs)
+        finally:
+            # (4.post) resume the engines so subsequent generate calls work.
+            try:
+                cont_refs = [h.continue_generation.remote() for h in handles.values()]
+                await _ray_get(cont_refs)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[MilesModelUpdateService] continue_generation post-finalize failed: %r", exc
+                )
 
         # (5) Single version publish (F21). Pipeline / coordinator MUST
         #     NOT call this directly — only the service does.

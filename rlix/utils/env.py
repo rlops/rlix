@@ -52,3 +52,21 @@ def parse_env_timeout_s(env_key: str, default_s: Optional[float] = None) -> Opti
     except ValueError as exc:
         raise RuntimeError(f"{env_key} must be a number, got: {raw!r}") from exc
     return None if value <= 0 else value
+
+
+def parse_env_positive_float(env_key: str, default: float) -> float:
+    """Read a positive float from an env var; fail-fast on invalid values.
+
+    Returns *default* when the env var is unset. Raises RuntimeError if the
+    value cannot be parsed as a number, or if the parsed value is <= 0.
+    """
+    raw = os.environ.get(env_key)
+    if raw is None:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{env_key} must be a number, got: {raw!r}") from exc
+    if value <= 0.0:
+        raise RuntimeError(f"{env_key} must be > 0, got: {value!r}")
+    return value

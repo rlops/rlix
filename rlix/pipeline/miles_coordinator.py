@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import threading
 import time
 from copy import deepcopy
@@ -60,9 +61,13 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     runtime_env. Reads ``RLIX_CONTROL_PLANE`` from the environment so
     actors inside an existing pipeline preserve the inherited value.
     """
-    return pipeline_identity_env_vars(
+    env_vars = pipeline_identity_env_vars(
         pipeline_id=str(pipeline_id), ray_namespace=str(ray_namespace)
     )
+    for key in ("MILES_MAX_RESIDUAL_GPU_MEM_GB",):
+        if (value := os.environ.get(key)) is not None:
+            env_vars[key] = value
+    return env_vars
 
 
 class MilesCoordinator(Coordinator):

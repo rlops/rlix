@@ -554,10 +554,9 @@ class MilesPipeline:
                     rollout_manager.get_engine_states.remote(target_indices)
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "_wait_for_overlap_engines_offloaded: get_engine_states failed: %r", exc
-                )
-                return
+                raise RuntimeError(
+                    "_wait_for_overlap_engines_offloaded: get_engine_states failed"
+                ) from exc
             uniq = {states.get(i, "?") for i in target_indices}
             if uniq.issubset({"offloaded", "shell"}):
                 logger.info(
@@ -567,10 +566,9 @@ class MilesPipeline:
                 break
             time.sleep(0.1)
         else:
-            logger.warning(
-                "_wait_for_overlap_engines_offloaded: state timeout after %.1fs; "
-                "engines %s still in state=%r",
-                timeout_s, target_indices, uniq,
+            raise RuntimeError(
+                "_wait_for_overlap_engines_offloaded: state timeout after "
+                f"{timeout_s:.1f}s; engines {target_indices} still in state={uniq!r}"
             )
 
         # Phase 2: probe nvidia-smi for OS-level free memory on the
@@ -607,13 +605,11 @@ class MilesPipeline:
                 )
                 return
             time.sleep(0.5)
-        logger.warning(
-            "_wait_for_overlap_engines_offloaded: free-mem timeout after %.1fs; "
-            "min_free_gb=%.2f below %.1f GB target on GPUs %s — wake_up may OOM",
-            timeout_s,
-            last_min_free_gb if last_min_free_gb is not None else float("nan"),
-            target_free_gb,
-            target_gpu_ids,
+        raise RuntimeError(
+            "_wait_for_overlap_engines_offloaded: free-mem timeout after "
+            f"{timeout_s:.1f}s; min_free_gb="
+            f"{last_min_free_gb if last_min_free_gb is not None else float('nan'):.2f} "
+            f"below {target_free_gb:.1f} GB target on GPUs {target_gpu_ids}"
         )
 
     @staticmethod

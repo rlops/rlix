@@ -577,7 +577,7 @@ class MilesPipeline:
         # intentionally broader than the SGLang process tree: it catches
         # non-child/orphan/co-tenant VRAM (Megatron/Miles/vLLM/etc.) on the
         # GPUs that must be clear before actor_train wakes up.
-        threshold_gb = parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 13.0)
+        threshold_gb = parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 7.0)
         max_used_gb = self._probe_max_used_gpu_mem_gb(target_gpu_ids)
         if max_used_gb is None:
             logger.warning(
@@ -600,7 +600,10 @@ class MilesPipeline:
                 "check may be caused by non-SGLang co-tenants such as "
                 "Megatron/Miles/vLLM/orphan processes. SGLang per-engine "
                 "process-resident and server_info residual diagnostics are logged "
-                "engine-side for attribution."
+                "engine-side for attribution. Note: with MILES_TMS_HOOK_MODE=torch, "
+                "~11 GiB residual is expected (Megatron optimizer state is not "
+                "tms-pausable) — either run the preload hook mode (cu13+ stacks) "
+                "or set MILES_MAX_RESIDUAL_GPU_MEM_GB=13."
             )
 
     @staticmethod

@@ -49,13 +49,20 @@ else
 fi
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
-export MILES_TMS_HOOK_MODE=torch
-# B-14 mitigation on 16 GB GPUs: enable torch_memory_saver.pause() so
-# Megatron weights actually move off-GPU between train cycles. Original
-# `MILES_SKIP_TMS_PAUSE=1` was a workaround for tms.pause segfault on
-# CUDA 12.9 + Blackwell + tms 0.0.9. On this RTX 4060 Ti + torch 2.11
-# stack, attempt to use real tms.pause to free GPU memory between
-# rollouts.
+# preload = full-catchment offload (optimizer state pausable), verified on
+# cu130 Blackwell 2026-07-05; matches the 7.0 residual gate default.
+# Fallback for pre-cu13 Blackwell stacks:
+#   export MILES_TMS_HOOK_MODE=torch AND MILES_MAX_RESIDUAL_GPU_MEM_GB=13.
+export MILES_TMS_HOOK_MODE=preload
+# miles' arch guard blocks preload on Blackwell (a tms 0.0.9 + CUDA 12.9
+# segfault, since fixed on cu13 images — verified 2026-07-05 on 4x RTX 5090
+# cu130, mock + dual E2E). Authorize preload via the guard's own escape
+# hatch; on pre-cu13 Blackwell stacks use the torch+13 fallback above instead.
+export MILES_TMS_ALLOW_PRELOAD_ON_BLACKWELL=1
+# Real tms.pause stays enabled (MILES_SKIP_TMS_PAUSE unset). The historical
+# skip was a workaround for the tms 0.0.9 pause segfault on pre-cu13
+# Blackwell stacks; if you must revive it, also pin
+# MILES_MAX_RESIDUAL_GPU_MEM_GB=13 (nothing offloads with the skip).
 # export MILES_SKIP_TMS_PAUSE=1
 export MILES_SKIP_NODE_PG_PIN=1
 # NOTE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is incompatible with

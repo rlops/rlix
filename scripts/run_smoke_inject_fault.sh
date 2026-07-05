@@ -32,6 +32,9 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 export MILES_TMS_HOOK_MODE=torch
 export MILES_SKIP_TMS_PAUSE=1
 export MILES_SKIP_NODE_PG_PIN=1
+# torch-mode/skip-pause rollback value for the residual gate (code default 7.0
+# is sized for preload mode — see run_smoke_dual.sh).
+export MILES_MAX_RESIDUAL_GPU_MEM_GB=13
 
 # Phase 1 fault injection — raises inside train_group.train at first rollout.
 export MILES_INJECT_TRAIN_FAULT=1

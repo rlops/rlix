@@ -26,6 +26,10 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 # aggressive offload).
 export MILES_TMS_HOOK_MODE=torch
 export MILES_SKIP_TMS_PAUSE=1
+# torch-mode/skip-pause leaves ~11+ GiB residual on the train GPUs; pin the
+# residual gate to the torch-mode rollback value (code default is now 7.0,
+# sized for preload mode — see run_smoke_dual.sh).
+export MILES_MAX_RESIDUAL_GPU_MEM_GB=13
 # ROLL ResourceManagerProxy creates a node-PG holding all GPUs which would
 # pin the MilesPipeline actor and block Phase B's _create_placement_group.
 # Skip the pin so the coordinator can remove the node-PG mid-run.

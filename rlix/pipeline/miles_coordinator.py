@@ -439,12 +439,14 @@ class MilesCoordinator(Coordinator):
         # Whole-GPU residual threshold (GiB). Miles shrink_engines logs
         # SGLang per-process/server_info attribution diagnostics with this
         # value; the hard whole-GPU gate runs in MilesPipeline after the
-        # engines report offloaded. Default 13.0 is a temporary smoke-safe
-        # value based on observed whole-GPU residuals with the known Megatron
-        # train-offload gap; lower it after that follow-up is fixed and
-        # re-measured.
+        # engines report offloaded. Default 7.0 = measured preload-mode
+        # whole-GPU floor 5.02 GiB (2026-07-05 audit, 4x RTX 5090 cu130 dual
+        # smoke) + margin; requires MILES_TMS_HOOK_MODE=preload (miles guard
+        # allows it on cu13+ Blackwell). torch-hook deployments must set
+        # MILES_MAX_RESIDUAL_GPU_MEM_GB=13. Next step: ~3.0 after the
+        # suspected tms.disable() weight-sync-window tail (~1.6 GiB) is fixed.
         residual_threshold_gb = parse_env_positive_float(
-            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 13.0
+            "MILES_MAX_RESIDUAL_GPU_MEM_GB", 7.0
         )
         shrunk = ray.get(
             rollout_manager.shrink_engines.remote(

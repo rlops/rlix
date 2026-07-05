@@ -33,9 +33,9 @@ def test_miles_uses_whole_gpu_residual_threshold() -> None:
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value == "MILES_MAX_RESIDUAL_GPU_MEM_GB"
         and isinstance(node.args[1], ast.Constant)
-        and node.args[1].value == 13.0
+        and node.args[1].value == 7.0
         for node in ast.walk(shrink_fn)
-    ), "_shrink_workers must parse the residual threshold env var with 13GB default"
+    ), "_shrink_workers must parse the residual threshold env var with 7GB default"
 
     assert any(
         isinstance(node, ast.Call)
@@ -90,9 +90,9 @@ def test_miles_pipeline_enforces_whole_gpu_residual_gate() -> None:
         and isinstance(node.args[0], ast.Constant)
         and node.args[0].value == "MILES_MAX_RESIDUAL_GPU_MEM_GB"
         and isinstance(node.args[1], ast.Constant)
-        and node.args[1].value == 13.0
+        and node.args[1].value == 7.0
         for node in ast.walk(wait_fn)
-    ), "MilesPipeline hard gate must parse MILES_MAX_RESIDUAL_GPU_MEM_GB with 13GB default"
+    ), "MilesPipeline hard gate must parse MILES_MAX_RESIDUAL_GPU_MEM_GB with 7GB default"
     assert any(isinstance(node, ast.Raise) for node in ast.walk(wait_fn)), (
         "MilesPipeline must raise when whole-GPU residual exceeds the threshold"
     )

@@ -535,6 +535,7 @@ Four small fixes from the M11 review report.
 | MED | MED1 | concurrent-resize stress test under `max_concurrency=4` | Open (Codex carryforward) |
 | NOTE | F8 / F10 | `orchestrator.cleanup_stale_pipelines()` RPC | M11.3 production hardening |
 | LOW | LOW1 | verify `generate_rollout_fully_async` accepts `rlix_hooks` kw | ~30 min check |
+| MED | F2 v2 | whole-GPU used-memory gate landed (`rlops/rlix#17` merged 2026-07-05, default 13.0); follow-up lowers default to 7.0 + preload dual smoke (this PR) — basis: torch-hook residual 11.07 GiB vs preload 5.02 GiB (4x5090 cu130); rollback `MILES_TMS_HOOK_MODE=torch` + `MILES_MAX_RESIDUAL_GPU_MEM_GB=13` _(added 2026-07-05)_ | #17 merged; threshold-7 follow-up in flight |
 
 ## §3.6 Tianye's PR #14 — finalize-always-continue + release-on-sync-failure ✅ MERGED 2026-05-18 _(added 2026-05-24)_
 
@@ -718,6 +719,7 @@ New deferred-work entries surfaced during M11.2 real-overlap work (not in the hi
 | **F8 / F10 (NOTE)** | Detached coordinator persists after driver crash | M11.3 cleanup RPC scope | Stale actors on operator-killed runs | Still open; needs `orchestrator.cleanup_stale_pipelines()` RPC. | _(added 2026-05-24)_ |
 | **F9 (NOTE)** | `_split_pools_for_dual` silently ignored extra GPUs on non-2N machines | Static-analysis finding | Silent GPU leak on 5/6/7-GPU machines | **✅ RESOLVED** by miles `1487c3f` — explicit `ValueError` when `num_gpus_per_node != 2*infer_pool_size`; error message points at MILES_DUAL_P* workaround. | _(added 2026-05-24)_ |
 | **LOW1 (Codex carryforward)** | Verify `generate_rollout_fully_async` actually accepts `rlix_hooks` kw | `inspect.signature` forward silently no-ops if kw is missing | Demand signal path dead-codes silently | Open; ~30 min grep + startup assert. | _(added 2026-05-24)_ |
+| **F2 v2 (MED)** | Whole-GPU used-memory gate landed (`rlops/rlix#17` merged 2026-07-05, default 13.0); follow-up threshold 7.0 + preload dual smoke (this PR) | Measured basis: torch-hook residual 11.07 GiB (Megatron optimizer state never offloads) vs preload 5.02 GiB stable on 4x5090 cu130 dual smoke | Tighter gate catches offload regressions; torch-hook deployments trip 7.0 by design | Landed; rollback knobs `MILES_TMS_HOOK_MODE=torch` + `MILES_MAX_RESIDUAL_GPU_MEM_GB=13`. | _(added 2026-07-05)_ |
 
 ---
 
@@ -737,6 +739,7 @@ A vast.ai (or equivalent) GPU instance with:
 | Model checkpoint | Qwen2.5-0.5B at `/root/Qwen2.5-0.5B`, torch_dist at `/root/Qwen2.5-0.5B_torch_dist`, miles bundle at `/root/Qwen2.5-0.5B_miles/` | Any HF Megatron-compatible Qwen2.5-0.5B mirror works. |
 | Datasets | `/root/dapo-math-17k/dapo-math-17k.jsonl`, `/root/aime-2024/aime-2024.jsonl` | Eval is gated and skipped in smoke; the file just needs to exist. |
 | Branches | rlix on `zhenyu/miles-mvp-e2e` (or main once merged), miles on `zhenyu/m11-mvp-test` | See Appendix C for HEADs. |
+| CUDA — update | 13.0 (cu130 wheels, 4×RTX 5090) | `run_smoke_dual.sh` now defaults to `MILES_TMS_HOOK_MODE=preload` (verified 2026-07-05: preload segfault gone on cu13 wheels; residual gate default 7.0 sized for preload). Pre-cu13 Blackwell stacks: fall back to `MILES_TMS_HOOK_MODE=torch` + `MILES_MAX_RESIDUAL_GPU_MEM_GB=13` (`run_smoke_e2e.sh`/`run_smoke_inject_fault.sh` keep that combination). _(added 2026-07-05)_ |
 
 ### 7.2 Smoke scripts
 

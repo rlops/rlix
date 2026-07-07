@@ -43,12 +43,18 @@ from rlix.scheduler.types import (
     validate_cluster_id,
 )
 from rlix.scheduler.validation import ValidationInputs, validate_execution_plan
+from rlix.utils.env import parse_env_timeout_s
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
 
 _TOPOLOGY_READY_TIMEOUT_S: float = float(os.environ.get("RLIX_TOPOLOGY_READY_TIMEOUT_S", "120"))
 _FAIL_FAST_SHUTDOWN_TIMEOUT_S: float = float(os.environ.get("RLIX_FAIL_FAST_SHUTDOWN_TIMEOUT_S", "5"))
+# Bound for the per-cycle resize_infer RPC fan-out in _execute_resize_calls.
+# Must exceed the coordinator-side worst case (30s shrink drain + release +
+# MILES_RESIZE_RPC_TIMEOUT_S-bounded expand/sync chain, default 180s).
+# <=0 in the env disables the bound (parse_env_timeout_s returns None).
+_RESIZE_EXEC_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_RESIZE_RPC_TIMEOUT_S", 300.0)
 
 # Progress reporting: sentinel stream key for full-finetune pipelines (no adapter_id).
 # LoRA pipelines use adapter_id as stream key; full-finetune uses this reserved sentinel.
@@ -1393,7 +1399,7 @@ class SchedulerImpl:
             if removes
         ]
         if shrink_tasks:
-            await asyncio.gather(*shrink_tasks)
+            await self._gather_resize_rpcs(shrink_tasks, phase="shrink")
         # GPU Tracing: close slices right after shrinks complete, before expands start
         if shrink_trace_infos:
             self._tracer.end_traces_for_gpu_ids([info.gpu_id for info in shrink_trace_infos])
@@ -1405,7 +1411,7 @@ class SchedulerImpl:
             if adds
         ]
         if expand_tasks:
-            await asyncio.gather(*expand_tasks)
+            await self._gather_resize_rpcs(expand_tasks, phase="expand")
         # GPU Tracing: open slices right after expands complete, before state commit
         for info in expand_trace_infos:
             self._tracer.start_gpu_trace(
@@ -1418,6 +1424,29 @@ class SchedulerImpl:
                 required_gpus_per_node=self._required_gpus_per_node,
                 cycle_counter=self._cycle_counter,
             )
+
+    @staticmethod
+    async def _gather_resize_rpcs(tasks: List[Any], *, phase: str) -> None:
+        """Await a resize_infer RPC fan-out with a bounded timeout.
+
+        Without the bound, one wedged coordinator (e.g. a stuck SGLang drain
+        inside shrink_engines) stalls the central scheduling loop — and with
+        it every pipeline's request/release processing — forever. The
+        fail-fast policy only covers exceptions, not hangs; converting the
+        hang into an exception routes it through scheduling_cycle's existing
+        fail-fast shutdown path.
+        """
+        if _RESIZE_EXEC_TIMEOUT_S is None:
+            await asyncio.gather(*tasks)
+            return
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=_RESIZE_EXEC_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"resize_infer {phase} RPC fan-out timed out after {_RESIZE_EXEC_TIMEOUT_S}s; "
+                f"a coordinator is likely wedged. Set RLIX_RESIZE_RPC_TIMEOUT_S to adjust "
+                f"(<=0 disables)."
+            ) from None
 
     async def _fail_fast_shutdown(self, *, reason: str) -> None:
         """Trigger a forced orchestrator shutdown on unrecoverable scheduler error."""

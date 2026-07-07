@@ -536,7 +536,7 @@ Four small fixes from the M11 review report.
 | MED | F2 | configurable free-mem threshold via `MILES_MAX_RESIDUAL_GPU_MEM_GB` | howard989's PRs `rlops/rlix#11` + `rlops/miles#3` in flight (v2 per @taoluo) |
 | MED | MED1 | concurrent-resize stress test under `max_concurrency=4` | Open (Codex carryforward) |
 | NOTE | F8 / F10 | `orchestrator.cleanup_stale_pipelines()` RPC | M11.3 production hardening |
-| LOW | LOW1 | verify `generate_rollout_fully_async` accepts `rlix_hooks` kw | ~30 min check |
+| LOW | LOW1 | verify `generate_rollout_fully_async` accepts `rlix_hooks` kw | ✅ Verified closed _(2026-07-06, F1-F12 review)_ — see §6.1 |
 
 ## §3.6 Tianye's PR #14 — finalize-always-continue + release-on-sync-failure ✅ MERGED 2026-05-18 _(added 2026-05-24)_
 
@@ -698,7 +698,7 @@ The table above is the historical M11.1 / M11.2 Option A deferred-work record an
 | **F22 (relaxed)** | **Partially resolved by Phase 3 Option β** (env-gated `MILES_INIT_DEFER_ADD_WORKER=1` lands engines in `loading` → `finish_init_offload` → `offloaded`). Full F22 architectural rebuild still deferred to M11.5; Option β provides the same observable Gate 4(c) semantics. | _(added 2026-05-24)_ |
 | **M11.3** | M11.2 real overlap (2 pipelines on shared GPUs) now validated; 3+ still deferred. | _(added 2026-05-24)_ |
 | **F95.1** | Still deferred; real overlap M11.2 also unaffected because Option β's `finish_init_offload` parks engines before contention. | _(added 2026-05-24)_ |
-| **F19/F20 (saving)** | Unchanged. | _(added 2026-05-24)_ |
+| **F19/F20 (saving)** | **Save side resolved** _(updated 2026-07-06, F1-F12 review)_: `run_async_train_loop` wraps `save_model` in an explicit onload→save→offload bracket (`miles/utils/rlix_train_loop.py:203-218`), matching the "real fix" described in the historical row above. Eval-at-final-rollout remains open (still intentionally skipped in rlix-mode loops). | _(added 2026-05-24)_ |
 | **Eval at final rollout** | Unchanged. | _(added 2026-05-24)_ |
 | **Pytest coverage of M11 changes** | Tianye's PR#16 added 3 new test files (`test_orchestrator_death_is_benign.py`, `test_scheduler_apply_plan_invariants.py`, `test_gap_ratio.py` rewrite) covering planner durability + scheduler intent. Still no unit tests on `_wait_for_overlap_engines_offloaded` or `_split_pools_for_dual` (F9 behavior-tested via local Python invocation). | _(added 2026-05-24)_ |
 | **R04-F1 (HIGH from review-report)** | **✅ RESOLVED** by Phase 1 (rlix `47bf02b` + miles `6513b25`). Verified on vast Attempt 0 via `MILES_INJECT_TRAIN_FAULT=1` injected smoke. | _(added 2026-05-24)_ |
@@ -719,7 +719,7 @@ New deferred-work entries surfaced during M11.2 real-overlap work (not in the hi
 | **F7 (NOTE)** | `shrink_engines` pause_generation contract undocumented | Documentation gap | Reviewers confused by broad `except Exception` | **✅ RESOLVED** by miles `1487c3f` — docstring covers mode='retract', idempotency, 4xx vs 5xx, swallowing rationale; log includes engine_indices. | _(added 2026-05-24)_ |
 | **F8 / F10 (NOTE)** | Detached coordinator persists after driver crash | M11.3 cleanup RPC scope | Stale actors on operator-killed runs | Still open; needs `orchestrator.cleanup_stale_pipelines()` RPC. | _(added 2026-05-24)_ |
 | **F9 (NOTE)** | `_split_pools_for_dual` silently ignored extra GPUs on non-2N machines | Static-analysis finding | Silent GPU leak on 5/6/7-GPU machines | **✅ RESOLVED** by miles `1487c3f` — explicit `ValueError` when `num_gpus_per_node != 2*infer_pool_size`; error message points at MILES_DUAL_P* workaround. | _(added 2026-05-24)_ |
-| **LOW1 (Codex carryforward)** | Verify `generate_rollout_fully_async` actually accepts `rlix_hooks` kw | `inspect.signature` forward silently no-ops if kw is missing | Demand signal path dead-codes silently | Open; ~30 min grep + startup assert. | _(added 2026-05-24)_ |
+| **LOW1 (Codex carryforward)** | Verify `generate_rollout_fully_async` actually accepts `rlix_hooks` kw | `inspect.signature` forward silently no-ops if kw is missing | Demand signal path dead-codes silently | **✅ Verified closed** _(2026-07-06, F1-F12 review)_: `examples/fully_async/fully_async_rollout.py:225` declares `rlix_hooks: RLixHooks | None = None` and drives begin/bump/end (L275/385/422); the `inspect.signature` forward in `base_types.call_rollout_fn` matches. Note this covers the legacy call path only — the experimental-refactor path does not thread hooks and is now rejected at startup by C24 (`rlops/miles#33`). | _(added 2026-05-24)_ |
 
 ---
 

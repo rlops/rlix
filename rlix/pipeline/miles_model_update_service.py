@@ -190,13 +190,17 @@ class MilesModelUpdateService:
             )
         cpu_serialize_set = target - broadcast_set
 
-        # R06-F1 fix: track every Ray ObjectRef issued by this atomic
-        # unit so an asyncio.wait_for timeout (or any other cancellation)
-        # can fan out ray.cancel(force=True) on them. Without this, the
-        # local coroutine cancels but the Ray actor methods on
-        # cache_owner / rollout_manager keep running and continue to
-        # hold cache_owner._cache_lock — the next sync_selected_workers
-        # call would queue behind the still-executing prior method.
+        # R06-F1: track every Ray ObjectRef issued by this atomic unit so
+        # an asyncio.wait_for timeout (or any other cancellation) can fan
+        # out ray.cancel on them. Scope of what cancel can actually do
+        # (Ray actor-task semantics): QUEUED tasks are cancelled and never
+        # start; a task already EXECUTING on the sync cache_owner /
+        # rollout_manager actors cannot be interrupted (Ray only sets a
+        # cooperative is_canceled() flag that miles does not poll), so a
+        # running run_sync_session keeps holding cache_owner._cache_lock
+        # until it finishes and the next sync queues behind it. Preventing
+        # the queued follow-up RPCs (finalize / set_weight_version /
+        # try_put) from firing after a timeout is the effective win here.
         inflight_refs: list = []
 
         async def _run() -> int:
@@ -235,7 +239,14 @@ class MilesModelUpdateService:
         )
         for ref in inflight_refs:
             try:
-                ray.cancel(ref, force=True)
+                # force=False is the ONLY mode Ray allows for actor tasks —
+                # force=True raises ValueError before cancelling anything
+                # (docs: "Only force=False is allowed for an Actor Task"),
+                # which made this whole fan-out a silent no-op. force=False
+                # cancels queued tasks; executing tasks on sync actors run
+                # to completion (see the R06-F1 note in
+                # sync_selected_workers).
+                ray.cancel(ref, force=False)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "ray.cancel failed pipeline_id=%s reason=%s exc=%r",

@@ -51,8 +51,12 @@ logger = logging.getLogger(__name__)
 _TOPOLOGY_READY_TIMEOUT_S: float = float(os.environ.get("RLIX_TOPOLOGY_READY_TIMEOUT_S", "120"))
 _FAIL_FAST_SHUTDOWN_TIMEOUT_S: float = float(os.environ.get("RLIX_FAIL_FAST_SHUTDOWN_TIMEOUT_S", "5"))
 # Bound for the per-cycle resize_infer RPC fan-out in _execute_resize_calls.
-# Must exceed the coordinator-side worst case (30s shrink drain + release +
-# MILES_RESIZE_RPC_TIMEOUT_S-bounded expand/sync chain, default 180s).
+# Ordering invariant: this backstop MUST stay above the coordinator-side
+# per-op budget (MILES_RESIZE_RPC_TIMEOUT_S, default 180s in
+# rlix/pipeline/miles_coordinator.py — a shared deadline covering the whole
+# lock+RPC chain of one shrink/expand), so a slow resize fails as a bounded
+# per-pipeline error before this timeout routes through scheduling_cycle's
+# fail-fast path and shuts down the orchestrator.
 # <=0 in the env disables the bound (parse_env_timeout_s returns None).
 _RESIZE_EXEC_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_RESIZE_RPC_TIMEOUT_S", 300.0)
 

@@ -6,6 +6,11 @@ Covers the resize hardening:
      ``PipelineCoordinator.resize_infer``).
   2. ``_resize_locked`` bounds ``_resize_sync_lock`` acquisition and raises
      instead of blocking forever when the lock is wedged.
+  3. ``MILES_RESIZE_RPC_TIMEOUT_S`` is a shared per-op budget: lock waits
+     and every resize-chain ``ray.get`` draw down from one monotonic
+     deadline, so the whole shrink/expand chain — not each hop — is bounded
+     and stays below the scheduler-side ``RLIX_RESIZE_RPC_TIMEOUT_S``
+     backstop (300s).
 """
 
 from __future__ import annotations
@@ -93,3 +98,70 @@ def test_resize_lock_acquisition_times_out_instead_of_blocking(
 
     # After the holder releases, the same call succeeds.
     assert coordinator.get_active_engines() == frozenset()
+
+
+def test_resize_op_budget_caps_lock_wait_below_lock_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared op budget must bind even when the lock timeout is large —
+    otherwise the coordinator-side worst case exceeds the scheduler backstop
+    again (the #35 inversion)."""
+    module, coordinator = _make_coordinator(monkeypatch)
+    monkeypatch.setattr(module, "_RESIZE_OP_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(module, "_RESIZE_LOCK_TIMEOUT_S", 300.0)
+    coordinator._model_update_resources["rollout_manager"] = object()
+
+    assert coordinator._resize_sync_lock.acquire()
+    try:
+        with pytest.raises(RuntimeError, match="_resize_sync_lock"):
+            coordinator._shrink_workers({0})
+    finally:
+        coordinator._resize_sync_lock.release()
+
+
+def test_resize_rpc_timeout_draws_down_from_shared_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator = _make_coordinator(monkeypatch)
+    monkeypatch.setattr(module, "_RESIZE_OP_TIMEOUT_S", 10.0)
+
+    recorded_timeouts: list = []
+
+    def _recording_get(ref, timeout=None):
+        recorded_timeouts.append(timeout)
+        return ref
+
+    monkeypatch.setattr(module.ray, "get", _recording_get)
+    coordinator._model_update_resources["rollout_manager"] = types.SimpleNamespace(
+        shrink_engines=types.SimpleNamespace(remote=lambda *args, **kwargs: [0])
+    )
+
+    coordinator._shrink_workers({0})
+
+    assert len(recorded_timeouts) == 1
+    # The RPC gets the budget REMAINING after the snapshot lock, not the
+    # full per-hop constant: 0 < remaining <= budget.
+    assert recorded_timeouts[0] is not None
+    assert 0 < recorded_timeouts[0] <= 10.0
+
+
+def test_resize_rpc_timeout_disabled_when_budget_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, coordinator = _make_coordinator(monkeypatch)
+    monkeypatch.setattr(module, "_RESIZE_OP_TIMEOUT_S", None)
+
+    recorded_timeouts: list = []
+
+    def _recording_get(ref, timeout=None):
+        recorded_timeouts.append(timeout)
+        return ref
+
+    monkeypatch.setattr(module.ray, "get", _recording_get)
+    coordinator._model_update_resources["rollout_manager"] = types.SimpleNamespace(
+        shrink_engines=types.SimpleNamespace(remote=lambda *args, **kwargs: [0])
+    )
+
+    coordinator._shrink_workers({0})
+
+    assert recorded_timeouts == [None]

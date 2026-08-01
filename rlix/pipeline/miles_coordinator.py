@@ -58,13 +58,38 @@ _MILES_PIPELINE_ACTOR_MAX_CONCURRENCY: int = 2
 # way PipelineCoordinator does (same env var, default 180s) so a wedged holder
 # surfaces as a RuntimeError instead of blocking callers forever.
 _RESIZE_LOCK_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_RESIZE_LOCK_TIMEOUT_S", default_s=180.0)
-# Bound for the resize-chain Ray RPCs into miles (shrink_engines /
-# get_engine_states / expand_engines / sync_selected_workers /
-# activate_routing). Default leaves margin over the service-internal
+# Shared budget for ONE whole shrink/expand operation: lock waits and every
+# resize-chain Ray RPC (shrink_engines / get_engine_states / expand_engines /
+# sync_selected_workers / activate_routing) draw down from a single monotonic
+# deadline started at op entry, so this value bounds the chain, not each hop.
+# Default leaves margin over the service-internal
 # ROLL_SELECTIVE_MODEL_UPDATE_TIMEOUT_S (150s) and the shrink-side drain
 # (30s). <=0 in the env disables the bound (parse_env_timeout_s -> None,
 # which ray.get treats as "wait indefinitely").
-_RESIZE_RPC_TIMEOUT_S: Optional[float] = parse_env_timeout_s("MILES_RESIZE_RPC_TIMEOUT_S", default_s=180.0)
+# Ordering invariant: this per-op budget MUST stay below the scheduler-side
+# RLIX_RESIZE_RPC_TIMEOUT_S backstop (default 300s in
+# rlix/scheduler/scheduler.py), so a slow resize surfaces as a bounded
+# per-pipeline error before the scheduler's fail-fast shutdown fires.
+_RESIZE_OP_TIMEOUT_S: Optional[float] = parse_env_timeout_s("MILES_RESIZE_RPC_TIMEOUT_S", default_s=180.0)
+
+
+def _resize_op_deadline() -> Optional[float]:
+    """Start the shared per-op budget; ``None`` when the bound is disabled."""
+    if _RESIZE_OP_TIMEOUT_S is None:
+        return None
+    return time.monotonic() + _RESIZE_OP_TIMEOUT_S
+
+
+def _remaining_op_budget_s(deadline: Optional[float], op: str) -> Optional[float]:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError(
+            f"{op} exceeded the {_RESIZE_OP_TIMEOUT_S}s resize op budget; "
+            f"set MILES_RESIZE_RPC_TIMEOUT_S to adjust (<=0 disables)"
+        )
+    return remaining
 
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
@@ -296,21 +321,26 @@ class MilesCoordinator(Coordinator):
     # ------------------------------------------------------------------
 
     @contextlib.contextmanager
-    def _resize_locked(self, op: str) -> Iterator[None]:
+    def _resize_locked(self, op: str, *, deadline: Optional[float] = None) -> Iterator[None]:
         """Acquire ``_resize_sync_lock`` with a bounded timeout (F20).
 
         Mirrors PipelineCoordinator's ``_RESIZE_LOCK_TIMEOUT_S`` discipline:
         a wedged holder (e.g. a stuck resize RPC on another thread) surfaces
-        as a RuntimeError instead of blocking the caller forever.
+        as a RuntimeError instead of blocking the caller forever. When a
+        resize-op ``deadline`` is passed, the wait is further capped by the
+        op's remaining shared budget.
         """
-        acquired = self._resize_sync_lock.acquire(
-            timeout=_RESIZE_LOCK_TIMEOUT_S if _RESIZE_LOCK_TIMEOUT_S is not None else -1
-        )
+        timeout_s = _RESIZE_LOCK_TIMEOUT_S
+        if deadline is not None:
+            remaining = _remaining_op_budget_s(deadline, op)
+            timeout_s = remaining if timeout_s is None else min(timeout_s, remaining)
+        acquired = self._resize_sync_lock.acquire(timeout=timeout_s if timeout_s is not None else -1)
         if not acquired:
             raise RuntimeError(
                 f"{op} timed out waiting for _resize_sync_lock after "
-                f"{_RESIZE_LOCK_TIMEOUT_S}s (pipeline_id={self._pipeline_id!r}); "
-                f"set RLIX_RESIZE_LOCK_TIMEOUT_S to adjust (<=0 disables)"
+                f"{timeout_s}s (pipeline_id={self._pipeline_id!r}); "
+                f"set RLIX_RESIZE_LOCK_TIMEOUT_S / MILES_RESIZE_RPC_TIMEOUT_S "
+                f"to adjust (<=0 disables)"
             )
         try:
             yield
@@ -471,9 +501,10 @@ class MilesCoordinator(Coordinator):
         return ActionResponse(success=True)
 
     def _shrink_workers(self, engine_indices: Set[int]) -> None:
+        deadline = _resize_op_deadline()
         # Snapshot under lock — only to read shared state; the Ray RPC
         # runs without the lock held (R10-F1).
-        with self._resize_locked("_shrink_workers(snapshot)"):
+        with self._resize_locked("_shrink_workers(snapshot)", deadline=deadline):
             rollout_manager = self._model_update_resources.get("rollout_manager")
             if rollout_manager is None:
                 raise RuntimeError("resource registration missing for shrink")
@@ -493,7 +524,7 @@ class MilesCoordinator(Coordinator):
                 sorted(engine_indices),
                 post_sleep_vram_threshold_gb=residual_threshold_gb,
             ),
-            timeout=_RESIZE_RPC_TIMEOUT_S,
+            timeout=_remaining_op_budget_s(deadline, "_shrink_workers(shrink_engines)"),
         )
         logger.info(
             "[MilesCoordinator] shrink_engines complete pipeline_id=%s "
@@ -504,12 +535,13 @@ class MilesCoordinator(Coordinator):
             residual_threshold_gb,
         )
         # Commit under lock.
-        with self._resize_locked("_shrink_workers(commit)"):
+        with self._resize_locked("_shrink_workers(commit)", deadline=deadline):
             self._active_engine_indices -= engine_indices
 
     def _expand_workers(self, engine_indices: Set[int]) -> None:
+        deadline = _resize_op_deadline()
         # Phase 1 — Snapshot under lock (R10-F1).
-        with self._resize_locked("_expand_workers(snapshot)"):
+        with self._resize_locked("_expand_workers(snapshot)", deadline=deadline):
             rollout_manager = self._model_update_resources.get("rollout_manager")
             if rollout_manager is None:
                 raise RuntimeError("resource registration missing for expand")
@@ -530,7 +562,7 @@ class MilesCoordinator(Coordinator):
         # manager layer.
         states = ray.get(
             rollout_manager.get_engine_states.remote(sorted(engine_indices)),
-            timeout=_RESIZE_RPC_TIMEOUT_S,
+            timeout=_remaining_op_budget_s(deadline, "_expand_workers(get_engine_states)"),
         )
         unique_states = {states[idx] for idx in engine_indices}
         if unique_states == {"shell"}:
@@ -568,7 +600,7 @@ class MilesCoordinator(Coordinator):
             # base v=-1 sync was driven from MilesPipeline init step7,
             # and routing is alive (RolloutManager.add_worker fired
             # during start_rollout_servers).
-            with self._resize_locked("_expand_workers(already-active commit)"):
+            with self._resize_locked("_expand_workers(already-active commit)", deadline=deadline):
                 self._active_engine_indices |= set(engine_indices)
             logger.info(
                 "[MilesCoordinator] _expand_workers: engines already 'active' "
@@ -587,7 +619,7 @@ class MilesCoordinator(Coordinator):
         # activate_routing.
         ray.get(
             rollout_manager.expand_engines.remote(sorted(engine_indices)),
-            timeout=_RESIZE_RPC_TIMEOUT_S,
+            timeout=_remaining_op_budget_s(deadline, "_expand_workers(expand_engines)"),
         )
         ray.get(
             service.sync_selected_workers.remote(
@@ -595,15 +627,15 @@ class MilesCoordinator(Coordinator):
                 target_engine_indices=frozenset(engine_indices),
                 version=cached_step,
             ),
-            timeout=_RESIZE_RPC_TIMEOUT_S,
+            timeout=_remaining_op_budget_s(deadline, "_expand_workers(sync_selected_workers)"),
         )
         ray.get(
             rollout_manager.activate_routing.remote(sorted(engine_indices)),
-            timeout=_RESIZE_RPC_TIMEOUT_S,
+            timeout=_remaining_op_budget_s(deadline, "_expand_workers(activate_routing)"),
         )
 
         # Phase 3 — Commit under lock.
-        with self._resize_locked("_expand_workers(commit)"):
+        with self._resize_locked("_expand_workers(commit)", deadline=deadline):
             self._active_engine_indices |= set(engine_indices)
 
     def remove_resource_manager_node_pg(self) -> bool:

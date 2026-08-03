@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -283,23 +284,71 @@ class MilesModelUpdateService:
         #     used for transport.
         sync_ref = self._cache_owner_actor.run_sync_session.remote(plan)
         inflight_refs.append(sync_ref)
-        await _ray_get(sync_ref)
+        actual_version = await _ray_get(sync_ref)
+        if actual_version is not None and int(actual_version) != int(version):
+            # The cache owner served a newer step than requested (single-
+            # ready-slot supersession, see run_sync_session). Publish the
+            # version that was ACTUALLY synced, not the stale request.
+            logger.warning(
+                "[MilesModelUpdateService] sync_id=%s requested version=%s but "
+                "cache served version=%s — publishing the served version",
+                sync_id, version, actual_version,
+            )
+            version = int(actual_version)
 
         # (4) Finalize fan-out. F21: per-bucket payload had no version;
         #     finalize_weight_update on every receiver flushes pending
         #     work so update_weight_version below is observed at the
         #     next prefill.
-        # (4.pre, rlix-mode safety) pause each engine's scheduler before
+        # (4.pre, rlix-mode safety) quiesce each engine before
         # finalize_weight_update. ``finalize_weight_update`` invokes
-        # SGLang's ``/flush_cache`` which loops up to 60 s waiting for
-        # the request queue to drain. With a fully-async rollout
-        # function, the rollout-data return does not synchronously
-        # quiesce the engine — pending decode batches keep the queue
-        # non-empty and flush_cache times out. ``pause_generation``
-        # retracts the in-flight batch and reaches a quiescent state
-        # so the subsequent flush_cache returns 200 immediately.
+        # SGLang's ``/flush_cache``, which refuses (400) while ANY request
+        # is queued or running. ``pause_generation(mode="retract")`` alone
+        # is NOT enough: retract parks the fully-async rollout's in-flight
+        # straggler back INTO the queue, and a paused scheduler never
+        # drains it — flush_cache then 400s until its 60-attempt timeout
+        # and raises, killing the sync (observed 2026-07-09 on the
+        # fork-baseline image, single-pipeline smoke, rollout_id=0).
+        #
+        # Sequence (mirrors the shrink path, rollout.py:977-1023):
+        #   abort_all_requests  -> queue+running cleared; aborted samples
+        #                          come back Status.ABORTED and the rollout
+        #                          layer recycles them through the data
+        #                          buffer for a fresh dispatch (they are
+        #                          NOT counted toward the batch target, so
+        #                          no sample-accounting hang)
+        #   is_idle poll        -> abort is processed asynchronously by the
+        #                          scheduler; wait for it to actually drain
+        #   pause_generation    -> stop new batch dispatch so flush_cache
+        #                          meets an idle, quiescent engine
+        try:
+            abort_refs = [h.abort_all_requests.remote() for h in handles.values()]
+            inflight_refs.extend(abort_refs)
+            await _ray_get(abort_refs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[MilesModelUpdateService] abort_all_requests pre-finalize failed: %r", exc
+            )
+        idle_deadline = time.time() + 10.0
+        while time.time() < idle_deadline:
+            try:
+                verdicts = await _ray_get([h.is_idle.remote() for h in handles.values()])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[MilesModelUpdateService] is_idle poll pre-finalize failed: %r", exc
+                )
+                break
+            if all(verdicts):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            logger.warning(
+                "[MilesModelUpdateService] engines not idle 10s after abort; "
+                "finalize may hit flush_cache timeouts"
+            )
         try:
             pause_refs = [h.pause_generation.remote(mode="retract") for h in handles.values()]
+            inflight_refs.extend(pause_refs)
             await _ray_get(pause_refs)
         except Exception as exc:  # noqa: BLE001
             logger.warning(

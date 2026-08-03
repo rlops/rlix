@@ -240,6 +240,17 @@ class MilesPipeline:
         logger.info("[MilesPipeline] phaseA step7: release actor_train done released=%s", released)
         if released:
             self._actor_train_allocated = False
+        else:
+            # Fail fast: phase B requests actor_infer on a pool that may be
+            # sized for one role at a time; proceeding with actor_train still
+            # allocated would block that request forever (request_gpus has no
+            # timeout by design). initialize_pipeline's except path runs
+            # shutdown_hard, which retries the release.
+            raise RuntimeError(
+                f"phaseA step7: failed to release actor_train allocation "
+                f"(cluster_id={self._actor_train_cluster_id}); aborting init "
+                f"instead of letting phase B block on GPUs this pipeline still holds"
+            )
 
     def _init_phase_b_infer(self) -> None:
         """Step 7 — actor_infer side.
@@ -477,6 +488,16 @@ class MilesPipeline:
         )
         if released_infer:
             self._actor_infer_allocated = False
+        else:
+            # Fail fast with a clear message: re-requesting the same
+            # cluster_id at GENERATION while the INITIALIZATION allocation is
+            # still live would be rejected by the scheduler with a confusing
+            # priority-mismatch error.
+            raise RuntimeError(
+                f"phaseB step8: failed to release actor_infer INITIALIZATION "
+                f"allocation (cluster_id={self._actor_infer_cluster_id}); "
+                f"cannot re-request at GENERATION priority"
+            )
         # The scheduler's gap-ratio planner skips GENERATION clusters with
         # both progress=0 AND step_target_estimate=None, hanging the request.
         # Estimate per-rollout trajectory demand from miles_args:
@@ -747,11 +768,11 @@ class MilesPipeline:
         # the actor is ray.kill'd immediately after).
         scheduler = self._get_scheduler_handle(silent_on_missing=True)
         if scheduler is not None:
-            for cluster_id, was_allocated in (
-                (self._actor_train_cluster_id, self._actor_train_allocated),
-                (self._actor_infer_cluster_id, self._actor_infer_allocated),
+            for cluster_id, flag_attr in (
+                (self._actor_train_cluster_id, "_actor_train_allocated"),
+                (self._actor_infer_cluster_id, "_actor_infer_allocated"),
             ):
-                if not was_allocated:
+                if not getattr(self, flag_attr):
                     continue
                 try:
                     ray.get(
@@ -761,13 +782,17 @@ class MilesPipeline:
                         timeout=10.0,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    # R11-F1: keep the ledger flag set on failure so a later
+                    # shutdown_hard / dispose call retries the release instead
+                    # of silently leaking the server-side allocation.
                     logger.warning(
-                        "shutdown_hard: notify_release_gpus(%s) failed: %r",
+                        "shutdown_hard: notify_release_gpus(%s) failed; "
+                        "keeping ledger flag for retry: %r",
                         cluster_id,
                         exc,
                     )
-            self._actor_train_allocated = False
-            self._actor_infer_allocated = False
+                    continue
+                setattr(self, flag_attr, False)
 
     def dispose(self) -> None:
         self.shutdown_hard()

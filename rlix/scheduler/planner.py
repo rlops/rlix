@@ -196,6 +196,8 @@ def plan_generation_gap_ratio(
         # Derive remaining from completed metric; same derivation path as
         # background rebalance to keep demand semantics consistent.
         remaining, step_target = progress_totals_fn(pipeline_id=pipeline_id)
+        # Capture before the estimate branch overwrites step_target.
+        in_bootstrap_window = step_target <= 0.0
         if step_target <= 0.0:
             if has_pending:
                 raw_estimate = rollout_open_pipelines.get(pipeline_id)
@@ -210,9 +212,9 @@ def plan_generation_gap_ratio(
         else:
             percent_remaining = remaining / step_target if step_target > 0 else 0.0
 
-        if has_pending:
-            # Inflate demand in the bootstrap window (request sent, no progress yet)
-            # so the pipeline gets at least one DP worker allocated before generation starts.
+        if has_pending and in_bootstrap_window:
+            # Inflate demand only in the bootstrap window (request sent, no
+            # progress yet); once progress flows we must not double-count (#36).
             remaining += step_target
             percent_remaining = remaining / step_target if step_target > 0 else 0.0
 

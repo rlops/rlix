@@ -460,14 +460,8 @@ async def _ray_get(refs):
     just delegate.
     """
     if isinstance(refs, list):
-        return await asyncio.gather(*[_await_ref(r) for r in refs])
-    return await _await_ref(refs)
-
-
-async def _await_ref(ref):
-    import asyncio  # noqa: F401  -- module-level import handled below
-
-    return await ref
+        return await asyncio.gather(*refs)
+    return await refs
 
 
 __all__ = ["SyncSessionPlan", "MilesModelUpdateService"]

@@ -57,6 +57,15 @@ from rlix.utils.ray import get_actor_or_raise
 logger = logging.getLogger(__name__)
 
 
+def _rollout_step_target(miles_args) -> int:
+    """Per-rollout step-target estimate for the scheduler's gap-ratio planner.
+
+    Unit is group count (one prompt's sample set), i.e. ``rollout_batch_size``,
+    matching the per-rollout demand signal in ``signal_rollout_demand``.
+    """
+    return max(int(getattr(miles_args, "rollout_batch_size", 1)), 1)
+
+
 class MilesPipeline:
     """Per-pipeline actor created by :class:`MilesCoordinator`."""
 
@@ -500,13 +509,8 @@ class MilesPipeline:
             )
         # The scheduler's gap-ratio planner skips GENERATION clusters with
         # both progress=0 AND step_target_estimate=None, hanging the request.
-        # Estimate per-rollout trajectory demand from miles_args:
-        #   rollout_batch_size × n_samples_per_prompt
-        gen_step_target_estimate = max(
-            int(getattr(miles_args, "rollout_batch_size", 1))
-            * int(getattr(miles_args, "n_samples_per_prompt", 1)),
-            1,
-        )
+        # Use the same group-count unit as the per-rollout demand signal.
+        gen_step_target_estimate = _rollout_step_target(miles_args)
         regranted = self._request_cluster_gpus(
             cluster_id=self._actor_infer_cluster_id,
             priority=Priority.GENERATION,

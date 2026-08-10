@@ -170,8 +170,6 @@ class MilesModelUpdateService:
 
         Returns the published version (echoed for caller logging).
         """
-        import asyncio
-
         sync_id = sync_id or f"miles-sync-{uuid.uuid4().hex}"
         target = frozenset(int(i) for i in target_engine_indices)
         if not target:

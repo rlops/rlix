@@ -507,8 +507,7 @@ class MilesCoordinator(Coordinator):
             # behind the coordinator's back). Raise so the regression
             # surfaces in the smoke log. Standalone miles (env unset)
             # still gets the hatch as the documented happy path.
-            import os as _os
-            if _os.environ.get("MILES_INIT_DEFER_ADD_WORKER") == "1":
+            if os.environ.get("MILES_INIT_DEFER_ADD_WORKER") == "1":
                 raise RuntimeError(
                     "_expand_workers: engines already 'active' under "
                     "MILES_INIT_DEFER_ADD_WORKER=1 (Option β); expected "
@@ -603,10 +602,8 @@ class MilesCoordinator(Coordinator):
         # drop num_gpus to 0 in this mode because the node-PG is holding all
         # GPUs and an unpinned actor with num_gpus=0.01 would block forever
         # waiting for a free fractional slice.
-        import os as _os
-
         scheduling_strategy = None
-        skip_pg_pin = _os.environ.get("MILES_SKIP_NODE_PG_PIN") == "1"
+        skip_pg_pin = os.environ.get("MILES_SKIP_NODE_PG_PIN") == "1"
         if (
             self._resource_manager_node0_pg is not None
             and not skip_pg_pin

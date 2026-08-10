@@ -335,6 +335,7 @@ class MilesModelUpdateService:
         # so the subsequent flush_cache returns 200 immediately.
         try:
             pause_refs = [h.pause_generation.remote(mode="retract") for h in handles.values()]
+            inflight_refs.extend(pause_refs)
             await _ray_get(pause_refs)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -348,6 +349,7 @@ class MilesModelUpdateService:
             # (4.post) resume the engines so subsequent generate calls work.
             try:
                 cont_refs = [h.continue_generation.remote() for h in handles.values()]
+                inflight_refs.extend(cont_refs)
                 await _ray_get(cont_refs)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(

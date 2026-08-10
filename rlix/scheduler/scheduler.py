@@ -585,6 +585,32 @@ class SchedulerImpl:
     def _clear_rollout_intent_locked(self, pipeline_id: str) -> None:
         self._state.rollout_open_pipelines.pop(pipeline_id, None)
 
+    def _warn_gen_request_without_demand_locked(
+        self, *, cluster_id: str, pipeline_id: str, step_target_estimate: Optional[int]
+    ) -> None:
+        """Warn when a GENERATION request carries no usable demand signal.
+
+        The gap-ratio planner skips pipelines whose registry entry has no
+        positive ``step_target_estimate`` AND no stored progress (see the
+        bootstrap-estimate branch in ``planner.plan_generation_gap_ratio``).
+        Such a request is never signaled and the caller blocks indefinitely.
+        Warn-only: progress may still arrive later on some backends, so
+        rejecting outright could break legitimate request-then-report flows.
+        """
+        if step_target_estimate is not None and int(step_target_estimate) > 0:
+            return
+        _, step_target = self._pipeline_progress_totals_locked(pipeline_id=pipeline_id)
+        if step_target > 0.0:
+            return
+        logger.warning(
+            "request_gpus(GENERATION) for cluster_id=%r has no step_target_estimate "
+            "(got %r) and no stored progress; the gap-ratio planner will skip this "
+            "pipeline and the request may block indefinitely until progress or a "
+            "positive estimate arrives",
+            cluster_id,
+            step_target_estimate,
+        )
+
     async def request_gpus(
         self,
         *,
@@ -636,6 +662,9 @@ class SchedulerImpl:
             self._state.pending_bucket(priority).append(pending)
             if priority == Priority.GENERATION:
                 self._state.rollout_open_pipelines[pipeline_id] = step_target_estimate
+                self._warn_gen_request_without_demand_locked(
+                    cluster_id=cluster_id, pipeline_id=pipeline_id, step_target_estimate=step_target_estimate
+                )
             # Queue Tracing: Track enqueue AFTER append (depth is correct)
             self._tracer.trace_queue_enqueue(
                 cluster_id, priority, lora_name, bucket_depth=len(self._state.pending_bucket(priority))
@@ -737,6 +766,11 @@ class SchedulerImpl:
             if request_priority == Priority.GENERATION:
                 pipeline_id_gen, _ = parse_cluster_id(request_cluster_id)
                 self._state.rollout_open_pipelines[pipeline_id_gen] = request_step_target_estimate
+                self._warn_gen_request_without_demand_locked(
+                    cluster_id=request_cluster_id,
+                    pipeline_id=pipeline_id_gen,
+                    step_target_estimate=request_step_target_estimate,
+                )
             # Queue Tracing: Track enqueue AFTER append (depth is correct)
             self._tracer.trace_queue_enqueue(
                 request_cluster_id,

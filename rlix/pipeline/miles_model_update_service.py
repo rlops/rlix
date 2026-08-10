@@ -28,6 +28,21 @@ from rlix.utils.env import parse_env_timeout_s
 logger = logging.getLogger(__name__)
 
 
+def _get_shared_storage_actor() -> Any:
+    try:
+        from roll.utils.constants import (  # type: ignore[import-not-found]
+            GLOBAL_STORAGE_NAMESPACE,
+            STORAGE_NAME,
+        )
+    except ImportError:
+        from roll.distributed.scheduler.storage import (  # type: ignore[import-not-found]
+            STORAGE_NAME,
+        )
+        from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE  # type: ignore[import-not-found]
+
+    return ray.get_actor(STORAGE_NAME, namespace=GLOBAL_STORAGE_NAMESPACE)
+
+
 @dataclasses.dataclass(frozen=True)
 class SyncSessionPlan:
     """Frozen RLix-side construction shape; serializes to a plain dict before
@@ -198,6 +213,9 @@ class MilesModelUpdateService:
         # hold cache_owner._cache_lock — the next sync_selected_workers
         # call would queue behind the still-executing prior method.
         inflight_refs: list = []
+        # Carries the (addr, port) claim out of the atomic unit so the
+        # cancellation handlers below can still release it.
+        port_claim_holder: list = []
 
         async def _run() -> int:
             return await self._run_atomic_unit(
@@ -207,6 +225,7 @@ class MilesModelUpdateService:
                 cpu_serialize_set=cpu_serialize_set,
                 broadcast_set=broadcast_set,
                 inflight_refs=inflight_refs,
+                port_claim_holder=port_claim_holder,
             )
 
         try:
@@ -215,12 +234,14 @@ class MilesModelUpdateService:
             return await asyncio.wait_for(_run(), timeout=float(self._timeout_s))
         except asyncio.TimeoutError:
             self._cancel_inflight(inflight_refs, reason="wait_for timeout")
+            self._release_port_claim_nowait(port_claim_holder)
             raise
         except asyncio.CancelledError:
             # Outer cancellation (caller cancelled sync_selected_workers
             # task) — propagate after firing ray.cancel so we don't leak
             # inflight Ray work either.
             self._cancel_inflight(inflight_refs, reason="task cancelled")
+            self._release_port_claim_nowait(port_claim_holder)
             raise
 
     def _cancel_inflight(self, inflight_refs: list, *, reason: str) -> None:
@@ -254,6 +275,7 @@ class MilesModelUpdateService:
         cpu_serialize_set: frozenset[int],
         broadcast_set: frozenset[int],
         inflight_refs: list,
+        port_claim_holder: list,
     ) -> int:
         # Each .remote() is captured into inflight_refs BEFORE we await
         # so the outer cancellation handler can fire ray.cancel(force=True)
@@ -269,7 +291,7 @@ class MilesModelUpdateService:
             )
 
         # (2) Build the wire-format plan dict.
-        plan = await self._build_plan(
+        plan, port_claim = await self._build_plan(
             sync_id=sync_id,
             version=version,
             target_handles=handles,
@@ -277,13 +299,26 @@ class MilesModelUpdateService:
             broadcast_set=broadcast_set,
             inflight_refs=inflight_refs,
         )
+        if port_claim is not None:
+            port_claim_holder.append(port_claim)
 
         # (3) Single composite RPC into the cache_owner. F04 invariant
         #     means run_sync_session is the ONLY top-level Ray method
         #     used for transport.
         sync_ref = self._cache_owner_actor.run_sync_session.remote(plan)
         inflight_refs.append(sync_ref)
-        await _ray_get(sync_ref)
+        try:
+            await _ray_get(sync_ref)
+        finally:
+            # The port is only needed for the NCCL rendezvous during
+            # transport, so release it however the transport ended.
+            if port_claim is not None:
+                await self._release_port_claim(
+                    master_addr=port_claim[0],
+                    master_port=port_claim[1],
+                    inflight_refs=inflight_refs,
+                )
+                port_claim_holder.clear()
 
         # (4) Finalize fan-out. F21: per-bucket payload had no version;
         #     finalize_weight_update on every receiver flushes pending
@@ -347,7 +382,7 @@ class MilesModelUpdateService:
         cpu_serialize_set: frozenset[int],
         broadcast_set: frozenset[int],
         inflight_refs: list,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], tuple[str, int] | None]:
         # F26 / C16: master_port != 0. Claim a free port from the
         # cache_owner actor (not 0; not picked by the receiver) and
         # publish it via the SharedStorage singleton so concurrent
@@ -370,22 +405,8 @@ class MilesModelUpdateService:
         # False if the key already exists, which we treat as a
         # collision and re-pick. Bound the retry budget so a stuck
         # claim can't hang the sync.
-        # ROLL@main relocated STORAGE_NAME from roll.distributed.scheduler.storage
-        # to roll.utils.constants. Try the new location first, fall back to the
-        # old location for older ROLL releases.
         try:
-            from roll.utils.constants import (  # type: ignore[import-not-found]
-                GLOBAL_STORAGE_NAMESPACE,
-                STORAGE_NAME,
-            )
-        except ImportError:
-            from roll.distributed.scheduler.storage import (  # type: ignore[import-not-found]
-                STORAGE_NAME,
-            )
-            from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE  # type: ignore[import-not-found]
-
-        try:
-            shared_storage = ray.get_actor(STORAGE_NAME, namespace=GLOBAL_STORAGE_NAMESPACE)
+            shared_storage = _get_shared_storage_actor()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "MilesModelUpdateService: SharedStorage actor unavailable; "
@@ -394,6 +415,7 @@ class MilesModelUpdateService:
             )
             shared_storage = None
 
+        port_claim: tuple[str, int] | None = None
         if shared_storage is not None:
             for attempt in range(8):
                 claim_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"
@@ -401,6 +423,7 @@ class MilesModelUpdateService:
                 inflight_refs.append(try_put_ref)
                 claimed = bool(await _ray_get(try_put_ref))
                 if claimed:
+                    port_claim = (master_addr, master_port)
                     break
                 # Collision — pick another free port and re-try.
                 next_port_ref = self._cache_owner_actor.get_free_port.remote()
@@ -448,7 +471,52 @@ class MilesModelUpdateService:
             comm_ranks=comm_ranks,
             world_size=int(world_size),
         )
-        return plan.as_wire_dict()
+        return plan.as_wire_dict(), port_claim
+
+    def _release_port_claim_nowait(self, port_claim_holder: list) -> None:
+        """Fire-and-forget release used on the cancellation path.
+
+        An awaited release would itself be cancelled by ``wait_for`` (and
+        ``CancelledError`` is a ``BaseException``, so the ``except Exception``
+        in :meth:`_release_port_claim` would not catch it). A bare
+        ``.remote()`` still dispatches the delete on the actor.
+        """
+        if not port_claim_holder:
+            return
+        master_addr, master_port = port_claim_holder.pop()
+        try:
+            shared_storage = _get_shared_storage_actor()
+            shared_storage.delete.remote(f"MASTER_ADDR_PORT:{master_addr}:{int(master_port)}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "MilesModelUpdateService: failed to release port claim "
+                "master_addr=%s master_port=%s: %r",
+                master_addr,
+                master_port,
+                exc,
+            )
+
+    async def _release_port_claim(
+        self,
+        *,
+        master_addr: str,
+        master_port: int,
+        inflight_refs: list,
+    ) -> None:
+        try:
+            shared_storage = _get_shared_storage_actor()
+            claim_key = f"MASTER_ADDR_PORT:{master_addr}:{int(master_port)}"
+            delete_ref = shared_storage.delete.remote(claim_key)
+            inflight_refs.append(delete_ref)
+            await _ray_get(delete_ref)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "MilesModelUpdateService: failed to release port claim "
+                "master_addr=%s master_port=%s: %r",
+                master_addr,
+                master_port,
+                exc,
+            )
 
 
 async def _ray_get(refs):

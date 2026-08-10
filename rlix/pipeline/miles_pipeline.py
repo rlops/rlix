@@ -103,10 +103,14 @@ class MilesPipeline:
             return
         try:
             from miles.utils.rlix_validation import assert_rlix_topology
-        except Exception as exc:  # noqa: BLE001
+        except ModuleNotFoundError as exc:
+            # miles not installed (test/dev fixture). A partial or broken
+            # install raises ImportError/SyntaxError and must NOT be swallowed
+            # here — in production miles is always importable, so those signal
+            # a real bug and should fail fast.
             logger.warning(
-                "MilesPipeline: miles.utils.rlix_validation unavailable; "
-                "skipping startup validation: %r",
+                "MilesPipeline: miles not installed; skipping F10 startup "
+                "validation (test-fixture path): %r",
                 exc,
             )
             return

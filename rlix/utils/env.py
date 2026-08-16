@@ -4,6 +4,20 @@ import os
 from typing import Dict, Optional
 
 
+def scheduler_env_passthrough() -> Dict[str, str]:
+    """Driver-side passthrough of scheduler-actor tuning knobs.
+
+    ``RLIX_RESIZE_RPC_TIMEOUT_S`` is read at import time inside the
+    scheduler actor process, and Ray actors do not inherit the driver
+    shell environment on multi-node clusters — the value must travel via
+    ``runtime_env``. ``rlix.init()`` merges this dict into the env_vars it
+    forwards to the orchestrator/scheduler actors (explicit caller-provided
+    values win). Returns only keys actually set in the driver environment.
+    """
+    keys = ("RLIX_RESIZE_RPC_TIMEOUT_S",)
+    return {k: os.environ[k] for k in keys if k in os.environ}
+
+
 def thread_limit_env_vars() -> Dict[str, str]:
     """Thread-count limits to stay under container pids.max.
 

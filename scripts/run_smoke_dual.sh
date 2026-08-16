@@ -122,7 +122,7 @@ python /root/miles/examples/rlix/run_miles_dual.py \
   --optimizer adam --lr 1e-6 --lr-decay-style constant \
   --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98 \
   --use-dynamic-batch-size --max-tokens-per-gpu 512 \
-  --sglang-mem-fraction-static 0.30 \
+  --sglang-mem-fraction-static "${MILES_SMOKE_MEM_FRACTION:-0.30}" \
   --rollout-num-gpus 2 --rollout-num-gpus-per-engine 1 \
   --use-miles-router \
   --rollout-function-path examples.fully_async.fully_async_rollout.generate_rollout_fully_async \

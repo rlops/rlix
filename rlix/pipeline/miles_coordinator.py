@@ -43,6 +43,151 @@ from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
 
+# --- rlix#42 user-selected weight-update transport mode -----------------
+# One rlix-side control (plan D4): `cpu_serialize` (default — today's
+# behavior, no classification), `broadcast` (strict: ALL engines
+# broadcast; fail-fast if any target engine shares a GPU with the train
+# pool — NCCL cannot form a group containing the same physical GPU
+# twice), `auto` (topology split; the only mode that mixes transports).
+_TRANSPORT_MODE_ENV = "RLIX_MILES_UPDATE_TRANSPORT"
+_VALID_TRANSPORT_MODES = ("cpu_serialize", "broadcast", "auto")
+# Smoke-validity guard (plan C9): when set to "1", registration asserts
+# that the pipeline's FULL engine set classifies into BOTH transport
+# classes under `auto` — an overlap smoke that cannot produce mixed
+# sessions is INVALID and must fail fast rather than pass vacuously.
+_ASSERT_MIXED_ENV = "RLIX_ASSERT_MIXED_TRANSPORT"
+
+
+def _assert_mixed_transport_startup(
+    *,
+    mode: str,
+    pipeline_id: str,
+    train_gpu_ids: Optional[List[int]],
+    infer_gpu_ids: Optional[List[int]],
+    per_engine: int,
+) -> None:
+    """C9 startup assertion, gated by ``RLIX_ASSERT_MIXED_TRANSPORT=1``.
+
+    Only meaningful for ``auto`` (the mixing mode): classify the full
+    engine set and require ≥1 broadcast-classified AND ≥1
+    cpu_serialize-classified engine; log the resulting split. Any other
+    mode with the env set is a smoke misconfiguration — fail fast.
+    """
+    if os.environ.get(_ASSERT_MIXED_ENV, "").strip() != "1":
+        return
+    if mode != "auto":
+        raise RuntimeError(
+            f"{_ASSERT_MIXED_ENV}=1 requires {_TRANSPORT_MODE_ENV}=auto "
+            f"(the only mixing mode); got mode={mode!r}"
+        )
+    if not infer_gpu_ids:
+        raise RuntimeError(
+            f"{_ASSERT_MIXED_ENV}=1 requires registered topology (infer_gpu_ids)"
+        )
+    engine_count = len(infer_gpu_ids) // max(per_engine, 1)
+    full_set = set(range(engine_count))
+    broadcast = _classify_broadcast_engines(
+        target_engine_indices=full_set,
+        mode="auto",
+        train_gpu_ids=train_gpu_ids,
+        infer_gpu_ids=infer_gpu_ids,
+        per_engine=per_engine,
+    )
+    cpu_serialize = full_set - set(broadcast)
+    logger.info(
+        "[MilesCoordinator] C9 mixed-transport startup assertion pipeline_id=%s "
+        "engines=%s broadcast=%s cpu_serialize=%s",
+        pipeline_id,
+        sorted(full_set),
+        sorted(broadcast),
+        sorted(cpu_serialize),
+    )
+    if not broadcast or not cpu_serialize:
+        raise RuntimeError(
+            f"C9 mixed-transport startup assertion FAILED pipeline_id={pipeline_id}: "
+            f"engines={sorted(full_set)} broadcast={sorted(broadcast)} "
+            f"cpu_serialize={sorted(cpu_serialize)} — the overlap smoke requires "
+            "≥1 engine of EACH class per pipeline; this topology cannot produce "
+            "mixed sessions, so the smoke would pass vacuously (INVALID)."
+        )
+
+
+def _resolve_transport_mode() -> str:
+    """Parse the transport-mode env once; invalid value = fail-fast
+    (plan C5: no silent default on a typo)."""
+    raw = os.environ.get(_TRANSPORT_MODE_ENV, "").strip().lower()
+    if not raw:
+        return "cpu_serialize"
+    if raw not in _VALID_TRANSPORT_MODES:
+        raise RuntimeError(
+            f"{_TRANSPORT_MODE_ENV}={raw!r} is not a valid transport mode; "
+            f"expected one of {list(_VALID_TRANSPORT_MODES)}"
+        )
+    return raw
+
+
+def _classify_broadcast_engines(
+    *,
+    target_engine_indices: Set[int],
+    mode: str,
+    train_gpu_ids: Optional[List[int]],
+    infer_gpu_ids: Optional[List[int]],
+    per_engine: int,
+) -> frozenset:
+    """Classify a sync's target engines into the broadcast subset (AC4).
+
+    Engine → physical-GPU mapping follows the manager's contiguous
+    layout (cf. ``MilesPipeline._wait_for_overlap_engines_offloaded``):
+    local engine ``e`` occupies the ``per_engine`` consecutive GPUs
+    starting at ``sorted(infer_gpu_ids)[e * per_engine]``.
+
+    - ``cpu_serialize``: empty set (no classification, no topology
+      required — backward-compatible default).
+    - ``auto``: engines whose GPU set is disjoint from the train pool →
+      broadcast; overlapping engines → cpu_serialize (the only mixing
+      mode).
+    - ``broadcast``: ALL engines must be broadcast-eligible; any
+      colocate target = RuntimeError (plan C5: honored exactly or the
+      run refuses to proceed, never a quiet downgrade).
+    """
+    target = {int(i) for i in target_engine_indices}
+    if mode == "cpu_serialize" or not target:
+        return frozenset()
+    if mode not in _VALID_TRANSPORT_MODES:
+        raise RuntimeError(f"unknown transport mode {mode!r}")
+    if train_gpu_ids is None or infer_gpu_ids is None:
+        raise RuntimeError(
+            f"{_TRANSPORT_MODE_ENV}={mode} requires topology at "
+            "register_model_update_resources (train_gpu_ids + infer_gpu_ids); "
+            "registration did not provide it"
+        )
+    train = {int(g) for g in train_gpu_ids}
+    infer_sorted = sorted(int(g) for g in infer_gpu_ids)
+    broadcast: Set[int] = set()
+    colocate: Set[int] = set()
+    for engine_index in sorted(target):
+        lo = engine_index * per_engine
+        hi = lo + per_engine
+        engine_gpus = infer_sorted[lo:hi]
+        if len(engine_gpus) != per_engine:
+            raise RuntimeError(
+                f"engine {engine_index} maps outside the infer pool "
+                f"(pool={infer_sorted}, per_engine={per_engine})"
+            )
+        if train & set(engine_gpus):
+            colocate.add(engine_index)
+        else:
+            broadcast.add(engine_index)
+    if mode == "broadcast" and colocate:
+        raise RuntimeError(
+            f"{_TRANSPORT_MODE_ENV}=broadcast cannot serve colocate engines "
+            f"{sorted(colocate)} (their GPUs intersect the train pool "
+            f"{sorted(train)}); NCCL cannot form a group containing the same "
+            "physical GPU twice. Use 'auto' (mixed transports) or "
+            "'cpu_serialize'."
+        )
+    return frozenset(broadcast)
+
 _T = TypeVar("_T")
 
 # Default max_concurrency for the MILES pipeline actor (F108 Special C1).
@@ -313,21 +458,98 @@ class MilesCoordinator(Coordinator):
         *,
         cache_owner_actor,
         rollout_manager,
+        train_gpu_ids: Optional[List[int]] = None,
+        infer_gpu_ids: Optional[List[int]] = None,
+        rollout_num_gpus_per_engine: int = 1,
     ) -> None:
         """X2 ctor handle injection — capture handles for lazy
         :class:`MilesModelUpdateService` construction. Pipeline calls
         this at init Step 6.6 BEFORE Step 7 INIT, so the service can
         be lazily built whenever the coordinator first needs to push
         a sync.
+
+        Topology kwargs (rlix#42): ``train_gpu_ids`` / ``infer_gpu_ids``
+        are this pipeline's physical GPU mappings
+        (``cluster_device_mappings`` actor_train / actor_infer);
+        ``rollout_num_gpus_per_engine`` is the uniform per-engine GPU
+        count (v7 uniformity guard runs in MilesPipeline before this
+        call). They feed transport classification. Optional for
+        backward compatibility: with the default ``cpu_serialize``
+        transport mode no classification runs; any other mode
+        fail-fasts at sync time if topology was not registered.
         """
         if cache_owner_actor is None or rollout_manager is None:
             raise ValueError(
                 "register_model_update_resources requires both handles"
             )
+        per_engine = int(rollout_num_gpus_per_engine)
+        if per_engine < 1:
+            raise ValueError(
+                f"rollout_num_gpus_per_engine must be >= 1; got {rollout_num_gpus_per_engine}"
+            )
+        # Resolve the transport mode ONCE per pipeline (invalid value =
+        # fail-fast here, not at first sync) and log it (plan AC4).
+        mode = _resolve_transport_mode()
+        logger.info(
+            "[MilesCoordinator] transport mode=%s pipeline_id=%s "
+            "(env %s; train_gpus=%s infer_gpus=%s per_engine=%d)",
+            mode,
+            self._pipeline_id,
+            _TRANSPORT_MODE_ENV,
+            sorted(int(g) for g in train_gpu_ids) if train_gpu_ids else None,
+            sorted(int(g) for g in infer_gpu_ids) if infer_gpu_ids else None,
+            per_engine,
+        )
+        _assert_mixed_transport_startup(
+            mode=mode,
+            pipeline_id=self._pipeline_id,
+            train_gpu_ids=list(train_gpu_ids) if train_gpu_ids is not None else None,
+            infer_gpu_ids=list(infer_gpu_ids) if infer_gpu_ids is not None else None,
+            per_engine=per_engine,
+        )
+        # Capability probe (codex impl-r15): the sync-under-load bracket
+        # depends on the manager-side atomic register_router_if_active
+        # RPC. On a version-skewed deployment (new rlix + old miles) the
+        # missing method would only surface INSIDE the first sync's
+        # finally — after engines were already quiesced. Probe with an
+        # empty list at registration time so skew fails loud and early.
+        try:
+            ray.get(rollout_manager.register_router_if_active.remote([]))
+        except AttributeError as exc:
+            raise RuntimeError(
+                "rollout_manager lacks register_router_if_active — the miles "
+                "side of this deployment predates the rlix#42 sync-under-load "
+                "bracket; update miles (miles/ray/rollout.py) before running "
+                "RLix-mode weight sync"
+            ) from exc
         self._model_update_resources = {
             "cache_owner_actor": cache_owner_actor,
             "rollout_manager": rollout_manager,
+            "train_gpu_ids": (
+                sorted(int(g) for g in train_gpu_ids) if train_gpu_ids is not None else None
+            ),
+            "infer_gpu_ids": (
+                sorted(int(g) for g in infer_gpu_ids) if infer_gpu_ids is not None else None
+            ),
+            "rollout_num_gpus_per_engine": per_engine,
+            "transport_mode": mode,
         }
+
+    def _broadcast_set_for(self, target_engine_indices: Set[int]) -> frozenset:
+        """Transport classification for one sync's target set (plan AC4).
+
+        Reads the mode + topology captured at registration; delegates to
+        the module-level :func:`_classify_broadcast_engines` (unit-tested
+        directly). Default ``cpu_serialize`` mode returns an empty set
+        without touching topology (backward compatible)."""
+        resources = self._model_update_resources
+        return _classify_broadcast_engines(
+            target_engine_indices=target_engine_indices,
+            mode=resources.get("transport_mode", "cpu_serialize"),
+            train_gpu_ids=resources.get("train_gpu_ids"),
+            infer_gpu_ids=resources.get("infer_gpu_ids"),
+            per_engine=int(resources.get("rollout_num_gpus_per_engine", 1)),
+        )
 
     def publish_cache_ready_step(self, step: int) -> int:
         """Init-bootstrap-only. Sets ``_cache_ready_step`` so any later
@@ -366,6 +588,9 @@ class MilesCoordinator(Coordinator):
             pipeline_id=self._pipeline_id,
             cache_owner_actor=self._model_update_resources["cache_owner_actor"],
             rollout_manager=self._model_update_resources["rollout_manager"],
+            rollout_num_gpus_per_engine=int(
+                self._model_update_resources.get("rollout_num_gpus_per_engine", 1)
+            ),
         )
         return self._model_update_service
 
@@ -386,19 +611,118 @@ class MilesCoordinator(Coordinator):
         # Run the sync OUTSIDE the resize lock so concurrent
         # report_progress_from_scheduler / clear_progress_stream
         # callers do not block on weight transport.
+        broadcast_set = self._broadcast_set_for(set(target))
+        # rlix#42 sync-under-load bracket (flush-timeout root cause):
+        # under the fully-async rollout, generation for the NEXT step is
+        # already live on these engines, and the router keeps dispatching
+        # new requests while finalize's /flush_cache waits for the queue
+        # to drain — a guaranteed 60 s timeout under real load. Mirror
+        # shrink_engines' proven ordering BEFORE the sync: close router
+        # admission (unregister raises on non-2xx, aborting the sync
+        # early rather than hanging in flush), then abort in-flight work
+        # (the router re-dispatches aborted requests afterwards — same
+        # contract the donor-shrink path relies on). Re-open admission in
+        # a finally: serving briefly-stale weights is recoverable,
+        # unrouted-forever engines are not.
+        rollout_manager = self._model_update_resources.get("rollout_manager")
+        handles = ray.get(rollout_manager.get_engine_handles.remote(sorted(target)))
+        sync_error: Exception | None = None
         try:
+            # Quiesce INSIDE the guarded region so any failure — including
+            # a partial unregister or an abort error — still reaches the
+            # re-register finally (codex impl-r11 high #1).
+            ray.get([h.unregister_from_router.remote() for h in handles.values()])
+            ray.get(rollout_manager._abort_engines.remote(sorted(target)))
             return int(
                 ray.get(
                     service.sync_selected_workers.remote(
                         sync_id=None,
                         target_engine_indices=target,
                         version=int(step),
+                        broadcast_local_ranks=broadcast_set,
                     )
                 )
             )
         except Exception as exc:
+            sync_error = exc
             logger.error("sync_base_weights_to_active failed: %r", exc)
             raise
+        finally:
+            # Re-open router admission via the per-engine
+            # ``register_with_router`` — idempotent at the router (re-add
+            # discards from dead_workers), safe even for engines whose
+            # unregister never happened. NOT ``activate_routing``: that
+            # is the loading→active INIT transition and raises for these
+            # still-active engines (codex impl-r11 high #2).
+            # Concurrent-shrink guard (codex impl-r12/r13): a resize can
+            # shrink one of these engines while the sync is in flight
+            # (both flows RPC outside the lock by design, R10-F1). The
+            # state-check + register must be ATOMIC w.r.t. shrink, so
+            # both happen inside a single serialized manager call
+            # (``register_router_if_active`` — the manager actor is
+            # single-threaded, so no shrink can interleave between its
+            # state read and the /add_worker). The coordinator-side
+            # intent intersection under the lock is a cheap pre-filter
+            # only; the manager call is the authority.
+            reregister_error: Exception | None = None
+            try:
+                with self._resize_sync_lock:
+                    still_intended = sorted(
+                        set(self._active_engine_indices) & set(target)
+                    )
+                reregistered = (
+                    ray.get(
+                        rollout_manager.register_router_if_active.remote(
+                            still_intended
+                        )
+                    )
+                    if still_intended
+                    else []
+                )
+                skipped = sorted(set(int(i) for i in target) - set(reregistered))
+                if skipped:
+                    logger.warning(
+                        "sync-under-load bracket: NOT re-registering %s "
+                        "(concurrently shrunk/offloaded or no longer intended "
+                        "active)",
+                        skipped,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                reregister_error = exc
+                logger.error(
+                    "sync-under-load bracket: failed to re-register router "
+                    "workers for %s: %r",
+                    sorted(target),
+                    exc,
+                )
+            # Independently best-effort: reset the abort-idempotency cache
+            # so a future genuine shrink re-aborts any in-flights that
+            # arrive from now on (these engines stay ACTIVE — shrink's
+            # release-on-offload path never fires for this bracket).
+            try:
+                ray.get(
+                    rollout_manager._reset_abort_idempotency_for.remote(sorted(target))
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "sync-under-load bracket: failed to reset abort "
+                    "idempotency for %s: %r",
+                    sorted(target),
+                    exc,
+                )
+            # codex impl-r14: a re-registration FAILURE (exception — not
+            # the legitimate skipped-because-shrunk case) must never let a
+            # successful sync report success: the engines would stay
+            # intended-active yet unroutable, silently suspending
+            # generation. Escalate unless an earlier exception is already
+            # propagating (then keep the original as the primary error).
+            if reregister_error is not None and sync_error is None:
+                raise RuntimeError(
+                    "sync_base_weights_to_active: sync succeeded but router "
+                    f"re-registration failed for targets {sorted(target)}; "
+                    "engines may be unroutable — failing fast rather than "
+                    "reporting a healthy sync"
+                ) from reregister_error
 
     # ------------------------------------------------------------------
     # F22 / F37 / F40 resize_infer + _expand_workers (iter 23)
@@ -541,12 +865,14 @@ class MilesCoordinator(Coordinator):
             )
         # F40 Runtime branch: wake → service.sync_selected_workers →
         # activate_routing.
+        broadcast_set = self._broadcast_set_for(set(engine_indices))
         ray.get(rollout_manager.expand_engines.remote(sorted(engine_indices)))
         ray.get(
             service.sync_selected_workers.remote(
                 sync_id=None,
                 target_engine_indices=frozenset(engine_indices),
                 version=cached_step,
+                broadcast_local_ranks=broadcast_set,
             )
         )
         ray.get(rollout_manager.activate_routing.remote(sorted(engine_indices)))

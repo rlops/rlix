@@ -28,19 +28,77 @@ from rlix.utils.env import parse_env_timeout_s
 logger = logging.getLogger(__name__)
 
 
-def _get_shared_storage_actor() -> Any:
-    try:
-        from roll.utils.constants import (  # type: ignore[import-not-found]
-            GLOBAL_STORAGE_NAMESPACE,
-            STORAGE_NAME,
-        )
-    except ImportError:
-        from roll.distributed.scheduler.storage import (  # type: ignore[import-not-found]
-            STORAGE_NAME,
-        )
-        from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE  # type: ignore[import-not-found]
+@ray.remote(num_cpus=0)
+class _PortClaimStore:
+    """Minimal KV store implementing the SharedStorage port-claim protocol
+    (``try_put`` / ``delete``) for MILES mode, where ROLL's SharedStorage
+    singleton does not exist.
 
-    return ray.get_actor(STORAGE_NAME, namespace=GLOBAL_STORAGE_NAMESPACE)
+    rlix#42: the port claim is NOT optional once pipelines sync
+    concurrently (dedicated-train topology): every cache_owner scans free
+    ports from the same base (miles ``RayActor.get_free_port`` starts at
+    20000), so two simultaneous sessions deterministically pick the SAME
+    rendezvous port, cross-wire their NCCL TCP stores, and crash mid
+    ``ncclUniqueId`` exchange. Detached + named so every service instance
+    on the cluster shares one claim space; claims die with the Ray
+    cluster (consistent with the leak-and-log rule for wedged senders).
+    """
+
+    def __init__(self):
+        self._claims: dict = {}
+
+    def try_put(self, key, value) -> bool:
+        if key in self._claims:
+            return False
+        self._claims[key] = value
+        return True
+
+    def delete(self, key) -> bool:
+        self._claims.pop(key, None)
+        return True
+
+
+def _fallback_port_claim_store() -> Any:
+    from rlix.protocol.types import RLIX_NAMESPACE
+
+    return _PortClaimStore.options(  # type: ignore[attr-defined]
+        name="rlix:miles_port_claims",
+        namespace=RLIX_NAMESPACE,
+        get_if_exists=True,
+        lifetime="detached",
+    ).remote()
+
+
+def _get_shared_storage_actor() -> Any:
+    """Resolve the port-claim store: ROLL's SharedStorage when it exists,
+    else the rlix-owned fallback (see :class:`_PortClaimStore`).
+
+    Fallback triggers ONLY on the two expected miles-mode signals — ROLL
+    unimportable (ImportError) or the SharedStorage actor absent
+    (``ray.get_actor`` ValueError). Any OTHER failure propagates: a
+    transient/unexpected lookup error must fail the sync fast rather
+    than silently split the claim namespace between the real store and
+    the fallback (codex impl-r7 medium).
+    """
+    try:
+        try:
+            from roll.utils.constants import (  # type: ignore[import-not-found]
+                GLOBAL_STORAGE_NAMESPACE,
+                STORAGE_NAME,
+            )
+        except ImportError:
+            from roll.distributed.scheduler.storage import (  # type: ignore[import-not-found]
+                STORAGE_NAME,
+            )
+            from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE  # type: ignore[import-not-found]
+    except ImportError:
+        return _fallback_port_claim_store()
+    try:
+        return ray.get_actor(STORAGE_NAME, namespace=GLOBAL_STORAGE_NAMESPACE)
+    except ValueError:
+        # Ray raises ValueError for a named actor that does not exist —
+        # the normal miles-mode case (no ROLL control plane).
+        return _fallback_port_claim_store()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,6 +177,7 @@ class MilesModelUpdateService:
         pipeline_id: str,
         cache_owner_actor,
         rollout_manager,
+        rollout_num_gpus_per_engine: int = 1,
     ):
         if not isinstance(pipeline_id, str) or not pipeline_id:
             raise ValueError("pipeline_id must be a non-empty str")
@@ -126,6 +185,18 @@ class MilesModelUpdateService:
             raise ValueError("cache_owner_actor handle is required (F107 / X2 injection)")
         if rollout_manager is None:
             raise ValueError("rollout_manager handle is required")
+        # C8 rank accounting input: NCCL group ranks are per-GPU, so each
+        # broadcast engine occupies `rollout_num_gpus_per_engine`
+        # consecutive ranks (its TP workers). Uniform per pipeline in
+        # RLix mode — enforced upstream by the MilesPipeline uniformity
+        # startup guard (plan v7); heterogeneous engines are out of
+        # scope (plan O6).
+        per_engine = int(rollout_num_gpus_per_engine)
+        if per_engine < 1:
+            raise ValueError(
+                f"rollout_num_gpus_per_engine must be >= 1; got {rollout_num_gpus_per_engine}"
+            )
+        self._rollout_num_gpus_per_engine = per_engine
         self._pipeline_id = pipeline_id
         self._cache_owner_actor = cache_owner_actor
         self._rollout_manager = rollout_manager
@@ -189,20 +260,6 @@ class MilesModelUpdateService:
                 f"broadcast_local_ranks={sorted(broadcast_set)} must be a subset "
                 f"of target_engine_indices={sorted(target)}"
             )
-        if broadcast_set:
-            # The cache-owner sender NCCL path (init_process_group +
-            # per-bucket dist.broadcast + dist.destroy_process_group)
-            # is not yet implemented inside MILES run_sync_session
-            # (iter 12 wires only the receiver-side fan-out). Fail
-            # fast rather than hang the receivers waiting for an
-            # absent sender.
-            raise NotImplementedError(
-                "broadcast_local_ranks transport requires sender-side NCCL "
-                "(init_process_group + dist.broadcast on the cache_owner). "
-                "MILES iter 12 only wired the receiver-side fan-out. "
-                "Until the sender-side path lands, route every target "
-                "through cpu_serialize."
-            )
         cpu_serialize_set = target - broadcast_set
 
         # R06-F1 fix: track every Ray ObjectRef issued by this atomic
@@ -216,6 +273,12 @@ class MilesModelUpdateService:
         # Carries the (addr, port) claim out of the atomic unit so the
         # cancellation handlers below can still release it.
         port_claim_holder: list = []
+        # Set (appended) the moment the run_sync_session ref RESOLVES —
+        # success or error alike, the sender's finally has run by then
+        # (teardown ack). Distinguishes a truly wedged sender from a
+        # cancellation that landed during the post-resolution claim
+        # release await (codex impl-r1 medium).
+        sender_resolved_holder: list = []
 
         async def _run() -> int:
             return await self._run_atomic_unit(
@@ -226,6 +289,7 @@ class MilesModelUpdateService:
                 broadcast_set=broadcast_set,
                 inflight_refs=inflight_refs,
                 port_claim_holder=port_claim_holder,
+                sender_resolved_holder=sender_resolved_holder,
             )
 
         try:
@@ -234,14 +298,24 @@ class MilesModelUpdateService:
             return await asyncio.wait_for(_run(), timeout=float(self._timeout_s))
         except asyncio.TimeoutError:
             self._cancel_inflight(inflight_refs, reason="wait_for timeout")
-            self._release_port_claim_nowait(port_claim_holder)
+            self._finalize_port_claim_on_abort(
+                port_claim_holder,
+                has_broadcast=bool(broadcast_set),
+                sender_resolved=bool(sender_resolved_holder),
+                reason="wait_for timeout",
+            )
             raise
         except asyncio.CancelledError:
             # Outer cancellation (caller cancelled sync_selected_workers
             # task) — propagate after firing ray.cancel so we don't leak
             # inflight Ray work either.
             self._cancel_inflight(inflight_refs, reason="task cancelled")
-            self._release_port_claim_nowait(port_claim_holder)
+            self._finalize_port_claim_on_abort(
+                port_claim_holder,
+                has_broadcast=bool(broadcast_set),
+                sender_resolved=bool(sender_resolved_holder),
+                reason="task cancelled",
+            )
             raise
 
     def _cancel_inflight(self, inflight_refs: list, *, reason: str) -> None:
@@ -276,6 +350,7 @@ class MilesModelUpdateService:
         broadcast_set: frozenset[int],
         inflight_refs: list,
         port_claim_holder: list,
+        sender_resolved_holder: list,
     ) -> int:
         # Each .remote() is captured into inflight_refs BEFORE we await
         # so the outer cancellation handler can fire ray.cancel(force=True)
@@ -309,13 +384,35 @@ class MilesModelUpdateService:
         inflight_refs.append(sync_ref)
         try:
             await _ray_get(sync_ref)
-        finally:
-            # The port is only needed for the NCCL rendezvous during
-            # transport, so release it however the transport ended.
+        except asyncio.CancelledError:
+            # Service session deadline fired while the sender ref was
+            # UNRESOLVED (wedged sender). Do NOT dispatch a claim delete
+            # here — the NCCL TCP store behind master_port may still be
+            # bound; leak-vs-release is decided by the outer handler
+            # (_finalize_port_claim_on_abort, C6 ownership rule).
+            raise
+        except Exception:
+            # Sender ref RESOLVED with an error: the sender's own finally
+            # has already run its teardown (teardown ack) — releasing the
+            # claim is safe.
+            sender_resolved_holder.append(True)
             if port_claim is not None:
                 await self._release_port_claim(
                     master_addr=port_claim[0],
                     master_port=port_claim[1],
+                    storage=port_claim[2],
+                    inflight_refs=inflight_refs,
+                )
+                port_claim_holder.clear()
+            raise
+        else:
+            # Success: teardown ack via normal return.
+            sender_resolved_holder.append(True)
+            if port_claim is not None:
+                await self._release_port_claim(
+                    master_addr=port_claim[0],
+                    master_port=port_claim[1],
+                    storage=port_claim[2],
                     inflight_refs=inflight_refs,
                 )
                 port_claim_holder.clear()
@@ -405,17 +502,18 @@ class MilesModelUpdateService:
         # False if the key already exists, which we treat as a
         # collision and re-pick. Bound the retry budget so a stuck
         # claim can't hang the sync.
-        try:
-            shared_storage = _get_shared_storage_actor()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "MilesModelUpdateService: SharedStorage actor unavailable; "
-                "skipping port claim: %r",
-                exc,
-            )
-            shared_storage = None
+        # Claim store resolution is NOT optional and NOT skippable
+        # (codex impl-r7): an unexpected lookup failure propagates and
+        # fails this sync fast instead of running unprotected (the old
+        # skip path let concurrent sessions collide on the deterministic
+        # get_free_port scan — the disjoint-topology crash).
+        shared_storage = _get_shared_storage_actor()
 
-        port_claim: tuple[str, int] | None = None
+        # The claim tuple carries the ACCEPTING store handle so release
+        # always deletes from the same store that granted the claim —
+        # never a re-lookup that might resolve differently (codex
+        # impl-r7).
+        port_claim: tuple[str, int, Any] | None = None
         if shared_storage is not None:
             for attempt in range(8):
                 claim_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"
@@ -423,10 +521,17 @@ class MilesModelUpdateService:
                 inflight_refs.append(try_put_ref)
                 claimed = bool(await _ray_get(try_put_ref))
                 if claimed:
-                    port_claim = (master_addr, master_port)
+                    port_claim = (master_addr, master_port, shared_storage)
                     break
-                # Collision — pick another free port and re-try.
-                next_port_ref = self._cache_owner_actor.get_free_port.remote()
+                # Collision — pick another free port and re-try. The
+                # claimed port is only RESERVED (not yet OS-bound) by the
+                # winning session, so miles' deterministic free-port scan
+                # would return the very same value forever; force the
+                # scan to start PAST the contested port (rlix#42 fix for
+                # the concurrent-sync rendezvous collision).
+                next_port_ref = self._cache_owner_actor.get_free_port.remote(
+                    start_port=master_port + 1
+                )
                 inflight_refs.append(next_port_ref)
                 next_port = int(await _ray_get(next_port_ref))
                 # Always advance master_port to the new pick to avoid
@@ -444,11 +549,19 @@ class MilesModelUpdateService:
                     "claims before retrying."
                 )
 
-        # Per-engine NCCL rank within the dynamic broadcast group.
-        # cache_owner is rank 0; receivers are 1..N.
+        # Per-engine NCCL rank_offset within the dynamic broadcast group
+        # (C8): ranks are per-GPU, not per-engine. cache_owner is rank 0;
+        # each broadcast engine occupies `per_engine` consecutive ranks
+        # (its TP workers — SGLang's init_weights_update_group registers
+        # tp_size ranks starting at rank_offset), so engine offsets form
+        # a cursor with uniform stride. per_engine == 1 degenerates to
+        # the dense 1..N assignment.
+        per_engine = self._rollout_num_gpus_per_engine
         comm_ranks: dict[int, int] = {}
-        for r, idx in enumerate(sorted(broadcast_set), start=1):
-            comm_ranks[idx] = r
+        cursor = 1
+        for idx in sorted(broadcast_set):
+            comm_ranks[idx] = cursor
+            cursor += per_engine
         # cpu_serialize engines are not in the broadcast group; they
         # never enter setup_collective_group. Comm-rank assignment is
         # ignored for them but kept in the dict for plan-shape
@@ -456,7 +569,9 @@ class MilesModelUpdateService:
         for idx in cpu_serialize_set:
             comm_ranks.setdefault(idx, 0)
 
-        world_size = 1 + len(broadcast_set) if broadcast_set else 1
+        # world_size = 1 (sender) + per-GPU ranks of every broadcast
+        # engine == the final cursor value.
+        world_size = cursor if broadcast_set else 1
 
         plan = SyncSessionPlan(
             sync_id=sync_id,
@@ -473,6 +588,46 @@ class MilesModelUpdateService:
         )
         return plan.as_wire_dict(), port_claim
 
+    def _finalize_port_claim_on_abort(
+        self,
+        port_claim_holder: list,
+        *,
+        has_broadcast: bool,
+        sender_resolved: bool,
+        reason: str,
+    ) -> None:
+        """C6 port-claim ownership on the abort path (plan v4/v7).
+
+        cpu_serialize-only sessions keep the historical release-on-abort:
+        no NCCL TCP store ever bound the port, so deleting the claim is
+        harmless. A broadcast session whose sender ref already RESOLVED
+        (teardown ack) but got cancelled during the claim-release await
+        also releases — fire-and-forget — since the TCP store is already
+        retired (codex impl-r1 medium). Only the truly wedged sender
+        (broadcast leg + unresolved ref) intentionally LEAKS the claim:
+        it may still hold a live TCP store on ``master_port``, and
+        handing the port to a concurrent session would collide
+        (ROLL-backend precedent: leak is safer than collision). Fresh
+        per-session ``get_free_port`` picks keep later sessions safe; the
+        stale key dies with the SharedStorage actor.
+        """
+        if not port_claim_holder:
+            return
+        if not has_broadcast or sender_resolved:
+            self._release_port_claim_nowait(port_claim_holder)
+            return
+        master_addr, master_port, _storage = port_claim_holder.pop()
+        logger.error(
+            "[MilesModelUpdateService] WEDGED-SENDER PORT-CLAIM LEAK "
+            "pipeline_id=%s addr=%s port=%s reason=%s: claim intentionally NOT "
+            "released (possibly-live NCCL TCP store); stale "
+            "MASTER_ADDR_PORT key persists until SharedStorage restart.",
+            self._pipeline_id,
+            master_addr,
+            master_port,
+            reason,
+        )
+
     def _release_port_claim_nowait(self, port_claim_holder: list) -> None:
         """Fire-and-forget release used on the cancellation path.
 
@@ -483,10 +638,9 @@ class MilesModelUpdateService:
         """
         if not port_claim_holder:
             return
-        master_addr, master_port = port_claim_holder.pop()
+        master_addr, master_port, storage = port_claim_holder.pop()
         try:
-            shared_storage = _get_shared_storage_actor()
-            shared_storage.delete.remote(f"MASTER_ADDR_PORT:{master_addr}:{int(master_port)}")
+            storage.delete.remote(f"MASTER_ADDR_PORT:{master_addr}:{int(master_port)}")
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "MilesModelUpdateService: failed to release port claim "
@@ -501,12 +655,15 @@ class MilesModelUpdateService:
         *,
         master_addr: str,
         master_port: int,
+        storage: Any,
         inflight_refs: list,
     ) -> None:
         try:
-            shared_storage = _get_shared_storage_actor()
+            # Delete from the SAME store that accepted the claim (codex
+            # impl-r7) — never re-resolve, which could pick a different
+            # backend under degraded lookup conditions.
             claim_key = f"MASTER_ADDR_PORT:{master_addr}:{int(master_port)}"
-            delete_ref = shared_storage.delete.remote(claim_key)
+            delete_ref = storage.delete.remote(claim_key)
             inflight_refs.append(delete_ref)
             await _ray_get(delete_ref)
         except Exception as exc:  # noqa: BLE001

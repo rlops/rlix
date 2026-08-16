@@ -50,7 +50,14 @@ def connect(
             runtime_env={"env_vars": thread_limit_env_vars()},
         )
 
-    opts = ConnectOptions(address=address, create_if_missing=create_if_missing, env_vars=env_vars)
+    # Forward RLix's own scheduler tuning knobs from the driver environment
+    # (Ray actors do not inherit the driver shell on multi-node clusters).
+    # Caller-provided env_vars win on key collision.
+    from rlix.utils.env import scheduler_env_passthrough
+    merged_env = {**scheduler_env_passthrough(), **(env_vars or {})}
+    opts = ConnectOptions(
+        address=address, create_if_missing=create_if_missing, env_vars=merged_env or None
+    )
     return _get_or_create_orchestrator(opts)
 
 

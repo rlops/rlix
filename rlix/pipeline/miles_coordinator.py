@@ -16,16 +16,18 @@ _expand_workers + create_pipeline_actor.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
 import threading
 import time
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Set, TypeVar
+from typing import Any, Dict, Iterator, List, Optional, Set, TypeVar
 
 import ray
 
+from rlix.pipeline.utils import validate_resize_params
 from rlix.protocol.coordinator import Coordinator
 from rlix.protocol.types import (
     ACTOR_TRAIN_CLUSTER_NAME,
@@ -38,7 +40,7 @@ from rlix.protocol.types import (
     get_pipeline_namespace,
 )
 from rlix.protocol.validation import validate_pipeline_id
-from rlix.utils.env import parse_env_positive_float, pipeline_identity_env_vars
+from rlix.utils.env import parse_env_positive_float, parse_env_timeout_s, pipeline_identity_env_vars
 from rlix.utils.ray import get_actor_or_raise
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,43 @@ _T = TypeVar("_T")
 # resize_infer requests" without admitting unbounded concurrency. The
 # audit checkboxes (Phase 1 / Phase 2) start unchecked.
 _MILES_PIPELINE_ACTOR_MAX_CONCURRENCY: int = 2
+
+# F20 lock-discipline hardening: bound _resize_sync_lock acquisition the same
+# way PipelineCoordinator does (same env var, default 180s) so a wedged holder
+# surfaces as a RuntimeError instead of blocking callers forever.
+_RESIZE_LOCK_TIMEOUT_S: Optional[float] = parse_env_timeout_s("RLIX_RESIZE_LOCK_TIMEOUT_S", default_s=180.0)
+# Shared budget for ONE whole shrink/expand operation: lock waits and every
+# resize-chain Ray RPC (shrink_engines / get_engine_states / expand_engines /
+# sync_selected_workers / activate_routing) draw down from a single monotonic
+# deadline started at op entry, so this value bounds the chain, not each hop.
+# Default leaves margin over the service-internal
+# ROLL_SELECTIVE_MODEL_UPDATE_TIMEOUT_S (150s) and the shrink-side drain
+# (30s). <=0 in the env disables the bound (parse_env_timeout_s -> None,
+# which ray.get treats as "wait indefinitely").
+# Ordering invariant: this per-op budget MUST stay below the scheduler-side
+# RLIX_RESIZE_RPC_TIMEOUT_S backstop (default 300s in
+# rlix/scheduler/scheduler.py), so a slow resize surfaces as a bounded
+# per-pipeline error before the scheduler's fail-fast shutdown fires.
+_RESIZE_OP_TIMEOUT_S: Optional[float] = parse_env_timeout_s("MILES_RESIZE_RPC_TIMEOUT_S", default_s=180.0)
+
+
+def _resize_op_deadline() -> Optional[float]:
+    """Start the shared per-op budget; ``None`` when the bound is disabled."""
+    if _RESIZE_OP_TIMEOUT_S is None:
+        return None
+    return time.monotonic() + _RESIZE_OP_TIMEOUT_S
+
+
+def _remaining_op_budget_s(deadline: Optional[float], op: str) -> Optional[float]:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError(
+            f"{op} exceeded the {_RESIZE_OP_TIMEOUT_S}s resize op budget; "
+            f"set MILES_RESIZE_RPC_TIMEOUT_S to adjust (<=0 disables)"
+        )
+    return remaining
 
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
@@ -281,6 +320,33 @@ class MilesCoordinator(Coordinator):
     # F19 active-set bootstrap + resource registration (iter 22)
     # ------------------------------------------------------------------
 
+    @contextlib.contextmanager
+    def _resize_locked(self, op: str, *, deadline: Optional[float] = None) -> Iterator[None]:
+        """Acquire ``_resize_sync_lock`` with a bounded timeout (F20).
+
+        Mirrors PipelineCoordinator's ``_RESIZE_LOCK_TIMEOUT_S`` discipline:
+        a wedged holder (e.g. a stuck resize RPC on another thread) surfaces
+        as a RuntimeError instead of blocking the caller forever. When a
+        resize-op ``deadline`` is passed, the wait is further capped by the
+        op's remaining shared budget.
+        """
+        timeout_s = _RESIZE_LOCK_TIMEOUT_S
+        if deadline is not None:
+            remaining = _remaining_op_budget_s(deadline, op)
+            timeout_s = remaining if timeout_s is None else min(timeout_s, remaining)
+        acquired = self._resize_sync_lock.acquire(timeout=timeout_s if timeout_s is not None else -1)
+        if not acquired:
+            raise RuntimeError(
+                f"{op} timed out waiting for _resize_sync_lock after "
+                f"{timeout_s}s (pipeline_id={self._pipeline_id!r}); "
+                f"set RLIX_RESIZE_LOCK_TIMEOUT_S / MILES_RESIZE_RPC_TIMEOUT_S "
+                f"to adjust (<=0 disables)"
+            )
+        try:
+            yield
+        finally:
+            self._resize_sync_lock.release()
+
     def bootstrap_active_engines(self, engine_indices: Set[int]) -> None:
         """F19 / scope X3: legitimate first call may pass an empty set.
 
@@ -288,7 +354,7 @@ class MilesCoordinator(Coordinator):
         even when the second call also uses an empty set; without it,
         set truthiness alone cannot distinguish the two cases.
         """
-        with self._resize_sync_lock:
+        with self._resize_locked("bootstrap_active_engines"):
             if self._active_engines_bootstrapped:
                 raise RuntimeError(
                     "bootstrap_active_engines called twice on the same "
@@ -305,7 +371,7 @@ class MilesCoordinator(Coordinator):
     def get_active_engines(self) -> frozenset[int]:
         """Read-only snapshot used by the pipeline init bootstrap
         consistency check (Step 7.3)."""
-        with self._resize_sync_lock:
+        with self._resize_locked("get_active_engines"):
             return frozenset(self._active_engine_indices)
 
     def register_model_update_resources(
@@ -339,7 +405,7 @@ class MilesCoordinator(Coordinator):
         ``_cache_ready_step`` inside ``sync_base_weights_to_active``
         already, so this method is NOT used after init.
         """
-        with self._resize_sync_lock:
+        with self._resize_locked("publish_cache_ready_step"):
             self._cache_ready_step = int(step)
         return int(step)
 
@@ -376,7 +442,7 @@ class MilesCoordinator(Coordinator):
         view. F40-compatible: ``step == -1`` is the init bootstrap
         path (cache_owner has built base buckets at init Step 4).
         """
-        with self._resize_sync_lock:
+        with self._resize_locked("sync_base_weights_to_active"):
             self._cache_ready_step = int(step)
             target = frozenset(self._active_engine_indices)
             if not target:
@@ -419,7 +485,13 @@ class MilesCoordinator(Coordinator):
         (``get_active_engines``, ``publish_cache_ready_step``,
         ``sync_base_weights_to_active``) no longer queue behind the
         full RPC chain.
+
+        Contract: exactly one of {dp_ranks_to_remove, dp_ranks_to_add} must
+        be non-empty (same as PipelineCoordinator.resize_infer). The
+        scheduler's _execute_resize_calls already issues shrinks and expands
+        as separate RPCs; a mixed call indicates a caller bug.
         """
+        validate_resize_params(dp_ranks_to_remove, dp_ranks_to_add)
         if dp_ranks_to_remove:
             self._shrink_workers(set(int(i) for i in dp_ranks_to_remove))
         if dp_ranks_to_add:
@@ -429,9 +501,10 @@ class MilesCoordinator(Coordinator):
         return ActionResponse(success=True)
 
     def _shrink_workers(self, engine_indices: Set[int]) -> None:
+        deadline = _resize_op_deadline()
         # Snapshot under lock — only to read shared state; the Ray RPC
         # runs without the lock held (R10-F1).
-        with self._resize_sync_lock:
+        with self._resize_locked("_shrink_workers(snapshot)", deadline=deadline):
             rollout_manager = self._model_update_resources.get("rollout_manager")
             if rollout_manager is None:
                 raise RuntimeError("resource registration missing for shrink")
@@ -450,7 +523,8 @@ class MilesCoordinator(Coordinator):
             rollout_manager.shrink_engines.remote(
                 sorted(engine_indices),
                 post_sleep_vram_threshold_gb=residual_threshold_gb,
-            )
+            ),
+            timeout=_remaining_op_budget_s(deadline, "_shrink_workers(shrink_engines)"),
         )
         logger.info(
             "[MilesCoordinator] shrink_engines complete pipeline_id=%s "
@@ -461,12 +535,13 @@ class MilesCoordinator(Coordinator):
             residual_threshold_gb,
         )
         # Commit under lock.
-        with self._resize_sync_lock:
+        with self._resize_locked("_shrink_workers(commit)", deadline=deadline):
             self._active_engine_indices -= engine_indices
 
     def _expand_workers(self, engine_indices: Set[int]) -> None:
+        deadline = _resize_op_deadline()
         # Phase 1 — Snapshot under lock (R10-F1).
-        with self._resize_sync_lock:
+        with self._resize_locked("_expand_workers(snapshot)", deadline=deadline):
             rollout_manager = self._model_update_resources.get("rollout_manager")
             if rollout_manager is None:
                 raise RuntimeError("resource registration missing for expand")
@@ -486,7 +561,8 @@ class MilesCoordinator(Coordinator):
         # this read against another resize_infer is safe at the
         # manager layer.
         states = ray.get(
-            rollout_manager.get_engine_states.remote(sorted(engine_indices))
+            rollout_manager.get_engine_states.remote(sorted(engine_indices)),
+            timeout=_remaining_op_budget_s(deadline, "_expand_workers(get_engine_states)"),
         )
         unique_states = {states[idx] for idx in engine_indices}
         if unique_states == {"shell"}:
@@ -524,7 +600,7 @@ class MilesCoordinator(Coordinator):
             # base v=-1 sync was driven from MilesPipeline init step7,
             # and routing is alive (RolloutManager.add_worker fired
             # during start_rollout_servers).
-            with self._resize_sync_lock:
+            with self._resize_locked("_expand_workers(already-active commit)", deadline=deadline):
                 self._active_engine_indices |= set(engine_indices)
             logger.info(
                 "[MilesCoordinator] _expand_workers: engines already 'active' "
@@ -541,18 +617,25 @@ class MilesCoordinator(Coordinator):
             )
         # F40 Runtime branch: wake → service.sync_selected_workers →
         # activate_routing.
-        ray.get(rollout_manager.expand_engines.remote(sorted(engine_indices)))
+        ray.get(
+            rollout_manager.expand_engines.remote(sorted(engine_indices)),
+            timeout=_remaining_op_budget_s(deadline, "_expand_workers(expand_engines)"),
+        )
         ray.get(
             service.sync_selected_workers.remote(
                 sync_id=None,
                 target_engine_indices=frozenset(engine_indices),
                 version=cached_step,
-            )
+            ),
+            timeout=_remaining_op_budget_s(deadline, "_expand_workers(sync_selected_workers)"),
         )
-        ray.get(rollout_manager.activate_routing.remote(sorted(engine_indices)))
+        ray.get(
+            rollout_manager.activate_routing.remote(sorted(engine_indices)),
+            timeout=_remaining_op_budget_s(deadline, "_expand_workers(activate_routing)"),
+        )
 
         # Phase 3 — Commit under lock.
-        with self._resize_sync_lock:
+        with self._resize_locked("_expand_workers(commit)", deadline=deadline):
             self._active_engine_indices |= set(engine_indices)
 
     def remove_resource_manager_node_pg(self) -> bool:

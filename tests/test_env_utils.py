@@ -54,3 +54,17 @@ def test_parse_env_positive_float_rejects_non_numeric(monkeypatch):
 
     with pytest.raises(RuntimeError, match="must be a number"):
         env.parse_env_positive_float("MILES_MAX_RESIDUAL_GPU_MEM_GB", 2.0)
+
+
+def test_scheduler_env_passthrough_forwards_when_set(monkeypatch):
+    env = _load_env_module(monkeypatch)
+    monkeypatch.setenv("RLIX_RESIZE_RPC_TIMEOUT_S", "600")
+
+    assert env.scheduler_env_passthrough() == {"RLIX_RESIZE_RPC_TIMEOUT_S": "600"}
+
+
+def test_scheduler_env_passthrough_empty_when_unset(monkeypatch):
+    env = _load_env_module(monkeypatch)
+    monkeypatch.delenv("RLIX_RESIZE_RPC_TIMEOUT_S", raising=False)
+
+    assert env.scheduler_env_passthrough() == {}

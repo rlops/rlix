@@ -57,6 +57,43 @@ from rlix.utils.ray import get_actor_or_raise
 logger = logging.getLogger(__name__)
 
 
+def _assert_uniform_engine_gpu_counts(sglang_config: Any, per_engine: int) -> None:
+    """rlix#42 v7 uniformity startup guard.
+
+    The transport classification + NCCL rank cursor derive per-engine GPU
+    counts from ``miles_args.rollout_num_gpus_per_engine`` (uniform per
+    pipeline; heterogeneous engines are plan O6 out-of-scope). SGLang
+    server groups CAN override ``num_gpus_per_engine`` per group and the
+    miles C7 gates do not cross-check the resolved group values against
+    the arg — so this guard fail-fasts any divergence before
+    ``register_model_update_resources``. ``None`` / attribute-free
+    configs pass (nothing resolved to diverge).
+    """
+    if sglang_config is None:
+        return
+    models = getattr(sglang_config, "models", None) or []
+    for model in models:
+        model_name = getattr(model, "name", "?")
+        model_val = getattr(model, "num_gpus_per_engine", None)
+        if model_val is not None and int(model_val) != per_engine:
+            raise RuntimeError(
+                f"rlix#42 uniformity guard: sglang_config model {model_name!r} "
+                f"sets num_gpus_per_engine={model_val}, diverging from "
+                f"rollout_num_gpus_per_engine={per_engine}; heterogeneous "
+                "per-engine GPU counts are unsupported in RLix mode (plan O6)"
+            )
+        for group_index, group in enumerate(getattr(model, "server_groups", None) or []):
+            group_val = getattr(group, "num_gpus_per_engine", None)
+            if group_val is not None and int(group_val) != per_engine:
+                raise RuntimeError(
+                    f"rlix#42 uniformity guard: sglang_config model "
+                    f"{model_name!r} server_groups[{group_index}] sets "
+                    f"num_gpus_per_engine={group_val}, diverging from "
+                    f"rollout_num_gpus_per_engine={per_engine}; heterogeneous "
+                    "per-engine GPU counts are unsupported in RLix mode (plan O6)"
+                )
+
+
 class MilesPipeline:
     """Per-pipeline actor created by :class:`MilesCoordinator`."""
 
@@ -401,11 +438,32 @@ class MilesPipeline:
         # F107 / X2: register handles. F22 (relaxed): in M11.1 single-pipeline
         # this happens after the manager exists; the dual-pipeline-shell-init
         # F22 ordering is deferred.
+        # rlix#42: v7 uniformity guard runs BEFORE registration so the
+        # args-derived per-engine GPU count the transport classification
+        # relies on cannot silently diverge from a server-group override.
+        miles_args = self._pipeline_config.miles_args
+        per_engine = max(int(getattr(miles_args, "rollout_num_gpus_per_engine", 1) or 1), 1)
+        _assert_uniform_engine_gpu_counts(
+            getattr(self._pipeline_config, "sglang_config", None), per_engine
+        )
+        cluster_mappings = (
+            getattr(self._pipeline_config, "cluster_device_mappings", None) or {}
+        )
+        train_gpu_ids = [int(g) for g in cluster_mappings.get("actor_train", [])] or None
+        infer_gpu_ids = [
+            int(g)
+            for g in cluster_mappings.get(
+                "actor_infer", list(range(int(miles_args.rollout_num_gpus)))
+            )
+        ]
         logger.info("[MilesPipeline] phaseB step5: register_model_update_resources start")
         ray.get(
             self._coordinator_handle.register_model_update_resources.remote(
                 cache_owner_actor=self._cache_owner_actor,
                 rollout_manager=self._rollout_manager,
+                train_gpu_ids=train_gpu_ids,
+                infer_gpu_ids=infer_gpu_ids,
+                rollout_num_gpus_per_engine=per_engine,
             )
         )
         logger.info("[MilesPipeline] phaseB step5: register_model_update_resources done")
@@ -559,10 +617,18 @@ class MilesPipeline:
             )
         )
         infer_first = min(infer_mapping) if infer_mapping else 0
+        # rlix#42 disjoint-topology guard: only train GPUs that actually
+        # sit inside the infer pool have overlap engines to wait for. A
+        # dedicated-train GPU (disjoint mapping) has none — silently
+        # skipping it is correct, and prevents nonsense engine indices
+        # like (0 - infer_first) // per_engine == -1.
+        overlap_train_gpus = [
+            int(g) for g in allocated_train_gpus if int(g) in set(infer_mapping)
+        ]
         target_indices = sorted(
-            {(int(g) - infer_first) // per_engine for g in allocated_train_gpus}
+            {(g - infer_first) // per_engine for g in overlap_train_gpus}
         )
-        target_gpu_ids = sorted(set(int(g) for g in allocated_train_gpus))
+        target_gpu_ids = sorted(overlap_train_gpus)
         if not target_indices:
             return
 
